@@ -47,6 +47,8 @@ MAX_HORIZONTAL_W = 1920
 _ZOOM_BEAT_RE = re.compile(r"^\s*zoom\s*:.*@\s*(\d+(?:\.\d+)?)\s*s?\s*$", re.IGNORECASE)
 _SENTENCE_END = (".", "!", "?")
 CAM_EDGE_LO, CAM_EDGE_HI = 0.02, 0.98  # a cam box this close to a cropped edge was cut by it
+SEAM_FLASH = (0.6, 1.0, 0.6)  # white opacity of the 3 frames around the cold-open seam
+SEAM_SLACK_S = 0.1  # frame snapping may move a cold-open range bound by up to a frame
 
 log = logging.getLogger(__name__)
 
@@ -58,6 +60,36 @@ def cut_times_for(keep: list[tuple[float, float]]) -> list[float]:
         t += end - start
         out.append(round(t, 3))
     return out
+
+
+def seam_time(
+    keep: list[tuple[float, float]], cold_open: tuple[float, float] | None
+) -> float | None:
+    """Output time where the cold open ends: the length of the leading keep ranges that lie
+    inside the cold open's source span. None without a cold open, or when nothing of it is
+    kept or nothing follows it."""
+    if cold_open is None:
+        return None
+    lo, hi = cold_open[0] - SEAM_SLACK_S, cold_open[1] + SEAM_SLACK_S
+    t, n = 0.0, 0
+    for start, end in keep:
+        if not (lo <= start and end <= hi):
+            break
+        t += end - start
+        n += 1
+    return round(t, 3) if 0 < n < len(keep) else None
+
+
+def seam_flash(seam: float, fps: float) -> str:
+    """3-frame white flash centred on the frame at `seam`: fade in, full white, fade out."""
+    boxes = []
+    for k, alpha in zip((-1, 0, 1), SEAM_FLASH, strict=True):
+        a, b = seam + (k - 0.5) / fps, seam + (k + 0.5) / fps
+        boxes.append(
+            f"drawbox=x=0:y=0:w=iw:h=ih:color=white@{alpha:g}:t=fill"
+            f":enable='between(t\\,{a:.4f}\\,{b:.4f})'"
+        )
+    return ",".join(boxes)
 
 
 def _to_output_time(t: float, keep: list[tuple[float, float]]) -> float | None:
@@ -138,11 +170,13 @@ def render_clip(
     loud_seconds: set[int] | None = None,
 ) -> dict:
     """Write the finished clip to `dst`; returns sidecar extras (segments, layout, keep_ranges,
-    removed_s, cut_times, zoom_steps, overlay_bands). Cut and zoom times are on the output
-    timeline; zooms are applied before captions, so captions never zoom (vertical only; empty
-    when horizontal).
+    removed_s, cut_times, zoom_steps, overlay_bands, seam, caption_words). Cut and zoom times
+    are on the output timeline; zooms are applied before captions, so captions never zoom
+    (vertical only; empty when horizontal).
     `overlay_bands` is the [top, bottom] px of burned-in overlay cropped away (vertical only),
-    or None.
+    or None. `seam` is the output time where a cold open ends (None without one); it gets a
+    3-frame white flash and the "EARLIER…" tag. `caption_words` are the spoken words on the
+    output timeline, [start, end, text], so `hookline audit` needs no transcript.
 
     The intermediate cut (`work_dir/NN.mkv`, near-lossless libx264 + PCM audio, deleted after success)
     and the ASS file live in `work_dir`. Video is lossily encoded once (the final encode);
@@ -201,7 +235,11 @@ def render_clip(
     else:
         graph = _horizontal_graph(crop)
 
+    seam = seam_time(keep, refined.cold_open)
     out_label = "[vout]"
+    if seam is not None:
+        graph += f";[vout]{seam_flash(seam, fps)}[vseam]"
+        out_label = "[vseam]"
     if settings.captions:
         ass = work_dir / f"{name}.ass"
         text = build_ass(
@@ -210,9 +248,10 @@ def render_clip(
             duration,
             caption_y_for(layouts),
             hook_y_for(layouts),
+            seam=seam,
         )
         atomic_write_text(ass, text)
-        graph += f";[vout]{subtitles_filter(ass, fonts_dir())}[vfinal]"
+        graph += f";{out_label}{subtitles_filter(ass, fonts_dir())}[vfinal]"
         out_label = "[vfinal]"
 
     tmp = dst.with_suffix(".tmp.mp4")
@@ -243,4 +282,6 @@ def render_clip(
         "cut_times": cuts,
         "zoom_steps": [list(st) for st in steps],
         "overlay_bands": list(bands) if bands else None,
+        "seam": seam,
+        "caption_words": [[w.start, w.end, w.text] for w in out_words],
     }

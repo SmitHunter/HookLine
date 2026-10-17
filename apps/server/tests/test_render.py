@@ -353,3 +353,65 @@ def test_real_footage_bitrate_at_least_5mbps(tmp_path):
         _face_detector(s, print),
     )  # fmt: skip
     assert _video_kbps(dst) >= 5000
+
+
+# --- M2.5 Task 8: cold-open seam marker, caption words in the sidecar --------------------
+
+
+def _frame_at(path: Path, n: int):
+    import numpy as np
+
+    res = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(path),
+         "-vf", f"select=eq(n\\,{n})", "-fps_mode", "passthrough", "-frames:v", "1",
+         "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+        check=True, capture_output=True,
+    )  # fmt: skip
+    return np.frombuffer(res.stdout, np.uint8).reshape(1920, 1080, 3)
+
+
+def test_seam_time_counts_the_cold_open_ranges():
+    from hookline.pipeline.render import seam_time
+
+    keep = [(45.0, 46.2), (46.8, 48.0), (30.0, 40.0), (41.0, 55.0)]
+    assert seam_time(keep, (45.0, 48.0)) == pytest.approx(2.4)
+    assert seam_time(keep, None) is None
+    assert seam_time([(30.0, 55.0)], (45.0, 48.0)) is None  # cold open fully cut away
+
+
+def test_render_clip_cold_open_seam_flash_and_tag(
+    fixture_video, fixture_wav, fixture_words, sample_pick, settings, tmp_path, final_argvs
+):
+    pick = sample_pick.model_copy(update={"cold_open": (45.0, 48.0)})
+    dst = tmp_path / "out" / "02-cold.mp4"
+    extras = render_clip(
+        fixture_video, fixture_wav, pick, fixture_words, tmp_path / "r", dst, settings, NoFaces()
+    )
+    seam = extras["seam"]
+    assert seam == pytest.approx(3.0, abs=0.05)
+    assert seam in extras["cut_times"]
+    graph = _graph(final_argvs[0])
+    assert graph.count("drawbox=") == 3 and "color=white" in graph
+    ass = (tmp_path / "r" / "02.ass").read_text(encoding="utf-8")
+    (tag,) = [ln for ln in ass.splitlines() if "EARLIER" in ln]
+    assert ",Hook," in tag and tag.startswith("Dialogue: 1,0:00:03.00,0:00:03.80,")
+    fps = 25
+    corner = (slice(0, 60), slice(0, 60))
+    assert _frame_at(dst, round(seam * fps))[corner].min() > 230  # white flash
+    assert _frame_at(dst, round(seam * fps) - 1)[corner].min() > 150  # ramp in
+    assert _frame_at(dst, round(seam * fps) + 10)[corner].min() < 200  # gone again
+
+
+def test_render_clip_sidecar_caption_words_and_no_seam(
+    fixture_video, fixture_wav, fixture_words, sample_pick, settings, tmp_path, final_argvs
+):
+    dst = tmp_path / "out" / "03-plain.mp4"
+    extras = render_clip(
+        fixture_video, fixture_wav, sample_pick, fixture_words, tmp_path / "r", dst, settings,
+        NoFaces(),
+    )  # fmt: skip
+    assert extras["seam"] is None and "drawbox=" not in _graph(final_argvs[0])
+    words = extras["caption_words"]
+    assert words and words[0][0] <= 0.5 and words[0][2] == "line10"
+    assert all(len(w) == 3 and w[0] < w[1] for w in words)
+    assert "EARLIER" not in (tmp_path / "r" / "03.ass").read_text(encoding="utf-8")

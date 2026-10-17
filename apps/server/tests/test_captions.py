@@ -4,7 +4,16 @@ from pathlib import Path
 
 import pytest
 
-from hookline.captions.ass import build_ass, caption_y_for, group_words, hook_y_for
+from hookline.captions.ass import (
+    CAPTION_ABOVE,
+    CAPTION_BELOW,
+    CAPTION_MIN_Y,
+    build_ass,
+    caption_y_for,
+    face_rects,
+    group_words,
+    hook_y_for,
+)
 from hookline.media.subtitles import fonts_dir, subtitles_filter
 from hookline.models import Word
 from hookline.pipeline.layout import SceneLayout
@@ -41,11 +50,11 @@ def test_ass_highlights_each_word_once():
 
 
 def test_ass_header_and_styles():
-    ass = build_ass([w(0, 0.3, "no")], hook_text="Hi", duration=5, caption_y=640)
+    ass = build_ass([w(0, 0.3, "no")], hook_text="Hi", duration=5, caption_y=600)
     for s in ("PlayResX: 1080", "PlayResY: 1920", "WrapStyle: 2", "ScaledBorderAndShadow: yes"):
         assert s in ass
     assert "Style: Cap,Anton,136," in ass and "Style: Hook,Anton,136," in ass
-    assert "{\\pos(474,700)}" in ass  # 640 clamped to 700
+    assert "{\\pos(474,644)}" in ass  # 600 clamped to 644 (clear of a two-line hook)
     assert "{\\pos(474,378)\\fad" in ass  # 360 clamped: one-line box top at 290
     hook = next(e for e in _events(ass) if ",Hook," in e)
     assert hook.startswith("Dialogue: 1,0:00:00.00,0:00:03.00,")
@@ -166,15 +175,46 @@ def test_face_track_hook_moves_off_the_face():
 
 def test_face_track_captions_move_off_a_face_covering_them():
     small = [_lay("FACE_TRACK", (0.5, 0.12))]  # face 960-1190 px covers the 1180 line
-    assert caption_y_for(small) == 840  # 1180 is the band bottom: move above the face
+    y = caption_y_for(small)  # 1180 is the band bottom: move just above the face
+    assert 760 <= y and y + CAPTION_BELOW <= 960
     clear = [_lay("FACE_TRACK", (0.25, 0.3))]  # face 480-1056 px: clear of the 1180 line
     assert caption_y_for(clear) == 1180
-    big = [_lay("FACE_TRACK", (0.32, 0.5))]  # face 614-1574 px: no room above either
-    assert caption_y_for(big) == 1180 and hook_y_for(big) == 360
+    big = [_lay("FACE_TRACK", (0.32, 0.5))]  # face 614-1574 px: no clear line; least overlap
+    assert caption_y_for(big) == CAPTION_MIN_Y and hook_y_for(big) == 360
+
+
+def test_close_up_captions_go_above_the_head_clear_of_the_hook(tmp_path):
+    # a real podcast close-up: face 687-1332 px covers 1180 and reaches past the safe zone
+    close = [_lay("FACE_TRACK", (0.358, 0.336))]
+    y = caption_y_for(close)
+    assert CAPTION_MIN_Y <= y <= 687 - CAPTION_ABOVE
+    hook = _grey(
+        tmp_path, build_ass([], "Parks. Open space. All under siege.", 3, y, hook_y_for(close))
+    )
+    cap = _grey(tmp_path, build_ass([w(0, 2, "INCREDIBLE")], "", 3, y, hook_y_for(close)))
+    assert hook is not None and cap is not None and hook[3] < cap[1]  # 2-line hook clear
+    from hookline.quality import text_bbox
+
+    x0, y0, x1, y1 = text_bbox(_render(tmp_path, build_ass([w(0, 2, "HUGGING")], "", 3, y), 1.0))
+    ((fx0, fy0, fx1, fy1),) = face_rects(close[0])
+    ov = max(0, min(x1, fx1) - max(x0, fx0)) * max(0, min(y1, fy1) - max(y0, fy0))
+    assert ov / ((x1 - x0 + 1) * (y1 - y0 + 1)) <= 0.10  # Q4b
+
+
+def test_caption_line_weighs_every_face_scene_by_duration():
+    long_close = SceneLayout(start=0, end=30, kind="FACE_TRACK", face_box=(0.358, 0.336))
+    short_clear = SceneLayout(start=30, end=33, kind="FACE_TRACK", face_box=(0.2, 0.2))
+    assert caption_y_for([short_clear, long_close]) < 700  # the long close-up decides
+    split = [SceneLayout(start=0, end=5, kind="SPLIT", face_box=(0.3, 0.5))]
+    # faces 288-768 and 1248-1728 px: the line sits between them, clear of both
+    y = caption_y_for(split)
+    assert 768 + CAPTION_ABOVE < y < 1180 and y + CAPTION_BELOW < 1248
 
 
 def test_split_hook_uses_top_panel_face():
-    assert hook_y_for([_lay("SPLIT", (0.1, 0.5))]) == 920  # 96 px into the 960 px panel
+    # 96 px into the 960 px panel: hook 260 px above the captions, which sit above the
+    # bottom panel's face (1056 px) at 960
+    assert hook_y_for([_lay("SPLIT", (0.1, 0.5))]) == 700
     assert hook_y_for([_lay("SPLIT", (0.65, 0.3))]) == 360  # 624 px: below the band
 
 
@@ -328,7 +368,7 @@ def test_caption_style_outline_and_shadow():
 
 def test_caption_y_clamped_to_safe_band():
     assert "{\\pos(474,1180)}" in build_ass([w(0, 1, "x")], "", 2, caption_y=1600)
-    assert "{\\pos(474,700)}" in build_ass([w(0, 1, "x")], "", 2, caption_y=400)
+    assert "{\\pos(474,644)}" in build_ass([w(0, 1, "x")], "", 2, caption_y=400)
 
 
 def test_rendered_boxes_inside_q4_at_band_extremes(tmp_path):
