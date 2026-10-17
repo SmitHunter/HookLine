@@ -25,7 +25,7 @@ def words_to_transcript(
 ) -> Transcript:
     """Regroup a flat word list into sentence-shaped segments (shared by all backends)."""
     words = [w.model_copy(update={"text": w.text.strip()}) for w in words if w.text.strip()]
-    words = spread_collapsed(dedupe_segments(words))
+    words = spread_collapsed(dedupe_segments(words), end_limit=duration)
     sentences = split_sentences(words)
     buckets: list[list[Word]] = [[] for _ in sentences]
     idx = 0

@@ -5,7 +5,8 @@ import re
 from hookline.models import Word
 
 _MIN_RUN, _MAX_RUN = 2, 12
-_NEAR_START_S = 0.3
+_NEAR_START_S = 0.1
+_MAX_STEP_S = 0.6
 _SAME_START_S = 0.01
 _MIN_WORD_S = 0.08
 
@@ -19,7 +20,7 @@ def _is_repeat(prev: list[Word], run: list[Word]) -> bool:
         return False
     if not any(_norm(w.text) for w in run):
         return False
-    return abs(run[0].start - prev[0].start) <= _NEAR_START_S or run[0].start < prev[-1].end
+    return all(abs(a.start - b.start) <= _NEAR_START_S for a, b in zip(prev, run, strict=True))
 
 
 def dedupe_segments(words: list[Word]) -> list[Word]:
@@ -38,8 +39,11 @@ def dedupe_segments(words: list[Word]) -> list[Word]:
     return out
 
 
-def spread_collapsed(words: list[Word]) -> list[Word]:
-    """Spread runs of words sharing a start evenly up to the next distinct start."""
+def spread_collapsed(words: list[Word], end_limit: float | None = None) -> list[Word]:
+    """Spread runs of words sharing a start evenly up to the next distinct start.
+
+    A trailing run uses `end_limit` (e.g. the transcript duration) as the next start.
+    Each step is capped at 0.6 s so a run before a long pause does not stretch across it."""
     out = list(words)
     i = 0
     while i < len(out):
@@ -48,16 +52,15 @@ def spread_collapsed(words: list[Word]) -> list[Word]:
         while j < len(out) and abs(out[j].start - s) < _SAME_START_S:
             j += 1
         k = j - i
-        if k > 1 and j < len(out):
-            n = out[j].start
-            if n - s >= _MIN_WORD_S * k:
-                step = (n - s) / k
-                for m in range(k):
-                    start = s + m * step
-                    if m < k - 1:
-                        end = start + step
-                    else:
-                        end = min(max(out[i + m].end, start + _MIN_WORD_S), n)
-                    out[i + m] = out[i + m].model_copy(update={"start": start, "end": end})
+        n = out[j].start if j < len(out) else end_limit
+        if k > 1 and n is not None and n - s >= _MIN_WORD_S * k:
+            step = min((n - s) / k, _MAX_STEP_S)
+            for m in range(k):
+                start = s + m * step
+                if m < k - 1:
+                    end = start + step
+                else:
+                    end = min(max(out[i + m].end, start + _MIN_WORD_S), n)
+                out[i + m] = out[i + m].model_copy(update={"start": start, "end": end})
         i = j
     return out

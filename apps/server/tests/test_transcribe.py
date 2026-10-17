@@ -296,3 +296,41 @@ def test_words_to_transcript_applies_cleaning():
     words = [_w("hi", 1.0, 1.05), _w("there.", 1.0, 1.05), _w("ok", 2.0, 2.3)]
     t = words_to_transcript(words, "en", 5.0, timing="dtw")
     assert [w.start for w in t.words()] == pytest.approx([1.0, 1.5, 2.0])
+
+
+def test_dedupe_keeps_fast_stutter_repeats():
+    from hookline.transcribe.clean import dedupe_segments
+
+    for t in ("no", "go"):
+        words = [_w(t, 1.0 + i * 0.15, 1.0 + (i + 1) * 0.15) for i in range(4)]
+        assert len(dedupe_segments(words)) == 4
+
+
+def test_dedupe_keeps_sequential_repeat_with_small_overlap():
+    from hookline.transcribe.clean import dedupe_segments
+
+    run = ["we", "were", "here"]
+    words = [_w(t, 1.0 + i * 0.4, 1.0 + (i + 1) * 0.4 + 0.005) for i, t in enumerate(run)]
+    words += [_w(t, 2.195 + i * 0.4, 2.195 + (i + 1) * 0.4) for i, t in enumerate(run)]
+    assert len(dedupe_segments(words)) == 6
+
+
+def test_spread_trailing_run_uses_end_limit_and_caps_step():
+    from hookline.transcribe.clean import spread_collapsed
+
+    words = [_w("a", 10.0, 10.05), _w("b", 10.0, 10.05)]
+    out = spread_collapsed(words, end_limit=12.0)
+    assert [w.start for w in out] == pytest.approx([10.0, 10.6])  # step capped at 0.6
+    before_pause = [_w("a", 1.0, 1.05), _w("b", 1.0, 1.05), _w("c", 9.0, 9.2)]
+    out = spread_collapsed(before_pause)
+    assert out[1].start == pytest.approx(1.6) and out[1].end <= 2.0
+
+
+def test_cleaning_is_idempotent():
+    from hookline.transcribe.base import words_to_transcript
+
+    words = [_w("a", 1.0, 1.05), _w("b", 1.0, 1.05), _w("c", 2.0)]
+    words += [_w("x", 3.0), _w("y", 3.3), _w("x", 3.0), _w("y", 3.3)]
+    once = words_to_transcript(words, "en", 6.0, timing="dtw")
+    twice = words_to_transcript(once.words(), "en", 6.0, timing="dtw")
+    assert once.words() == twice.words()

@@ -368,6 +368,8 @@ def _old_format(fixture_video, fake_llm, s, timing: str):
     saved = json.loads(tpath.read_text(encoding="utf-8"))
     old = saved["transcript"]
     old["timing"] = timing
+    for w in old["segments"][0]["words"][:3]:  # collapsed DTW starts that need spreading
+        w["start"], w["end"] = 0.0, 0.05
     tpath.write_text(json.dumps(old), encoding="utf-8")
     return tpath
 
@@ -382,6 +384,8 @@ def test_old_format_dtw_transcript_is_migrated(fixture_video, fake_llm, settings
     assert any("transcript: migrated cached DTW transcript" in m for m in logs)
     saved = json.loads(tpath.read_text(encoding="utf-8"))
     assert saved["key"] == b.cache_key and saved["transcript"]["timing"] == "dtw"
+    starts = [w["start"] for w in saved["transcript"]["segments"][0]["words"][:3]]
+    assert len(set(starts)) == 3  # cleaning was applied during migration
     assert not tpath.with_name("transcript.json.tmp").exists()
 
 
