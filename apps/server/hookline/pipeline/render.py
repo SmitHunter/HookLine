@@ -20,13 +20,7 @@ from hookline.media.ffmpeg import (
     probe_fps,
     probe_size,
 )
-from hookline.media.loudness import (
-    COMPRESSOR,
-    ensure_true_peak,
-    loudnorm_filter,
-    loudnorm_mode,
-    measure_loudness,
-)
+from hookline.media.loudness import ensure_true_peak, plan_loudness
 from hookline.media.reframe import (
     box_hits_bands,
     box_to_crop,
@@ -184,7 +178,8 @@ def render_clip(
 
     The intermediate cut (`work_dir/NN.mkv`, near-lossless libx264 + PCM audio, deleted after success)
     and the ASS file live in `work_dir`. Video is lossily encoded once (the final encode);
-    audio once (AAC 192k, after compression and two-pass loudnorm to -14 LUFS).
+    audio once (AAC 192k, after compression, gain + peak limiting and two-pass
+    loudnorm to -14 LUFS; see `plan_loudness`).
 
     `protect_words` keeps dead-air cuts out of word spans; pass False for
     segment-interpolated word times, which tile the timeline with no gaps. `encoder` is the
@@ -215,8 +210,8 @@ def render_clip(
     inter = cut_segments(
         src, keep, work_dir / f"{name}.mkv", "libx264", quality=INTERMEDIATE_QUALITY, fps=fps
     )
-    loudness = measure_loudness(inter, COMPRESSOR)
-    audio_args = ["-af", loudnorm_filter(loudness)] if loudness else []
+    audio = plan_loudness(inter)
+    audio_args = ["-af", audio.af] if audio else []
     letterbox = detect_crop(inter)
     size = probe_size(inter)
     crop, bands = letterbox, None
@@ -282,7 +277,7 @@ def render_clip(
         ]
     )  # fmt: skip
     os.replace(tmp, dst)
-    if loudness and loudnorm_mode(loudness) != "skip":
+    if audio and audio.mode != "skip":
         ensure_true_peak(dst)
     inter.unlink(missing_ok=True)
 

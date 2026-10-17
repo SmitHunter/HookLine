@@ -71,15 +71,16 @@ def _num(v: str | float) -> float:
     return -70.0 if x == float("-inf") else x
 
 
-def loudnorm_mode(m: Loudness) -> str:
-    """ "skip" (near-silent), "linear" or "dynamic". `m` is measured AFTER the compressor.
+def loudnorm_mode(m: Loudness, target_i: float | None = None) -> str:
+    """ "skip" (near-silent), "linear" or "dynamic". `m` is measured AFTER the prefilter;
+    `target_i` is loudnorm's I (default `_target_i(m)`).
 
     Mirrors loudnorm's own rule: linear gain only works when the clip's LRA is nonzero and
     fits the target and the gained true peak stays under the ceiling; otherwise loudnorm would silently fall
     back to dynamic mode, so we ask for dynamic explicitly."""
     if m.i < SILENCE_FLOOR_LUFS:
         return "skip"
-    gain = _target_i(m) - m.i
+    gain = (_target_i(m) if target_i is None else target_i) - m.i
     if 0 < m.lra <= TARGET_LRA and m.tp + gain <= FINAL_TP:
         return "linear"
     return "dynamic"
@@ -89,23 +90,71 @@ def _target_i(m: Loudness) -> float:
     return min(TARGET_I, m.i + MAX_GAIN_DB)
 
 
-def loudnorm_filter(m: Loudness) -> str:
-    """Audio filter chain for the final encode: gentle compression, then loudnorm pass 2.
+def loudnorm_filter(m: Loudness, pre: str = COMPRESSOR, target_i: float | None = None) -> str:
+    """Audio filter chain for the final encode: `pre` (the prefilter `m` was measured after),
+    then loudnorm pass 2 aiming at `target_i` (default `_target_i(m)`).
 
     Gain is capped at +20 dB (target I = m.i + 20 when -14 would need more) so noise floors
     are not blown up; near-silent audio (< -50 LUFS) is left untouched."""
-    mode = loudnorm_mode(m)
+    target = _target_i(m) if target_i is None else target_i
+    mode = loudnorm_mode(m, target)
     log.info("audio: loudnorm %s, measured I=%.1f TP=%.1f LRA=%.1f", mode, m.i, m.tp, m.lra)
     if mode == "skip":
         return "anull"
-    base = f"loudnorm=I={_target_i(m):g}:TP={FINAL_TP:g}:LRA={TARGET_LRA:g}"
+    base = f"loudnorm=I={target:g}:TP={FINAL_TP:g}:LRA={TARGET_LRA:g}"
     if mode == "dynamic":
-        return f"{COMPRESSOR},{base}:print_format=json"
+        return f"{pre},{base}:print_format=json"
     return (
-        f"{COMPRESSOR},{base}"
+        f"{pre},{base}"
         f":measured_I={m.i:g}:measured_TP={m.tp:g}:measured_LRA={m.lra:g}"
         f":measured_thresh={m.thresh:g}:offset={m.offset:g}:linear=true:print_format=json"
     )
+
+
+# Peaks are limited BEFORE loudnorm, at the target level. Left to loudnorm, a high-crest clip
+# (true peak more than target I - FINAL_TP = 12 dB above its loudness, e.g. plosives in quiet
+# speech) forces dynamic mode, whose limiter then has to take several dB off the peaks and
+# the integrated loudness undershoots (real job e87398ed46 clip 04: crest 17 dB -> -15.0
+# LUFS). The compressor cannot help there: it runs before any gain, so on -30 LUFS speech it
+# sits below its threshold. With the peaks held at LIMIT_DB and the level near the target,
+# loudnorm can go linear: an exact gain of a fraction of a dB.
+LIMIT_DB = -3.0
+LIMITER = "alimiter=limit={lim:.4f}:attack=1:release=50:level=false:latency=true"
+PREGAIN_PASSES = 3  # limiting costs loudness, so the pre-gain is re-aimed by the measured miss
+
+
+def prefilter(gain_db: float) -> str:
+    """COMPRESSOR, then `gain_db` of gain, then a lookahead limiter at LIMIT_DB."""
+    return f"{COMPRESSOR},volume={gain_db:.2f}dB," + LIMITER.format(lim=10 ** (LIMIT_DB / 20))
+
+
+@dataclass(frozen=True)
+class AudioPlan:
+    af: str  # the final encode's audio filter
+    mode: str  # loudnorm_mode: "skip", "linear" or "dynamic"
+
+
+def plan_loudness(path: Path) -> AudioPlan | None:
+    """Measure `path`'s audio and plan its normalisation to `_target_i` (None without audio):
+    the compressed loudness sets a pre-gain to the target; the limited result is re-measured
+    and the pre-gain corrected by the miss (up to PREGAIN_PASSES measurements) until
+    loudnorm's remaining gain fits under the true-peak ceiling, so it can go linear."""
+    c = measure_loudness(path, COMPRESSOR)
+    if c is None:
+        return None
+    if loudnorm_mode(c) == "skip":
+        return AudioPlan(af=loudnorm_filter(c), mode="skip")
+    target = _target_i(c)
+    gain = target - c.i
+    for _ in range(PREGAIN_PASSES):
+        pre = prefilter(gain)
+        m = measure_loudness(path, pre)
+        miss = target - m.i
+        log.info("audio: pre-gain %.2f dB -> I=%.2f TP=%.2f", gain, m.i, m.tp)
+        if m.tp + miss <= FINAL_TP:
+            break
+        gain += miss
+    return AudioPlan(af=loudnorm_filter(m, pre, target), mode=loudnorm_mode(m, target))
 
 
 TP_TRIM_ABOVE = -1.2

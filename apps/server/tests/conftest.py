@@ -231,8 +231,11 @@ def synthetic_stream(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return out
 
 
-def _speechlike_video(dst: Path, lufs: float, duration: int = 20, steady: bool = False) -> Path:
-    """320x180 video whose audio is gated pink-noise bursts plus a 200 Hz tone (speech-like loudness range), scaled so its integrated loudness is `lufs`."""
+def _speechlike_video(
+    dst: Path, lufs: float, duration: int = 20, steady: bool = False, spikes: bool = False
+) -> Path:
+    """320x180 video whose audio is gated pink-noise bursts plus a 200 Hz tone (speech-like loudness range), scaled so its integrated loudness is `lufs`. `spikes` adds 6 ms
+    full-scale 800 Hz clicks every 0.43 s (plosive-like transients: crest factor ~18 dB)."""
     from hookline.media.loudness import measure_loudness
 
     raw = dst.with_suffix(".raw.wav")
@@ -240,12 +243,16 @@ def _speechlike_video(dst: Path, lufs: float, duration: int = 20, steady: bool =
     # Speech-like: 4 s loud, 3 s at -16 dB (LRA survives loudness's 3 s window). Steady: a
     # slow gentle swell (LRA must be nonzero or loudnorm refuses linear mode).
     gate = "0.65+0.35*sin(2*PI*t/9)" if steady else "if(lt(mod(t,7),4),1,0.15)"
+    click = r"aevalsrc='sin(2*PI*800*t)*lt(mod(t\,0.43)\,0.006)'"
+    spike_in = ["-f", "lavfi", "-i", f"{click}:s=48000:d={duration}"] if spikes else []
+    mix = "[s];[s][2:a]amix=inputs=2:normalize=0[a]" if spikes else "[a]"
     subprocess.run(
         ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
          "-f", "lavfi", "-i", f"anoisesrc=color=pink:seed=7:amplitude={noise_amp}:sample_rate=48000:duration={duration}",
          "-f", "lavfi", "-i", f"sine=frequency=200:sample_rate=48000:duration={duration}",
+         *spike_in,
          "-filter_complex",
-         f"[0:a][1:a]amix=inputs=2:normalize=0,volume='{gate}':eval=frame[a]",
+         f"[0:a][1:a]amix=inputs=2:normalize=0,volume='{gate}':eval=frame{mix}",
          "-map", "[a]", "-c:a", "pcm_s16le", str(raw)],
         check=True,
     )  # fmt: skip
@@ -272,6 +279,13 @@ def quiet_speech_video(tmp_path_factory: pytest.TempPathFactory) -> Path:
 def steady_quiet_video(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """20 s low-crest clip (steady tone, LRA ~0) at about -30 LUFS: loudnorm can go linear."""
     return _speechlike_video(tmp_path_factory.mktemp("loud") / "steady.mp4", -30.0, steady=True)
+
+
+@pytest.fixture(scope="session")
+def high_crest_video(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """20 s speech-like clip at about -32 LUFS with ~18 dB crest factor: loudnorm's limiter
+    must take several dB off the peaks (real job e87398ed46 clip 04 landed at -15.0)."""
+    return _speechlike_video(tmp_path_factory.mktemp("loud") / "crest.mp4", -32.0, spikes=True)
 
 
 @pytest.fixture(scope="session")

@@ -58,6 +58,28 @@ def test_loudnorm_filter_skips_below_minus_50():
     assert loudnorm_filter(_m(-60.0)) == "anull"
 
 
+def test_plan_loudness_regains_limiter_loss_and_keeps_gain_cap(monkeypatch, tmp_path):
+    """The pre-gain aims the limited signal at the (capped) target and is re-aimed by the
+    loudness the limiter took; loudnorm then targets the source's capped I, not -14."""
+    from hookline.media import loudness as loud_mod
+
+    calls = []
+
+    def fake(path, pre=None):
+        calls.append(pre)
+        if pre == loud_mod.COMPRESSOR:
+            return _m(-45.0, tp=-30.0)  # capped: target -25
+        gain = float(pre.split("volume=")[1].split("dB")[0])
+        lost = 1.5 if len(calls) == 2 else 0.4  # loudness the limiter takes
+        return _m(-45.0 + gain - lost, tp=-3.0)  # peaks held at the limiter ceiling
+
+    monkeypatch.setattr(loud_mod, "measure_loudness", fake)
+    plan = loud_mod.plan_loudness(tmp_path / "x.mkv")
+    assert [c.split(",")[1] for c in calls[1:]] == ["volume=20.00dB", "volume=21.50dB"]
+    assert "alimiter=" in calls[1] and plan.af.startswith(calls[2])
+    assert "loudnorm=I=-25:" in plan.af and plan.mode == "linear"
+
+
 def _render(video, tmp_path, sample_pick, settings, final_argvs):
     from hookline.media.ffmpeg import extract_audio
     from hookline.models import Word
@@ -101,6 +123,22 @@ def test_speech_like_clip_is_dynamic_and_minus_14(
     quiet_speech_video, sample_pick, settings, tmp_path, final_argvs
 ):
     _check_render(quiet_speech_video, tmp_path, sample_pick, settings, final_argvs, "dynamic")
+
+
+def test_high_crest_clip_lands_on_target(
+    high_crest_video, sample_pick, settings, tmp_path, final_argvs
+):
+    """Regression (e87398ed46 clip 04, -15.0 LUFS): when dynamic loudnorm's limiter has to
+    take several dB off the peaks, its output undershoots the target. The render must check
+    what the chain actually produces and correct for it."""
+    src = measure_loudness(high_crest_video)
+    print(f"source: I={src.i} TP={src.tp} crest={src.tp - src.i:.1f}")
+    assert src.tp - src.i > 16  # the limiter must take > 4 dB off at -14 / -2 dBTP
+    dst, _ = _render(high_crest_video, tmp_path, sample_pick, settings, final_argvs)
+    m = measure_loudness(dst)
+    print(f"high crest -> I={m.i} TP={m.tp}")
+    assert m.i == pytest.approx(-14.0, abs=0.5)
+    assert m.tp <= -1.0
 
 
 def test_near_silent_clip_not_boosted(
