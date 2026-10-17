@@ -180,3 +180,34 @@ def long_sentences(long_transcript: Transcript) -> list[Sentence]:
 @pytest.fixture
 def short_transcript() -> Transcript:
     return _synthetic_transcript(60.0)
+
+
+def _lavfi_wav(dst: Path, *sources: str) -> Path:
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
+    for s in sources:
+        cmd += ["-f", "lavfi", "-i", s]
+    n = len(sources)
+    cmd += ["-filter_complex", f"{''.join(f'[{i}:a]' for i in range(n))}concat=n={n}:v=0:a=1[a]"]
+    cmd += ["-map", "[a]", "-c:a", "pcm_s16le", str(dst)]
+    subprocess.run(cmd, check=True)
+    return dst
+
+
+@pytest.fixture(scope="session")
+def tone_gap_wav(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """16 kHz mono: 1 s tone, 1 s silence, 2 s tone."""
+    return _lavfi_wav(
+        tmp_path_factory.mktemp("audio") / "tone_gap.wav",
+        "sine=frequency=440:sample_rate=16000:duration=1",
+        "anullsrc=r=16000:cl=mono:d=1",
+        "sine=frequency=440:sample_rate=16000:duration=2",
+    )
+
+
+@pytest.fixture(scope="session")
+def tone_wav(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """16 kHz mono: 3 s continuous tone."""
+    return _lavfi_wav(
+        tmp_path_factory.mktemp("audio") / "tone.wav",
+        "sine=frequency=440:sample_rate=16000:duration=3",
+    )
