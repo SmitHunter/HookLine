@@ -15,6 +15,7 @@ SPLIT_H = OUT_H // 2  # 960
 TRACK_ALPHA = 0.3
 TRACK_DEADBAND = 0.05
 BLUR = "boxblur=20:2"
+MIN_SCENE = 1 / 30
 
 _CROP_RE = re.compile(r"crop=(\d+):(\d+):(\d+):(\d+)")
 _CROP_SAMPLES = 5
@@ -67,15 +68,18 @@ def _fill(w: int, h: int) -> str:
 
 
 def _smooth(keyframes: list[tuple[float, float]]) -> list[tuple[float, float]]:
-    """EMA (alpha 0.3) that only moves when the raw value differs by more than the deadband."""
+    """EMA (alpha 0.3) chasing a deadbanded target: the target jumps to the raw value only
+    when it differs by more than 0.05; the output eases toward the target every step."""
     out: list[tuple[float, float]] = []
-    s = 0.0
+    target = smoothed = 0.0
     for i, (t, x) in enumerate(sorted(keyframes)):
         if i == 0:
-            s = x
-        elif abs(x - s) > TRACK_DEADBAND:
-            s += TRACK_ALPHA * (x - s)
-        out.append((t, s))
+            target = smoothed = x
+        else:
+            if abs(x - target) > TRACK_DEADBAND:
+                target = x
+            smoothed += TRACK_ALPHA * (target - smoothed)
+        out.append((t, smoothed))
     return out
 
 
@@ -88,9 +92,10 @@ def track_x_expr(keyframes: list[tuple[float, float]], in_w: int, crop_w: int) -
         return _fmt(hi / 2)
     expr = _fmt(pts[-1][1])
     for (t0, x0), (t1, x1) in reversed(list(pairwise(pts))):
-        if t1 <= t0:
-            continue
-        lerp = f"{_fmt(x0)}+({_fmt(x1 - x0)})*(t-{_fmt(t0)})/{_fmt(t1 - t0)}"
+        dt = _fmt(t1 - t0)
+        if t1 <= t0 or dt == "0":
+            continue  # degenerate segment: would divide by zero once formatted
+        lerp = f"{_fmt(x0)}+({_fmt(x1 - x0)})*(t-{_fmt(t0)})/{dt}"
         expr = f"if(lt(t,{_fmt(t1)}),{lerp},{expr})"
     return f"if(lt(t,{_fmt(pts[0][0])}),{_fmt(pts[0][1])},{expr})"
 
@@ -156,7 +161,10 @@ def reframe_graph(
     crop: tuple[int, int, int, int] | None = None,
 ) -> str:
     """Full -filter_complex: [0:v] (crop) -> split -> per-scene trim + scene_filter -> concat [vout].
-    When `crop` is given, in_w/in_h are the cropped size."""
+    When `crop` is given, in_w/in_h are the cropped size. Scenes shorter than 1/30 s are dropped."""
+    layouts = [lay for lay in layouts if lay.end - lay.start >= MIN_SCENE]
+    if not layouts:
+        raise ValueError("no layouts")
     n = len(layouts)
     pre = f"crop={crop[0]}:{crop[1]}:{crop[2]}:{crop[3]}," if crop else ""
     parts = [f"[0:v]{pre}split={n}" + "".join(f"[s{i}]" for i in range(n))]

@@ -1,3 +1,4 @@
+import math
 import subprocess
 
 import pytest
@@ -73,6 +74,49 @@ def test_track_expression_clamps_edges_and_interpolates():
     for t in (0, 0.5, 1, 1.5, 2, 2.5, 3, 10):
         assert 0 <= evaluate(expr, t=t) <= 1920 - 607
     assert evaluate(expr, t=0) < evaluate(expr, t=0.5) < evaluate(expr, t=1)
+
+
+def _centre(expr: str, t: float, in_w: int = 1000, crop_w: int = 100) -> float:
+    """Normalized centre x back from an evaluated left edge."""
+    return (evaluate(expr, t=t) + crop_w / 2) / in_w
+
+
+def test_track_ema_converges_to_steady_target():
+    kfs = [(0, 0.5)] + [(i, 0.9) for i in range(1, 16)]
+    expr = track_x_expr(kfs, in_w=1000, crop_w=100)
+    assert _centre(expr, t=15) == pytest.approx(0.9, abs=0.01)
+
+
+def test_track_jitter_inside_deadband_holds_still():
+    kfs = [(i, 0.5 + (0.03 if i % 2 else -0.03)) for i in range(1, 12)]
+    expr = track_x_expr([(0, 0.5), *kfs], in_w=1000, crop_w=100)
+    for t in (0, 0.5, 3, 7.5, 11):
+        assert _centre(expr, t=t) == pytest.approx(0.5)
+
+
+def test_track_tiny_time_delta_has_no_division_by_zero():
+    expr = track_x_expr([(0, 0.2), (0.0003, 0.8), (1, 0.8)], in_w=1000, crop_w=100)
+    assert "/0)" not in expr and "/0," not in expr and not expr.endswith("/0")
+    for t in (0, 0.0001, 0.0003, 0.5, 1):
+        v = evaluate(expr, t=t)
+        assert math.isfinite(v) and 0 <= v <= 900
+
+
+def test_reframe_graph_rejects_empty_and_drops_tiny_scenes():
+    with pytest.raises(ValueError, match="no layouts"):
+        reframe_graph([], 1280, 720)
+    with pytest.raises(ValueError, match="no layouts"):
+        reframe_graph([SceneLayout(start=1, end=1.01, kind="FIT_BLUR")], 1280, 720)
+    graph = reframe_graph(
+        [
+            SceneLayout(start=0, end=2, kind="FIT_BLUR"),
+            SceneLayout(start=2, end=2.02, kind="FIT_BLUR"),
+            SceneLayout(start=2.02, end=4, kind="FIT_BLUR"),
+        ],
+        1280,
+        720,
+    )
+    assert "split=2[" in graph and "concat=n=2:" in graph
 
 
 def test_track_expression_empty_is_centre():
