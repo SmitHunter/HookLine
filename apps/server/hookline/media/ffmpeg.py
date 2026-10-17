@@ -81,6 +81,14 @@ def probe_size(path: Path) -> tuple[int, int]:
     return int(streams[0]["width"]), int(streams[0]["height"])
 
 
+def has_audio(path: Path) -> bool:
+    res = _run(
+        ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries",
+         "stream=index", "-of", "csv=p=0", str(path)]
+    )  # fmt: skip
+    return bool(res.stdout.strip())
+
+
 def extract_audio(src: Path, dst: Path) -> Path:
     _run(
         [
@@ -177,6 +185,7 @@ def cut_segments(
     if fps is None:
         fps = probe_fps(src)
     half = 0.5 / fps
+    with_audio = has_audio(src)
     video = encoder_args(encoder) if quality is None else ["-c:v", encoder, *quality]
     cmd = ["ffmpeg", "-hide_banner", "-y"]
     parts = []
@@ -186,23 +195,26 @@ def cut_segments(
         cmd += ["-ss", f"{seek:.6f}", "-t", f"{b + 1:.6f}", "-i", str(src)]
         parts.append(
             f"[{i}:v]trim=start={max(a - half, 0):.6f}:end={b - half:.6f},"
-            f"setpts=PTS-STARTPTS[v{i}];"
-            f"[{i}:a]atrim=start={a:.6f}:end={b:.6f},asetpts=PTS-STARTPTS[a{i}]"
+            f"setpts=PTS-STARTPTS[v{i}]"
+            + (
+                f";[{i}:a]atrim=start={a:.6f}:end={b:.6f},asetpts=PTS-STARTPTS[a{i}]"
+                if with_audio
+                else ""
+            )
         )
     n = len(segments)
-    inputs = "".join(f"[v{i}][a{i}]" for i in range(n))
+    inputs = "".join(f"[v{i}][a{i}]" if with_audio else f"[v{i}]" for i in range(n))
+    outs = "[v][a]" if with_audio else "[v]"
     cmd += [
         "-filter_complex",
-        ";".join(parts) + f";{inputs}concat=n={n}:v=1:a=1[v][a]",
+        ";".join(parts) + f";{inputs}concat=n={n}:v=1:a={int(with_audio)}{outs}",
         "-map",
         "[v]",
-        "-map",
-        "[a]",
+        *(["-map", "[a]"] if with_audio else []),
         *video,
         "-pix_fmt",
         "yuv420p",
-        "-c:a",
-        "pcm_s16le",
+        *(["-c:a", "pcm_s16le"] if with_audio else []),
     ]
     tmp = dst.with_suffix(f".tmp{dst.suffix}")
     _run([*cmd, str(tmp)])

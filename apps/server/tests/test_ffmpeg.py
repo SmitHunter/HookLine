@@ -72,6 +72,7 @@ def test_cut_segments_passes_encoder_args(monkeypatch, tmp_path):
         (tmp_path / "o.tmp.mkv").write_bytes(b"x")
 
     monkeypatch.setattr(ffmpeg_mod, "_run", fake_run)
+    monkeypatch.setattr(ffmpeg_mod, "has_audio", lambda p: True)
     cut_segments(tmp_path / "in.mp4", [(0.0, 1.0)], tmp_path / "o.mkv", "h264_amf", fps=25)
     cmd = seen[0]
     i = cmd.index("-c:v")
@@ -99,6 +100,7 @@ def test_cut_segments_quality_replaces_rate_control(monkeypatch, tmp_path):
         (tmp_path / "o.tmp.mkv").write_bytes(b"x")
 
     monkeypatch.setattr(ffmpeg_mod, "_run", fake_run)
+    monkeypatch.setattr(ffmpeg_mod, "has_audio", lambda p: True)
     q = ["-preset", "veryfast", "-crf", "12"]
     cut_segments(
         tmp_path / "in.mp4", [(0.0, 1.0)], tmp_path / "o.mkv", "libx264", quality=q, fps=25

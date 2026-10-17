@@ -2,11 +2,12 @@
 
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from hookline.media.ffmpeg import FFmpegError, _run
+from hookline.media.ffmpeg import FFmpegError, _run, has_audio
 
 TARGET_I = -14.0
 TARGET_TP = -1.0
@@ -28,14 +29,6 @@ class Loudness:
     lra: float
     thresh: float
     offset: float
-
-
-def has_audio(path: Path) -> bool:
-    res = _run(
-        ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries",
-         "stream=index", "-of", "csv=p=0", str(path)]
-    )  # fmt: skip
-    return bool(res.stdout.strip())
 
 
 def parse_loudnorm_json(stderr: str) -> dict:
@@ -113,3 +106,31 @@ def loudnorm_filter(m: Loudness) -> str:
         f":measured_I={m.i:g}:measured_TP={m.tp:g}:measured_LRA={m.lra:g}"
         f":measured_thresh={m.thresh:g}:offset={m.offset:g}:linear=true:print_format=json"
     )
+
+
+TP_TRIM_ABOVE = -1.2
+TP_TRIM_TARGET = -1.5
+
+
+def ensure_true_peak(dst: Path) -> float | None:
+    """Post-encode safety net: AAC can overshoot the limiter ceiling. When `dst`'s true peak
+    is above -1.2 dBTP, re-encode only its audio with a volume trim to land at about -1.5.
+    Returns the trim in dB (None when nothing was done)."""
+    m = measure_loudness(dst)
+    if m is None or m.tp <= TP_TRIM_ABOVE:
+        return None
+    trim = TP_TRIM_TARGET - m.tp
+    tmp = dst.with_suffix(".trim" + dst.suffix)
+    _run(
+        [
+            "ffmpeg", "-hide_banner", "-y", "-i", str(dst),
+            "-map", "0:v", "-map", "0:a", "-c:v", "copy",
+            "-af", f"volume={trim:.2f}dB",
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+            "-movflags", "+faststart", str(tmp),
+        ]
+    )  # fmt: skip
+    os.replace(tmp, dst)
+    after = measure_loudness(dst)
+    log.info("audio: true-peak trim %.2f dB -> TP %s", trim, f"{after.tp:.2f}" if after else "?")
+    return trim

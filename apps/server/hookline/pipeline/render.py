@@ -16,7 +16,13 @@ from hookline.media.ffmpeg import (
     probe_fps,
     probe_size,
 )
-from hookline.media.loudness import COMPRESSOR, loudnorm_filter, measure_loudness
+from hookline.media.loudness import (
+    COMPRESSOR,
+    ensure_true_peak,
+    loudnorm_filter,
+    loudnorm_mode,
+    measure_loudness,
+)
 from hookline.media.reframe import detect_crop, reframe_graph
 from hookline.media.subtitles import fonts_dir, subtitles_filter
 from hookline.models import ClipPick, Word
@@ -122,6 +128,8 @@ def render_clip(
         ]
     )  # fmt: skip
     os.replace(tmp, dst)
+    if loudness and loudnorm_mode(loudness) != "skip":
+        ensure_true_peak(dst)
     inter.unlink(missing_ok=True)
 
     kept = sum(e - s for s, e in keep)

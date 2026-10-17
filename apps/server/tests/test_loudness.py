@@ -4,6 +4,7 @@ from hookline.media.ffmpeg import _run
 from hookline.media.loudness import (
     COMPRESSOR,
     Loudness,
+    ensure_true_peak,
     loudnorm_filter,
     loudnorm_mode,
     measure_loudness,
@@ -103,9 +104,14 @@ def test_speech_like_clip_is_dynamic_and_minus_14(
 
 
 def test_near_silent_clip_not_boosted(
-    near_silent_video, sample_pick, settings, tmp_path, monkeypatch
+    near_silent_video, sample_pick, settings, tmp_path, final_argvs, monkeypatch
 ):
-    dst, _ = _render(near_silent_video, tmp_path, sample_pick, settings, monkeypatch)
+    from hookline.pipeline import render as render_mod
+
+    trims = []
+    monkeypatch.setattr(render_mod, "ensure_true_peak", lambda p: trims.append(p))
+    dst, _ = _render(near_silent_video, tmp_path, sample_pick, settings, final_argvs)
+    assert trims == []  # near-silent audio is skipped, so no true-peak check either
     m = measure_loudness(dst)
     print(f"silent -> I={m.i} TP={m.tp}")
     assert m.i <= -40.0
@@ -143,3 +149,87 @@ def test_intermediate_is_mkv_pcm(
     _render(quiet_speech_video, tmp_path, sample_pick, settings, final_argvs)
     assert seen[0].suffix == ".mkv" and seen[1] == "pcm_s16le"
     assert not seen[0].exists()  # removed after success
+
+
+def _hot_clip(src, dst, tp_db=-0.4):
+    """Copy of `src` with audio gained so its true peak is about `tp_db`."""
+    gain = tp_db - measure_loudness(src).tp
+    _run(["ffmpeg", "-hide_banner", "-v", "error", "-y", "-i", str(src), "-af",
+          f"volume={gain:.2f}dB", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", str(dst)])  # fmt: skip
+    return dst
+
+
+def test_ensure_true_peak_trims_hot_file(steady_quiet_video, tmp_path):
+    hot = _hot_clip(steady_quiet_video, tmp_path / "hot.mp4")
+    before = measure_loudness(hot)
+    assert before.tp > -1.2
+    trim = ensure_true_peak(hot)
+    after = measure_loudness(hot)
+    print(f"trim {trim:.2f} dB: TP {before.tp} -> {after.tp}, I {before.i} -> {after.i}")
+    assert trim < 0 and after.tp <= -1.0
+    assert not hot.with_suffix(".trim.mp4").exists()
+    streams = _run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_name",
+                    "-of", "csv=p=0", str(hot)]).stdout  # fmt: skip
+    assert "aac" in streams and "h264" in streams
+
+
+def test_ensure_true_peak_leaves_safe_file_alone(steady_quiet_video, tmp_path, monkeypatch):
+    from hookline.media import loudness as loud_mod
+
+    calls = []
+    monkeypatch.setattr(loud_mod, "_run", lambda cmd: calls.append(cmd))
+    monkeypatch.setattr(loud_mod, "measure_loudness", lambda p: _m(-14.0, tp=-1.8))
+    before = steady_quiet_video.read_bytes()
+    assert ensure_true_peak(steady_quiet_video) is None
+    assert calls == [] and steady_quiet_video.read_bytes() == before
+
+
+def test_ensure_true_peak_runs_on_hot_measurement(steady_quiet_video, tmp_path, monkeypatch):
+    from hookline.media import loudness as loud_mod
+
+    copy = tmp_path / "c.mp4"
+    copy.write_bytes(steady_quiet_video.read_bytes())
+    tps = iter([-0.4, -1.9])
+    monkeypatch.setattr(loud_mod, "measure_loudness", lambda p: _m(-14.0, tp=next(tps)))
+    cmds = []
+    real = loud_mod._run
+    monkeypatch.setattr(loud_mod, "_run", lambda cmd: (cmds.append(cmd), real(cmd))[1])
+    trim = ensure_true_peak(copy)
+    assert trim == pytest.approx(-1.1)
+    (cmd,) = cmds
+    assert cmd[cmd.index("-c:v") + 1] == "copy" and "volume=-1.10dB" in cmd
+
+
+def test_render_runs_true_peak_check(
+    quiet_speech_video, sample_pick, settings, tmp_path, final_argvs, monkeypatch
+):
+    from hookline.pipeline import render as render_mod
+
+    checked = []
+    monkeypatch.setattr(render_mod, "ensure_true_peak", lambda p: checked.append(p))
+    dst, _ = _render(quiet_speech_video, tmp_path, sample_pick, settings, final_argvs)
+    assert checked == [dst]
+
+
+def test_render_without_audio_stream(
+    quiet_speech_video, sample_pick, settings, tmp_path, final_argvs
+):
+    from hookline.media.ffmpeg import extract_audio
+
+    silent = tmp_path / "noaudio.mp4"
+    _run(["ffmpeg", "-hide_banner", "-v", "error", "-y", "-f", "lavfi", "-i",
+          "testsrc2=size=320x180:rate=25:duration=20", "-c:v", "libx264",
+          "-pix_fmt", "yuv420p", str(silent)])  # fmt: skip
+    wav = extract_audio(quiet_speech_video, tmp_path / "a.wav")  # timing source only
+    from hookline.models import Word
+
+    words = [Word(start=float(t), end=t + 0.5, text="hi") for t in range(20)]
+    pick = sample_pick.model_copy(update={"start": 2.0, "end": 16.0})
+    s = settings.model_copy(update={"captions": False})
+    dst = tmp_path / "out" / "01-x.mp4"
+    render_clip(silent, wav, pick, words, tmp_path / "r", dst, s, NoFaces())
+    assert dst.exists()
+    (final,) = final_argvs
+    assert "-af" not in final
+    assert _run(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries",
+                 "stream=index", "-of", "csv=p=0", str(dst)]).stdout.strip() == ""  # fmt: skip
