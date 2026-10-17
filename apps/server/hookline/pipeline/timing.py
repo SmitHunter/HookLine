@@ -66,13 +66,17 @@ def _quiet_from(env: Envelope, start: float, limit: float, threshold_db: float) 
     return env.time(run_start) if run and run_start is not None else None
 
 
-def voice_threshold(env: Envelope, silence_db: float) -> float:
+def voice_threshold(env: Envelope, silence_db: float) -> float | None:
     """dB above which the envelope counts as voice: the local noise floor (its FLOOR_QUANTILE
-    percentile) + FLOOR_MARGIN_DB, within [silence_db - VOICE_MARGIN_DB, silence_db]."""
+    percentile) + FLOOR_MARGIN_DB, at least silence_db - VOICE_MARGIN_DB. None when that
+    would be louder than silence_db: the bed is too close to the speech to tell word ends,
+    onsets or a clean tail from it (the caller keeps the transcript's timings)."""
     if not len(env.db):
         return silence_db - VOICE_MARGIN_DB
     floor = float(np.percentile(env.db, FLOOR_QUANTILE))
-    return min(max(floor + FLOOR_MARGIN_DB, silence_db - VOICE_MARGIN_DB), silence_db)
+    if floor + FLOOR_MARGIN_DB > silence_db:
+        return None
+    return max(floor + FLOOR_MARGIN_DB, silence_db - VOICE_MARGIN_DB)
 
 
 def protected_words(raw: list[Word], refined: list[Word]) -> list[Word]:
@@ -157,16 +161,19 @@ def tail_end(
     env: Envelope,
     threshold_db: float,
     max_tail: float = MAX_TAIL_S,
+    next_end: float = np.inf,
 ) -> float:
     """Clip end (source s) after the last word (ending `last_end`) for a current end `end`:
     a little (TAIL_PAD_S) into the first silence after the word, within `max_tail` of it and
     TAIL_GUARD_S short of the next word; with no silence in reach, the quietest point there.
-    A transcript `next_start` inside the last word's continuing sound (no audible onset before
-    the energy falls: DTW misplaced it) is replaced by the next audible onset after that
-    fall. Never earlier than `end`."""
+    A transcript next word (`next_start`-`next_end`) starting inside the last word's
+    continuing sound but running past where it falls silent (no audible onset of its own
+    before that: DTW misplaced it) is replaced by the next audible onset after the fall; a
+    next word lying wholly inside that sound is audible, so the tail stops at its start (a
+    whole word is never swallowed). Never earlier than `end`."""
     if _covers(env, last_end):
         fall = _quiet_from(env, last_end, last_end + max_tail, threshold_db)
-        if fall is not None and next_start < fall:
+        if fall is not None and next_start < fall < next_end:
             next_start = _rise_from(env, fall, threshold_db)
     hi = min(last_end + max_tail, next_start - TAIL_GUARD_S)
     if hi <= end or not _covers(env, last_end):

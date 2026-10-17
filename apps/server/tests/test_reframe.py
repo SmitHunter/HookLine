@@ -1163,3 +1163,144 @@ def test_rendered_zoom_steps_map_levels_through_each_scene():
     assert got[1][1] == pytest.approx(soft.zoom_level(ZOOM_IN)) and got[1][1] < ZOOM_IN
     assert got[2][1] == pytest.approx(1.12)  # the soft scene's punch renders at its cap
     assert got[3] == (4.0, pytest.approx(ZOOM_IN))
+
+
+# --- wave D review round 2: guard fixed point, holds hold, shifts checked as rendered ------
+
+
+def _lean_at(start: float, end: float, xs: list[float], fw: float = 0.13) -> SceneLayout:
+    return SceneLayout(
+        start=start, end=end, kind="FACE_TRACK",
+        track_x=[(start + i * 0.25, x) for i, x in enumerate(xs)],
+        face_w=fw, face_box=(0.3, 0.3), head_top=0.15,
+    )  # fmt: skip
+
+
+_LEAN = [0.5] * 8 + [0.6, 0.7, 0.75, 0.75, 0.75, 0.75, 0.7, 0.6] + [0.5] * 8
+_WOBBLE = [0.5 + (0.12 if (i // 2) % 2 else -0.12) for i in range(40)]
+_TWO_HOLDS = [0.5] * 4 + [0.75] * 4 + [0.5] * 5 + [0.25] * 4 + [0.5] * 8 + [0.75] * 4 + [0.5] * 10
+_GUARD_CASES = {  # the round-2 reviewer's probes (probeD/probe1.py, probe3.py)
+    "cut inside hold": (
+        [_lean_at(0, 6, _LEAN)],
+        [(0.0, 1.0), (1.0, ZOOM_IN), (3.0, 1.0), (5.5, ZOOM_IN)],
+        [3.0],
+    ),
+    "beat inside hold": (
+        [_lean_at(0, 6, _LEAN)],
+        [(0.0, 1.0), (1.0, ZOOM_IN), (3.0, 1.0), (5.5, ZOOM_IN)],
+        [],
+    ),
+    "whole-scene hold": (
+        [_lean_at(0, 10, _WOBBLE)],
+        [(0.0, 1.0), (2.0, ZOOM_IN), (4.0, 1.0), (6.0, ZOOM_IN), (8.0, ZOOM_PUNCH)],
+        [2.0, 4.0, 6.0, 8.0],
+    ),
+    "face at frame edge": (
+        [_lean_at(0, 10, [0.93] * 40)],
+        [(0.0, 1.0), (2.0, ZOOM_IN), (4.0, 1.0), (6.0, ZOOM_IN)],
+        [2.0, 4.0, 6.0],
+    ),
+    "back-to-back holds": (
+        [_lean_at(0, 10, _TWO_HOLDS)],
+        [(0.0, 1.0), (0.5, ZOOM_IN), (2.6, 1.0), (4.5, ZOOM_IN), (8.0, 1.0)],
+        [2.6, 4.5],
+    ),
+    "return inside the next span": (
+        [_lean_at(0, 10, _TWO_HOLDS)],
+        [(0.0, 1.0), (0.5, ZOOM_IN), (1.9, 1.0), (3.3, ZOOM_IN), (8.0, 1.0)],
+        [1.9, 3.3],
+    ),
+    "cut pulls span earlier": (
+        [_lean_at(0, 10, _TWO_HOLDS)],
+        [(0.0, 1.0), (0.5, ZOOM_IN), (4.65, 1.0), (5.1, ZOOM_IN), (8.5, 1.0)],
+        [4.65, 5.1],
+    ),
+    "hold across a camera change": (
+        [
+            _lean_at(0, 3, [0.5] * 8 + [0.62, 0.7, 0.75, 0.75]),
+            _lean_at(3, 7, [0.75, 0.75, 0.7, 0.6] + [0.5] * 12),
+        ],
+        [(0.0, 1.0), (1.0, ZOOM_IN), (3.0, 1.0), (5.0, ZOOM_IN)],
+        [3.0],
+    ),
+}
+
+
+def _final_spans(steps, lay, in_w=1920, in_h=864):
+    from hookline.media.reframe import _track_w, track_guard_spans, zoom_at_fn
+
+    rel = [(t - lay.start, x) for t, x in lay.track_x]
+    spans = track_guard_spans(
+        rel, in_w, _track_w(in_w, in_h), lay.face_w, lay.track_w or None, lay.lead,
+        zoom_top=zoom_at_fn(steps, lay),
+    )  # fmt: skip
+    return [(a + lay.start, b + lay.start) for a, b in spans]
+
+
+@pytest.mark.parametrize("name", list(_GUARD_CASES))
+def test_guard_zoom_is_a_fixed_point_and_holds_hold(name):
+    from hookline.media.reframe import guard_zoom
+
+    lays, steps, cuts = _GUARD_CASES[name]
+    lays = [plan_zoom(lay, 1920, 864) for lay in lays]
+    held, out = guard_zoom(lays, 1920, 864, steps, cuts)
+    again, out2 = guard_zoom(out, 1920, 864, held, cuts)
+    assert again == held and [o.shift_steps for o in out2] == [o.shift_steps for o in out]
+    for lay in out:  # the guard does not fire again at the zoom it renders
+        for a, b in _final_spans(held, lay):
+            inside = [(t, v) for t, v in held if a <= t < b and v != 1.0]
+            assert not inside, (name, (a, b), inside)
+
+
+def test_hold_spans_never_zooms_in_inside_a_hold_nor_returns_into_the_next():
+    from hookline.media.reframe import _hold_spans
+
+    class Fit:
+        def __init__(self, ok):
+            self.ok = ok
+
+        def fits(self, level, t0, t1, shift=0.0, path=False):
+            return self.ok(level, shift)
+
+        def toward(self, t):
+            return 1.0
+
+    def run(steps, spans, cuts, ok, scene=(0, 20)):
+        held, shifts = _hold_spans(list(steps), spans, cuts, (), Fit(ok), scene)
+        for a, b in spans:
+            assert not [(t, v) for t, v in held if a <= t < b and v != 1.0], (held, spans)
+        return held, shifts
+
+    yes = lambda lvl, sh: True
+    held, _ = run([(0, 1.0), (1, ZOOM_IN), (3.9, 1.0), (4.4, ZOOM_IN), (9, 1.0)],
+                  [(2, 4), (5.1, 7)], [3.9, 4.4], yes)  # fmt: skip
+    assert not [t for t, _ in held if 4.9 < t < 5.1]  # no return 0.2 s before the next hold
+    held, shifts = run([(0, 1.0), (1, ZOOM_IN), (5.8, 1.0)], [(2, 6)], [5.8], yes, scene=(0, 6))
+    assert all(t < 6 for t, _ in held) and all(t < 6 for t, _ in shifts)  # not past the scene
+    held, shifts = run([(0, 1.0), (3, ZOOM_IN), (5, 1.0)], [(2, 8)], [3, 5],
+                       lambda lvl, sh: not sh)  # fmt: skip
+    assert shifts == []  # no safe change: the cuts alone change the framing (pinned edge)
+
+
+def test_guard_shifts_are_checked_at_the_rendered_zoom():
+    # a shift outside a hold, where the crop renders zoomed in, is validated at that zoom
+    from hookline.media.reframe import _SceneFit, zoom_at_fn
+
+    lay = plan_zoom(_lean_at(0, 6, [0.5] * 24, fw=0.17), 1920, 864)
+    steps = [(0.0, ZOOM_IN)]
+    fit = _SceneFit(lay, 1920, 864, zoom_at_fn(steps, lay), steps)
+    room_base = 486 * 0.42 / lay.zoom_level(1.0)
+    room_zoomed = 486 * 0.42 / lay.zoom_level(ZOOM_IN)
+    # a shift that fits the base view but not the zoomed one
+    shift = (room_base - 0.17 * 1920 / 2) / 486 * 0.99
+    assert shift * 486 > room_zoomed - 0.17 * 1920 / 2
+    assert not fit.fits(None, 1.0, 2.0, shift=shift)
+
+
+def test_face_offset_includes_the_guard_shifts():
+    from hookline.media.reframe import face_offset
+
+    lay = _lean_at(0, 6, [0.5] * 24, fw=0.1)
+    plain = face_offset(lay, 1920, 864, [(0.0, 1.0)])
+    shifted = lay.model_copy(update={"shift_steps": [(0.0, 0.04)]})
+    assert face_offset(shifted, 1920, 864, [(0.0, 1.0)]) == pytest.approx(plain - 0.04, abs=1e-3)

@@ -136,7 +136,7 @@ def test_voice_threshold_follows_the_local_noise_floor():
     from hookline.pipeline.timing import voice_threshold
 
     assert voice_threshold(_env([(1.0, 2.0)]), -32.0) == pytest.approx(-44.0)  # clean: -32 - 12
-    assert voice_threshold(_noisy([(1.0, 2.0)]), -32.0) == pytest.approx(-32.0)  # -38 + 9, capped
+    assert voice_threshold(_noisy([(1.0, 2.0)]), -32.0) is None  # -38 + 9 > -32: too noisy
     mid = _noisy([(1.0, 2.0)], bed=-50.0)
     assert voice_threshold(mid, -32.0) == pytest.approx(-41.0)  # floor + 9
 
@@ -144,7 +144,7 @@ def test_voice_threshold_follows_the_local_noise_floor():
 def test_noise_bed_between_words_still_ends_words_and_snaps_onsets():
     from hookline.pipeline.timing import voice_threshold
 
-    env = _noisy([(1.0, 1.42), (2.0, 2.6)])  # a -38 dB bed between the words
+    env = _noisy([(1.0, 1.42), (2.0, 2.6)], bed=-45.0)  # a -45 dB bed between the words
     thr = voice_threshold(env, -32.0)
     words = [_w(1.0, 1.15, "one"), _w(2.15, 2.3, "two")]
     ends = refine_word_ends(words, env, thr)
@@ -178,3 +178,27 @@ def test_tail_ignores_a_next_word_start_without_an_audible_onset():
     # ... but an audible onset of the next word still stops it
     heard = _env([(1.0, 2.05), (2.15, 2.6)])
     assert tail_end(2.0, 2.0, 2.15, heard, THR) <= 2.10 + 1e-9
+
+
+# --- wave D review round 2 ---------------------------------------------------------------
+
+
+def test_voice_threshold_gives_up_on_a_bed_near_the_silence_level():
+    from hookline.pipeline.timing import voice_threshold
+
+    rng = np.random.default_rng(1)
+    for bed, jitter in ((-31.0, 2.0), (-38.0, 0.0)):  # the reviewer's -31 +- 2 dB probe
+        env = _noisy([(1.0, 1.3), (1.4, 1.7)], bed=bed)
+        db = np.where(env.db == bed, bed + rng.uniform(-jitter, jitter, len(env.db)), env.db)
+        assert voice_threshold(Envelope(t0=0.0, hop=HOP, db=db), -32.0) is None
+    assert voice_threshold(_noisy([(1.0, 2.0)], bed=-45.0), -32.0) == pytest.approx(-36.0)
+
+
+def test_tail_never_swallows_a_whole_audible_next_word():
+    # "alone. I" where the short "I" (2.1-2.2) lies wholly inside the continuing sound: the
+    # tail stops at its start instead of swallowing it
+    env = _env([(1.0, 2.25)])
+    end = tail_end(2.0, 2.0, 2.1, env, THR, next_end=2.2)
+    assert end <= 2.1 - 0.05 + 1e-9
+    # a next word running past the fall (DTW put its start inside the last word) is ignored
+    assert tail_end(2.0, 2.0, 2.1, env, THR, next_end=2.6) == pytest.approx(2.33, abs=0.011)

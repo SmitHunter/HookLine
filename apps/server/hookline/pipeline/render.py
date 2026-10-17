@@ -147,8 +147,9 @@ def _with_tail(
     if not spoken:
         return keep
     last = max(w.end for w in spoken)
-    later = [w.start for w in words if w.start >= end]
-    new_end = tail_end(last, end, min(later, default=float("inf")), env, voice_db)
+    later = min((w for w in words if w.start >= end), key=lambda w: w.start, default=None)
+    nxt = (later.start, later.end) if later else (float("inf"), float("inf"))
+    new_end = tail_end(last, end, nxt[0], env, voice_db, next_end=nxt[1])
     return [*keep[:-1], (start, round(new_end, 3))]
 
 
@@ -245,7 +246,14 @@ def render_clip(
     env = energy_envelope(wav, lo, hi + 1)
     voice_db = voice_threshold(env, settings.silence_db)  # from the local noise floor
     raw = [w for w in words if w.end > lo and w.start < hi]
-    near = snap_onsets(refine_word_ends(raw, env, voice_db), env, voice_db)
+    near = raw
+    if voice_db is None:
+        log.warning(
+            "%s: background noise near the silence level; word timings and end tail kept "
+            "from the transcript", name,
+        )  # fmt: skip
+    else:
+        near = snap_onsets(refine_word_ends(raw, env, voice_db), env, voice_db)
     refined = refine_boundaries(pick, near, silences, loud_seconds=loud_seconds)
     fps = probe_fps(src)
     # Frame-grid bounds make the cut timeline exact, so remapped caption times stay in sync.
@@ -257,7 +265,8 @@ def render_clip(
         # dead air trusts a refined word end only so far past the transcript's
         words=protected_words(raw, near) if protect_words else None,
     )
-    keep = snap_ranges(_with_tail(untailed, near, env, voice_db), fps)
+    tailed = untailed if voice_db is None else _with_tail(untailed, near, env, voice_db)
+    keep = snap_ranges(tailed, fps)
     # words starting in the tail (no audible onset: see `tail_end`) are not captioned
     spoken = [w for w in near if w.start < untailed[-1][1] - 1e-6] if untailed else near
 

@@ -468,11 +468,13 @@ def test_render_clip_extends_the_last_range_by_the_tail(
 
     seen = []
 
-    def fake_tail(last_end, end, next_start, env, threshold_db):
+    def fake_tail(last_end, end, next_start, env, threshold_db, **_):
         seen.append((last_end, end, next_start))
         return end + 0.3
 
     monkeypatch.setattr(render_mod, "tail_end", fake_tail)
+    # the fixture is a steady tone: as a bed it reads "too noisy"; force a voice level
+    monkeypatch.setattr(render_mod, "voice_threshold", lambda env, db: -44.0)
     s = settings.model_copy(update={"vertical": False, "captions": False})
     extras = render_clip(
         fixture_video, fixture_wav, sample_pick, fixture_words, tmp_path, tmp_path / "07-t.mp4",
@@ -552,7 +554,8 @@ def test_render_clip_fades_use_the_probed_duration_and_sidecar_includes_the_tail
         return d
 
     monkeypatch.setattr(render_mod, "probe_duration", spy_probe)
-    monkeypatch.setattr(render_mod, "tail_end", lambda last, end, nxt, env, thr: end + 0.3)
+    monkeypatch.setattr(render_mod, "tail_end", lambda last, end, nxt, env, thr, **_: end + 0.3)
+    monkeypatch.setattr(render_mod, "voice_threshold", lambda env, db: -44.0)
     s = settings.model_copy(update={"vertical": False, "captions": False})
     extras = render_clip(
         fixture_video, fixture_wav, sample_pick, fixture_words, tmp_path, tmp_path / "09-f.mp4",
@@ -564,3 +567,28 @@ def test_render_clip_fades_use_the_probed_duration_and_sidecar_includes_the_tail
     assert segs[-1][1] == pytest.approx(keep[-1][1])  # the tail is part of the clip's span
     kept = sum(e - st for st, e in keep)
     assert extras["removed_s"] == pytest.approx(sum(e - st for st, e in segs) - kept, abs=0.002)
+
+
+def test_render_clip_skips_word_refinement_on_a_noisy_bed(
+    fixture_video,
+    fixture_wav,
+    fixture_words,
+    sample_pick,
+    settings,
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    from hookline.pipeline import render as render_mod
+
+    calls = []
+    monkeypatch.setattr(render_mod, "voice_threshold", lambda env, db: None)
+    monkeypatch.setattr(render_mod, "refine_word_ends", lambda *a, **k: calls.append(1))
+    s = settings.model_copy(update={"vertical": False, "captions": False})
+    with caplog.at_level("WARNING"):
+        render_clip(
+            fixture_video, fixture_wav, sample_pick, fixture_words, tmp_path,
+            tmp_path / "10-n.mp4", s, None,
+        )  # fmt: skip
+    assert calls == []
+    assert any("noise" in r.getMessage() for r in caplog.records)
