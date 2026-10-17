@@ -112,10 +112,59 @@ def test_split_x_is_sorted_median_centres():
     assert s.split_x == pytest.approx((0.2, 0.7))
 
 
-def test_two_small_faces_are_not_split():
+def test_two_small_faces_are_a_wide_shot_not_split():
+    # Two comparable faces, both under SPLIT_MIN_H: a wide group shot -> FIT_BLUR.
     f1 = Face(x=0.3, y=0.4, w=0.06, h=0.1, score=0.9)
     f2 = Face(x=0.6, y=0.4, w=0.06, h=0.1, score=0.9)
-    assert classify_scene([(t, [f1, f2]) for t in range(10)], 0, 10).kind == "FACE_TRACK"
+    assert classify_scene([(t, [f1, f2]) for t in range(10)], 0, 10).kind == "FIT_BLUR"
+
+
+def test_small_face_with_tiny_background_face_still_tracks():
+    main = Face(x=0.3, y=0.4, w=0.06, h=0.12, score=0.9)
+    tiny = Face(x=0.6, y=0.4, w=0.03, h=0.05, score=0.9)  # not comparable (h > 2x apart)
+    assert classify_scene([(t, [main, tiny]) for t in range(10)], 0, 10).kind == "FACE_TRACK"
+
+
+def _row_of_three(cy=0.39, h=0.11):
+    return [Face(x=cx - 0.03, y=cy - h / 2, w=0.06, h=h, score=0.9) for cx in (0.15, 0.5, 0.85)]
+
+
+def test_three_faces_in_a_row_are_fit_blur_not_stacked():
+    # Wide group shot: the outer faces sit in "corners" (cy < 0.4) but a comparable face
+    # outside the grown box vetoes STACKED; all faces are small -> FIT_BLUR.
+    s = classify_scene([(t, _row_of_three()) for t in range(10)], 0, 10, src_h=1080)
+    assert s.kind == "FIT_BLUR"
+
+
+def test_facecam_veto_needs_thirty_percent_of_cam_samples():
+    cam = Face(x=0.78, y=0.05, w=0.08, h=0.14, score=0.9)
+    other = Face(x=0.3, y=0.5, w=0.06, h=0.08, score=0.9)  # h >= 0.5 x cam.h, outside box
+    tiny = Face(x=0.3, y=0.5, w=0.03, h=0.05, score=0.9)  # too small to veto
+    weak = Face(x=0.3, y=0.5, w=0.06, h=0.08, score=0.5)  # below MIN_SCORE
+    two = [(t, [cam, other] if t < 2 else [cam]) for t in range(10)]
+    assert classify_scene(two, 0, 10).kind == "STACKED"  # 20% < 30%
+    three = [(t, [cam, other] if t < 3 else [cam]) for t in range(10)]
+    assert classify_scene(three, 0, 10).kind != "STACKED"
+    assert classify_scene([(t, [cam, tiny]) for t in range(10)], 0, 10).kind == "STACKED"
+    assert classify_scene([(t, [cam, weak]) for t in range(10)], 0, 10).kind == "STACKED"
+
+
+def test_facecam_box_must_be_160_source_px_tall():
+    cam = Face(x=0.78, y=0.05, w=0.08, h=0.14, score=0.9)  # grown h 0.364
+    samples = [(t, [cam]) for t in range(10)]
+    assert classify_scene(samples, 0, 10, src_h=1080).kind == "STACKED"  # 393 px
+    assert classify_scene(samples, 0, 10, src_h=360).kind != "STACKED"  # 131 px
+
+
+def test_face_box_is_median_face_y_h():
+    face = Face(x=0.4, y=0.2, w=0.2, h=0.4, score=0.9)
+    s = classify_scene([(t, [face]) for t in range(10)], 0, 10)
+    assert s.kind == "FACE_TRACK" and s.face_box == pytest.approx((0.2, 0.4))
+    f1 = Face(x=0.1, y=0.3, w=0.15, h=0.3, score=0.9)
+    f2 = Face(x=0.7, y=0.2, w=0.15, h=0.2, score=0.9)
+    s = classify_scene([(t, [f1, f2]) for t in range(10)], 0, 10)
+    assert s.kind == "SPLIT" and s.face_box == pytest.approx((0.2, 0.3))  # topmost y, max h
+    assert classify_scene([(t, []) for t in range(10)], 0, 10).face_box is None
 
 
 def test_track_x_follows_largest_face_per_sample():
