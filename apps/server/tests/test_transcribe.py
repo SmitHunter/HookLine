@@ -224,3 +224,14 @@ def test_whisper_device_setting_from_env(monkeypatch, tmp_path):
     assert s.whisper_device == 1
     t = get_transcriber(s)
     assert isinstance(t, WhisperCppBackend) and t.device == 1
+
+
+def test_backend_cache_keys(tmp_path):
+    cpp = WhisperCppBackend(tmp_path / "w.exe", tmp_path / "ggml-medium.en-q8_0.bin")
+    assert cpp.cache_key == {
+        "backend": "whisper-cpp",
+        "model": "ggml-medium.en-q8_0.bin",
+        "dtw": "medium.en",
+    }
+    fw = FasterWhisperBackend("large-v3-turbo", "cpu", "int8")
+    assert fw.cache_key == {"backend": "faster-whisper", "model": "large-v3-turbo", "dtw": None}

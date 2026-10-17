@@ -25,13 +25,44 @@ class NoClipsSelectedError(Exception):
     """Selection returned zero clips; nothing was cached so a re-run re-selects."""
 
 
-def _picks_key(settings: Settings) -> dict:
+def transcript_key(transcriber: Transcriber) -> dict:
+    """What a cached transcript depends on: backend, model and DTW preset."""
+    key = getattr(transcriber, "cache_key", None)
+    if isinstance(key, dict):
+        return {"backend": key.get("backend"), "model": key.get("model"), "dtw": key.get("dtw")}
+    return {"backend": type(transcriber).__name__, "model": None, "dtw": None}
+
+
+def _picks_key(settings: Settings, tkey: dict) -> dict:
     return {
         "clips": settings.clips,
         "select_model": settings.select_model,
         "min_clip_s": settings.min_clip_s,
         "max_clip_s": settings.max_clip_s,
+        "transcript": tkey,
     }
+
+
+def _load_transcript(tpath: Path, key: dict, log: Callable[[str], None]) -> Transcript | None:
+    """Cached transcript when transcript.json was made with `key`; otherwise None."""
+    if not tpath.exists():
+        return None
+    try:
+        data = json.loads(tpath.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and "segments" in data and "key" not in data:
+            log("[3/6] transcribe: transcript.json is in the old format; re-transcribing")
+            return None
+        cached_key = data["key"]
+        transcript = Transcript.model_validate(data["transcript"])
+    except (ValueError, TypeError, KeyError):
+        log("warning: transcript.json is corrupt; deleting and re-running transcription")
+        tpath.unlink()
+        return None
+    changed = sorted(k for k in key if cached_key.get(k) != key[k])
+    if changed:
+        log(f"[3/6] transcribe: transcriber changed ({', '.join(changed)}); re-transcribing")
+        return None
+    return transcript
 
 
 def _load_picks(ppath: Path, key: dict, log: Callable[[str], None]) -> list[ClipPick] | None:
@@ -126,15 +157,11 @@ def run_job(
         log("[2/6] audio: done")
 
     tpath = job_dir / "transcript.json"
-    transcript = None
-    if tpath.exists():
-        try:
-            transcript = Transcript.model_validate_json(tpath.read_text(encoding="utf-8"))
-            log("[3/6] transcribe: skipped (cached)")
-        except ValueError:
-            log("warning: transcript.json is corrupt; deleting and re-running transcription")
-            tpath.unlink()
-    if transcript is None:
+    tkey = transcript_key(transcriber)
+    transcript = _load_transcript(tpath, tkey, log)
+    if transcript is not None:
+        log("[3/6] transcribe: skipped (cached)")
+    else:
         log("[3/6] transcribe: started")
         last = [-1]
 
@@ -145,7 +172,10 @@ def run_job(
                 log(f"[3/6] transcribe: {pct}%")
 
         transcript = transcriber.transcribe(wav, on_progress)
-        atomic_write_text(tpath, transcript.model_dump_json())
+        atomic_write_text(
+            tpath,
+            json.dumps({"key": tkey, "transcript": transcript.model_dump(mode="json")}),
+        )
         log("[3/6] transcribe: done")
 
     signals = _signals(job_dir, wav, transcript, log)
@@ -153,7 +183,7 @@ def run_job(
         signals = signals.model_copy(update={"chat": None})
 
     ppath = job_dir / "picks.json"
-    key = _picks_key(settings)
+    key = _picks_key(settings, tkey)
     picks = _load_picks(ppath, key, log)
     if picks is not None:
         log("[5/6] select: skipped (using cached picks.json - delete it to re-select)")

@@ -176,6 +176,7 @@ def test_picks_cache_key_mismatch_reselects(fixture_video, fake_llm, settings_tm
         "select_model": s.select_model,
         "min_clip_s": s.min_clip_s,
         "max_clip_s": s.max_clip_s,
+        "transcript": {"backend": "FakeTranscriber", "model": None, "dtw": None},
     }
     logs: list[str] = []
     run_job(str(fixture_video), s.model_copy(update={"max_clip_s": 45}), fake_llm, t, logs.append)
@@ -254,3 +255,43 @@ def test_word_protection_follows_transcript_timing(
     s = settings_tmp.model_copy(update={"clips": 1, "vertical": False, "captions": False})
     run_job(str(fixture_video), s, fake_llm, Timed(duration=150))
     assert seen == [protect]
+
+
+class KeyedTranscriber(FakeTranscriber):
+    def __init__(self, duration: float, model: str, dtw: str | None) -> None:
+        super().__init__(duration)
+        self.cache_key = {"backend": "whisper-cpp", "model": model, "dtw": dtw}
+
+
+def test_transcript_cache_is_keyed_by_transcriber(fixture_video, fake_llm, settings_tmp):
+    s = settings_tmp.model_copy(update={"clips": 1, "vertical": False, "captions": False})
+    fake_llm.queue(make_payload_for(150, 1, 21), make_payload_for(150, 1, 21))
+    a = KeyedTranscriber(150, "ggml-large-v3-turbo.bin", "large.v3.turbo")
+    run_job(str(fixture_video), s, fake_llm, a)
+    job = s.workspace_dir / job_id_for(str(fixture_video))
+    saved = json.loads((job / "transcript.json").read_text(encoding="utf-8"))
+    assert saved["key"] == a.cache_key and saved["transcript"]["segments"]
+    run_job(str(fixture_video), s, fake_llm, a)
+    assert a.calls == 1 and len(fake_llm.calls) == 1  # same key: both caches reused
+
+    b = KeyedTranscriber(150, "custom.bin", None)
+    logs: list[str] = []
+    run_job(str(fixture_video), s, fake_llm, b, logs.append)
+    assert b.calls == 1
+    assert any("transcriber changed (dtw, model)" in m and "re-transcribing" in m for m in logs)
+    assert len(fake_llm.calls) == 2  # picks depend on the transcript key too
+    assert any("re-select" in m and "transcript" in m for m in logs)
+
+
+def test_old_format_transcript_is_retranscribed(fixture_video, fake_llm, settings_tmp):
+    s = settings_tmp.model_copy(update={"clips": 1, "vertical": False, "captions": False})
+    fake_llm.queue(make_payload_for(150, 1, 21), make_payload_for(150, 1, 21))
+    t = FakeTranscriber(duration=150)
+    run_job(str(fixture_video), s, fake_llm, t)
+    job = s.workspace_dir / job_id_for(str(fixture_video))
+    tpath = job / "transcript.json"
+    saved = json.loads(tpath.read_text(encoding="utf-8"))
+    tpath.write_text(json.dumps(saved["transcript"]), encoding="utf-8")
+    logs: list[str] = []
+    run_job(str(fixture_video), s, fake_llm, t, logs.append)
+    assert t.calls == 2 and any("old format" in m and "re-transcribing" in m for m in logs)

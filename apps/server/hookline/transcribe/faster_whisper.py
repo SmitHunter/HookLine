@@ -12,6 +12,11 @@ class FasterWhisperBackend:
         self.compute_type = compute_type
         self._model = None
 
+    @property
+    def cache_key(self) -> dict:
+        """What the transcript depends on; a cached transcript with another key is stale."""
+        return {"backend": "faster-whisper", "model": self.model_name, "dtw": None}
+
     def _load(self):
         if self._model is None:
             from faster_whisper import WhisperModel
