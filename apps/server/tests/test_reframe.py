@@ -19,6 +19,7 @@ from hookline.media.reframe import (
     combine_crop,
     detect_crop,
     detect_overlay_bands,
+    plan_zoom,
     reframe_graph,
     scene_filter,
     scene_upscale,
@@ -564,3 +565,156 @@ def test_overlay_real_source_lower_third(tmp_path):
         assert detect_overlay_bands(clip, crop=(1920, 860, 0, 0)) is None
     finally:
         clip.unlink(missing_ok=True)
+
+
+# --- M2.5 wave B: tracking holds, every cut steps, soft-source caps, small faces, headroom ---
+
+_FPS = 30
+
+
+def test_track_holds_crop_x_through_a_face_gap():
+    from hookline.pipeline.layout import classify_scene
+    from hookline.vision.faces import Face
+
+    def face(cx, score=0.9):
+        return Face(x=cx - 0.08, y=0.2, w=0.16, h=0.4, score=score)
+
+    samples = []
+    for i in range(13):
+        t = i * 0.5
+        if t <= 2.0:
+            faces = [face(0.3)]
+        elif t < 4.0:  # 1.5 s without a face; only a low-score body box elsewhere
+            faces = [face(0.75, score=0.4)]
+        else:
+            faces = [face(0.3)]
+        samples.append((t, faces))
+    lay = classify_scene(samples, 0, 6.5)
+    expr = track_x_expr(lay.track_x, in_w=1280, crop_w=404, face_w=lay.face_w)
+    held = evaluate(expr, t=2.0)
+    for t in (2.1, 2.5, 3.0, 3.5, 3.9, 4.5, 6.0):
+        assert evaluate(expr, t=t) == pytest.approx(held)
+
+
+def test_track_keeps_a_leaning_face_inside_the_crop():
+    # clip 04: she leans from 0.57 to 0.77 in one sample; the EMA alone lagged ~0.14 behind
+    kfs = [(0, 0.57), (1, 0.57), (2, 0.77), (3, 0.776), (4, 0.62), (5, 0.565)]
+    face_w, in_w, crop_w = 0.17, 1280, 404
+    expr = track_x_expr(kfs, in_w=in_w, crop_w=crop_w, face_w=face_w)
+    for t, x in kfs:
+        left = evaluate(expr, t=t)
+        margin = 0.1 * crop_w - 1e-6
+        assert left + margin <= (x - face_w / 2) * in_w
+        assert (x + face_w / 2) * in_w <= left + crop_w - margin
+
+
+def _cut_has_step(steps, c):
+    return any(abs(t - c) <= 1 / _FPS + 1e-9 for t, _ in steps)
+
+
+@pytest.mark.parametrize(
+    ("duration", "cuts", "emph"),
+    [
+        (34.0, [14.667], [2.0, 14.867]),  # clip 04: the cut 0.2 s before a punch
+        (20.0, [3.93, 13.67], [3.5, 13.0]),  # cuts inside punch windows
+        (20.0, [5.0, 5.3, 5.45, 12.0], []),  # cuts closer than ZOOM_MIN_STEP
+        (20.0, [0.2, 19.8], [0.6]),  # cuts near both ends
+        (30.0, [6.4, 7.6, 14.83, 26.63], [6.0, 14.5, 26.2]),
+    ],
+)
+def test_zoom_schedule_steps_at_every_cut(duration, cuts, emph):
+    steps = zoom_schedule(duration, cuts, emph)
+    for c in cuts:
+        assert _cut_has_step(steps, c), (c, steps)
+    assert all(a[1] != b[1] for a, b in pairwise(steps))
+    assert all(a[0] < b[0] for a, b in pairwise(steps))
+    assert max(_gaps(steps, duration)) <= 4.5 + 1e-9
+
+
+def test_zoom_schedule_cut_inside_a_punch_ends_it_at_the_cut():
+    steps = zoom_schedule(20.0, [6.8], [6.0])
+    assert (6.0, ZOOM_PUNCH) in steps
+    assert steps[steps.index((6.0, ZOOM_PUNCH)) + 1] == (6.8, 1.0)
+    # a punch just after a cut moves onto it: the punch is the cut's framing change
+    steps = zoom_schedule(20.0, [6.0], [6.3])
+    assert (6.0, ZOOM_PUNCH) in steps and all(t != 6.3 for t, _ in steps)
+
+
+def test_zoom_expr_back_to_back_steps_stay_monotonic_in_time():
+    steps = [(0.0, 1.0), (5.0, ZOOM_IN), (5.1, 1.0), (5.2, ZOOM_IN)]
+    expr = zoom_expr(steps)
+    assert evaluate(expr, 5.1) == pytest.approx(ZOOM_IN)  # ease cut short by the next step
+    assert evaluate(expr, 5.2) == pytest.approx(1.0)
+    assert evaluate(expr, 6.0) == pytest.approx(ZOOM_IN)
+
+
+_SOFT_TRACK = SceneLayout(
+    start=0, end=4, kind="FACE_TRACK", track_x=[(0, 0.5)], face_box=(0.3, 0.3), head_top=0.15
+)
+
+
+def test_plan_zoom_soft_source_caps_every_level_and_uses_lanczos():
+    plan = plan_zoom(_SOFT_TRACK, 1280, 720)  # 720p FACE_TRACK: 2.67x upscale
+    assert scene_upscale(plan, 1280, 720) > 2.0
+    levels = [plan.zoom_level(s) for s in (1.0, ZOOM_IN, ZOOM_PUNCH)]
+    assert max(levels) <= 1.12 + 1e-9 and len(set(levels)) == 3  # capped, still distinct
+    chain = scene_filter(plan, 1280, 720, "a", "b", zoom_steps=[(0, 1.0), (1, ZOOM_PUNCH)])
+    assert "scale=1080:1920:flags=lanczos" in chain and "eval=frame:flags=lanczos" in chain
+    assert chain.index("unsharp") > chain.index("eval=frame")  # sharpen after the zoom
+    expr = zoom_expr([(0, 1.0), (1, ZOOM_PUNCH)], level=plan.zoom_level)
+    assert evaluate(expr, 3.0) == pytest.approx(1.12)
+    sharp = plan_zoom(_SOFT_TRACK, 3840, 2160)  # 4K: no cap, no lanczos
+    assert sharp.zoom_cap is None and sharp.zoom_level(ZOOM_PUNCH) == pytest.approx(1.2)
+    assert "lanczos" not in scene_filter(sharp, 3840, 2160, "a", "b", zoom_steps=_STEPS)
+
+
+def test_plan_zoom_small_face_gets_a_base_zoom_within_limits():
+    small = SceneLayout(
+        start=0, end=4, kind="FACE_TRACK", track_x=[(0, 0.5)], face_box=(0.4, 0.12),
+        head_top=0.34,
+    )  # fmt: skip
+    plan = plan_zoom(small, 1920, 1080)  # 1.78x upscale
+    up = scene_upscale(plan, 1920, 1080)
+    assert plan.base_zoom > 1.0
+    assert plan.zoom_level(1.0) * 0.12 <= 0.22 + 1e-9
+    for s in (1.0, ZOOM_IN, ZOOM_PUNCH):
+        assert plan.zoom_level(s) <= 1.4 + 1e-9 and plan.zoom_level(s) * up <= 2.5 + 1e-9
+    assert plan.zoom_level(ZOOM_IN) / plan.zoom_level(1.0) == pytest.approx(ZOOM_IN)
+    assert plan.model_dump()["base_zoom"] == plan.base_zoom  # recorded in the sidecar
+    # a big enough face, or a soft source, gets none
+    assert plan_zoom(small.model_copy(update={"face_box": (0.3, 0.25)}), 1920, 1080).base_zoom == 1
+    assert plan_zoom(small, 1280, 720).base_zoom == 1.0
+    flat = scene_filter(plan, 1920, 1080, "a", "b")  # no steps: the base zoom still applies
+    assert "eval=frame" in flat
+
+
+@pytest.mark.parametrize("face_y", [0.12, 0.2, 0.3, 0.45])
+@pytest.mark.parametrize("size", [(1920, 1080), (1280, 720)])
+def test_plan_zoom_keeps_head_top_inside_the_frame_at_every_level(face_y, size):
+    fh = 0.3
+    lay = SceneLayout(
+        start=0, end=4, kind="FACE_TRACK", track_x=[(0, 0.5)], face_box=(face_y, fh),
+        head_top=face_y - 0.5 * fh,
+    )  # fmt: skip
+    plan = plan_zoom(lay, *size)
+    head = lay.head_top * OUT_H
+    for s in (1.0, ZOOM_IN, ZOOM_PUNCH):
+        if head >= 0.04 * OUT_H:  # never cuts above the head top: >= 4% headroom
+            assert plan.zoom_y(head, s, OUT_H) >= 0.04 * OUT_H - 1e-6, s
+        assert plan.zoom_y((face_y + fh) * OUT_H, s, OUT_H) <= OUT_H + 1e-6  # chin in frame
+    if head < 0.04 * OUT_H:  # the source framing already cut it: zoom about the top row
+        assert plan.anchor_px(OUT_H) == 0
+    else:  # anchor rendered as planned
+        chain = scene_filter(plan, *size, "a", "b", zoom_steps=_STEPS)
+        assert f"min({plan.anchor_px(OUT_H):.3f}".rstrip("0").rstrip(".") in chain
+
+
+def test_plan_zoom_caps_the_level_when_head_and_chin_cannot_both_fit():
+    big = SceneLayout(
+        start=0, end=4, kind="FACE_TRACK", track_x=[(0, 0.5)], face_box=(0.3, 0.62),
+        head_top=0.0,
+    )  # fmt: skip
+    plan = plan_zoom(big, 3840, 2160)
+    assert plan.zoom_cap is not None and plan.zoom_cap < ZOOM_PUNCH
+    for s in (1.0, ZOOM_IN, ZOOM_PUNCH):
+        assert plan.zoom_y(0.92 * OUT_H, s, OUT_H) <= OUT_H + 1e-6

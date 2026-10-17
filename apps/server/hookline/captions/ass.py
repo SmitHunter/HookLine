@@ -1,5 +1,6 @@
 import math
 import re
+from collections.abc import Sequence
 
 from hookline.models import Word
 from hookline.pipeline.layout import SceneLayout
@@ -12,7 +13,7 @@ HOOK_LINE_CHARS = 18
 HOOK_MAX_LINES = 2
 HOOK_MAX_WORDS = 7  # renderer safety net only; selection owns Q5's word limit
 SEAM_TAG = "EARLIER…"  # hook-style tag marking the end of a cold open
-SEAM_TAG_S = 0.8
+SEAM_TAG_S = 1.2
 ELLIPSIS = "…"
 YELLOW = "{\\c&H00FFFF&}"
 WHITE = "{\\c&HFFFFFF&}"  # back to the style colour; `{\r}` would also drop \fs/\fscx
@@ -63,19 +64,20 @@ CAPTION_BELOW = 56
 HOOK_HALF = FONT_SIZE + HOOK_PAD  # half-height of a two-line hook box (2 x 136 / 2 + pad)
 HOOK_TOP_Y = SAFE_TOP + HOOK_HALF  # 446: a two-line hook clamped to the top of Q4
 TAG_HALF = FONT_SIZE // 2 + HOOK_PAD  # half-height of the one-line EARLIER tag box
-TEXT_SEPARATION = 24  # visible px between a hook/tag box and the caption below it
+TEXT_SEPARATION = 48  # visible px between a hook/tag box and the caption below it
 # Highest caption line while the hook is up: visible top clears a two-line top hook box (602).
-CAPTION_MIN_Y = HOOK_TOP_Y + HOOK_HALF + TEXT_SEPARATION + CAPTION_ABOVE  # 662
+CAPTION_MIN_Y = HOOK_TOP_Y + HOOK_HALF + TEXT_SEPARATION + CAPTION_ABOVE  # 686
 # Highest line once hook and tag are gone: clears the space a top one-line tag box uses (466).
-CAPTION_LATE_MIN_Y = SAFE_TOP + 2 * TAG_HALF + TEXT_SEPARATION + CAPTION_ABOVE  # 526
+CAPTION_LATE_MIN_Y = SAFE_TOP + 2 * TAG_HALF + TEXT_SEPARATION + CAPTION_ABOVE  # 550
 CAPTION_MAX_Y = 1180
 CAPTION_Y = CAPTION_MAX_Y
 CAPTION_FACE_GAP = 40  # clearance (px) kept between a face and the caption's visible extent
 CAPTION_STEP = 4  # caption / hook line candidates, px apart
 FACE_ZOOM_BUDGET = 1.2  # ZOOM_PUNCH: a punch-in grows the face about its centre this much
 STACKED_CAPTION_Y = 700  # just below the cam/game seam (640), inside the safe band
+# a two-line hook box TEXT_SEPARATION below the 700 captions (visible to 756): 960
+STACKED_HOOK_Y = STACKED_CAPTION_Y + CAPTION_BELOW + TEXT_SEPARATION + HOOK_HALF
 HOOK_Y = 360  # requested centre; clamped so the box stays in Q4 (1 line: 378, 2 lines: 446)
-STACKED_HOOK_Y = 940  # a two-line hook box clears the 700 captions (visible to 756)
 
 HEADER = f"""[Script Info]
 ScriptType: v4.00+
@@ -113,9 +115,27 @@ def _normalise(words: list[Word]) -> list[Word]:
     return out
 
 
+BREAK_SLACK_S = 0.01  # a word starting this little before a break still starts after it
+
+
+def _crosses(a: float, b: float, breaks: Sequence[float]) -> bool:
+    """A break (cut or seam) between word starts `a` and `b`."""
+    return any(a < x <= b + BREAK_SLACK_S for x in breaks)
+
+
+def _next_break(t: float, breaks: Sequence[float]) -> float:
+    return min((x for x in breaks if x > t + BREAK_SLACK_S), default=math.inf)
+
+
 def group_words(
-    words: list[Word], max_words: int = 3, max_chars: int = 18, max_gap: float = 0.5
+    words: list[Word],
+    max_words: int = 3,
+    max_chars: int = 18,
+    max_gap: float = 0.5,
+    breaks: Sequence[float] = (),
 ) -> list[list[Word]]:
+    """Caption pages. A page also ends at every `breaks` time (cuts and the cold-open seam):
+    no page shows words from both sides of a cut."""
     groups: list[list[Word]] = []
     cur: list[Word] = []
     for word in words:
@@ -126,6 +146,7 @@ def group_words(
                 or word.start - cur[-1].end > max_gap
                 or len(cur) >= max_words
                 or chars > max_chars
+                or _crosses(cur[-1].start, word.start, breaks)
             ):
                 groups.append(cur)
                 cur = []
@@ -223,9 +244,19 @@ def _clamp_hook_y(y: int, n_lines: int, fs: int) -> int:
     return min(max(y, math.ceil(SAFE_TOP + half)), math.floor(SAFE_BOTTOM - half))
 
 
-def _hold_ends(groups: list[list[Word]], duration: float, seam: float | None = None) -> list[float]:
-    """When each group leaves the screen (see HOLD_GAP_S/TAIL_S). A group spoken before a
-    cold-open `seam` never holds past it."""
+def _breaks(breaks: Sequence[float], seam: float | None) -> list[float]:
+    return sorted({*breaks, *([seam] if seam is not None else [])})
+
+
+def _hold_ends(
+    groups: list[list[Word]],
+    duration: float,
+    seam: float | None = None,
+    breaks: Sequence[float] = (),
+) -> list[float]:
+    """When each group leaves the screen (see HOLD_GAP_S/TAIL_S). No group holds past the
+    next break (a cut, or the cold-open `seam`) after its last word starts."""
+    cuts = _breaks(breaks, seam)
     ends = []
     for i, group in enumerate(groups):
         last = group[-1].end
@@ -234,9 +265,7 @@ def _hold_ends(groups: list[list[Word]], duration: float, seam: float | None = N
             end = nxt if nxt - last <= HOLD_GAP_S else min(last + TAIL_S, nxt)
         else:
             end = min(last + TAIL_S, max(duration, last))
-        if seam is not None and last <= seam + 1e-6:
-            end = min(end, max(seam, last))
-        ends.append(end)
+        ends.append(min(end, _next_break(group[-1].start, cuts)))
     return ends
 
 
@@ -262,15 +291,19 @@ def _early(
 
 
 def early_until(
-    words: list[Word], hook_text: str, duration: float, seam: float | None = None
+    words: list[Word],
+    hook_text: str,
+    duration: float,
+    seam: float | None = None,
+    breaks: Sequence[float] = (),
 ) -> float:
     """When the early caption line and the hook/tag position stop mattering: the end of the
     hook, of the EARLIER tag and of every caption group shown with them (a group starting
     under the hook may hold into a later scene). Pass it as `until` to caption_y_for and
-    hook_y_for so they consider every scene on screen until then."""
+    hook_y_for so they consider every scene on screen until then. `breaks` as for build_ass."""
     windows = _windows(bool(_layout_hook(hook_text)[0]), duration, seam)
-    groups = group_words(_normalise(words))
-    holds = _hold_ends(groups, duration, seam)
+    groups = group_words(_normalise(words), breaks=_breaks(breaks, seam))
+    holds = _hold_ends(groups, duration, seam, breaks)
     shown = [h for h, early in zip(holds, _early(groups, holds, windows), strict=True) if early]
     return max([HOOK_S, windows[2], *shown])
 
@@ -283,10 +316,13 @@ def build_ass(
     hook_y: int = HOOK_Y,
     seam: float | None = None,
     caption_y_late: int | None = None,
+    breaks: Sequence[float] = (),
 ) -> str:
     """`seam` (output s; cold opens only) adds SEAM_TAG for SEAM_TAG_S s at `hook_y`. When the
-    seam falls inside the hook title's 3 s, the tag waits for the title to finish; caption
-    groups spoken before the seam never hold past it.
+    seam falls inside the hook title's 3 s, the tag waits for the title to finish.
+
+    `breaks` (output s: the cut times, i.e. keep-range joins) and the seam force a caption
+    page break: no caption event spans one (a page never shows across a cut).
 
     `caption_y_late` (default `caption_y`) is the caption line for groups that start once the
     hook and tag are off screen; it may sit higher (down to CAPTION_LATE_MIN_Y), e.g. above a
@@ -307,8 +343,9 @@ def build_ass(
     cy_late = cy
     if caption_y_late is not None:
         cy_late = min(max(caption_y_late, CAPTION_LATE_MIN_Y), CAPTION_MAX_Y)
-    groups = group_words(_normalise(words))
-    holds = _hold_ends(groups, duration, seam)
+    cuts = _breaks(breaks, seam)
+    groups = group_words(_normalise(words), breaks=cuts)
+    holds = _hold_ends(groups, duration, seam, breaks)
     for group, hold_end, early in zip(groups, holds, _early(groups, holds, windows), strict=True):
         texts = [word.text.upper() for word in group]
         # A single over-long word that cannot fit even at the minimum size keeps that size.
@@ -316,6 +353,7 @@ def build_ass(
         tags = f"\\pos({TEXT_X},{cy if early else cy_late})" + _size_tags(fs, scale)
         for i, active in enumerate(group):
             end = group[i + 1].start if i + 1 < len(group) else hold_end
+            end = min(end, _next_break(active.start, cuts))  # a word straddling a cut
             parts = [
                 f"{YELLOW}{_esc(t)}{WHITE}" if j == i else _esc(t) for j, t in enumerate(texts)
             ]
@@ -324,8 +362,10 @@ def build_ass(
 
 
 def face_rects(layout: SceneLayout, zoom: float = 1.0) -> list[tuple[float, float, float, float]]:
-    """Output-px (x0, y0, x1, y1) of the layout's median FACE CORE(s), scaled by `zoom` about
-    the face centre: one for FACE_TRACK, one per panel for SPLIT.
+    """Output-px (x0, y0, x1, y1) of the layout's median FACE CORE(s) at zoom step level
+    `zoom`, mapped as the render zooms it (`SceneLayout.zoom_y`: the scene's base zoom and
+    cap, about its anchor row; the face centre unless planned otherwise): one for FACE_TRACK,
+    one per panel for SPLIT.
 
     The face core is the detector box with its top FACE_CORE_TOP (20%) removed: that strip is
     hairline/upper forehead, where text is acceptable short-form practice; the core (eyes,
@@ -336,12 +376,12 @@ def face_rects(layout: SceneLayout, zoom: float = 1.0) -> list[tuple[float, floa
     face = _face_px(layout)
     if face is None:
         return []
-    top, bottom = face
-    cy, half_h = (top + bottom) / 2, (bottom - top) / 2 * zoom
-    half_w = half_h * FACE_W_PER_H
-    core_top = cy - half_h + FACE_CORE_TOP * 2 * half_h
+    panel_h = SPLIT_PANEL_H if layout.kind == "SPLIT" else OUT_H
+    top, bottom = (layout.zoom_y(y, zoom, panel_h) for y in face)
+    half_w = (bottom - top) / 2 * FACE_W_PER_H
+    core_top = top + FACE_CORE_TOP * (bottom - top)
     panels = (0, SPLIT_PANEL_H) if layout.kind == "SPLIT" else (0,)
-    return [(OUT_W / 2 - half_w, core_top + p, OUT_W / 2 + half_w, cy + half_h + p) for p in panels]
+    return [(OUT_W / 2 - half_w, core_top + p, OUT_W / 2 + half_w, bottom + p) for p in panels]
 
 
 def _face_px(layout: SceneLayout) -> tuple[float, float] | None:
@@ -387,7 +427,7 @@ def caption_y_for(
 
     The default (`late=False`) line is for groups shown with the hook or the EARLIER tag:
     scenes starting before `until` (`early_until`: hook, tag and those groups; the hook's 3 s
-    by default), lines in [CAPTION_MIN_Y, CAPTION_MAX_Y] so a top hook box stays 24 px
+    by default), lines in [CAPTION_MIN_Y, CAPTION_MAX_Y] so a top hook box stays 48 px
     clear. `late=True` is for the rest: every scene, lines from CAPTION_LATE_MIN_Y."""
     if not layouts:
         return CAPTION_Y

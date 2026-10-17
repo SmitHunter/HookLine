@@ -393,12 +393,14 @@ def test_render_clip_cold_open_seam_flash_and_tag(
     assert graph.count("drawbox=") == 3 and "color=white" in graph
     ass = (tmp_path / "r" / "02.ass").read_text(encoding="utf-8")
     (tag,) = [ln for ln in ass.splitlines() if "EARLIER" in ln]
-    assert ",Hook," in tag and tag.startswith("Dialogue: 1,0:00:03.00,0:00:03.80,")
+    assert ",Hook," in tag and tag.startswith("Dialogue: 1,0:00:03.00,0:00:04.20,")
     fps = 25
     corner = (slice(0, 60), slice(0, 60))
-    assert _frame_at(dst, round(seam * fps))[corner].min() > 230  # white flash
-    assert _frame_at(dst, round(seam * fps) - 1)[corner].min() > 150  # ramp in
-    assert _frame_at(dst, round(seam * fps) + 10)[corner].min() < 200  # gone again
+    n = round(seam * fps)
+    peak, ramp, after = (_frame_at(dst, k)[corner].astype(int).mean() for k in (n, n - 1, n + 10))
+    assert peak > after + 60  # a visible flash ...
+    assert peak < 245  # ... at 60% white, not blown out
+    assert after < ramp < peak  # ramp in
 
 
 def test_render_clip_sidecar_caption_words_and_no_seam(

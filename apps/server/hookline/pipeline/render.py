@@ -33,6 +33,7 @@ from hookline.media.reframe import (
     combine_crop,
     detect_crop,
     detect_overlay_bands,
+    plan_zoom,
     reframe_graph,
     zoom_schedule,
 )
@@ -48,7 +49,7 @@ MAX_HORIZONTAL_W = 1920
 _ZOOM_BEAT_RE = re.compile(r"^\s*zoom\s*:.*@\s*(\d+(?:\.\d+)?)\s*s?\s*$", re.IGNORECASE)
 _SENTENCE_END = (".", "!", "?")
 CAM_EDGE_LO, CAM_EDGE_HI = 0.02, 0.98  # a cam box this close to a cropped edge was cut by it
-SEAM_FLASH = (0.6, 1.0, 0.6)  # white opacity of the 3 frames around the cold-open seam
+SEAM_FLASH = (0.35, 0.6, 0.35)  # white opacity of the 3 frames around the cold-open seam
 SEAM_SLACK_S = 0.1  # frame snapping may move a cold-open range bound by up to a frame
 
 log = logging.getLogger(__name__)
@@ -82,7 +83,7 @@ def seam_time(
 
 
 def seam_flash(seam: float, fps: float) -> str:
-    """3-frame white flash centred on the frame at `seam`: fade in, full white, fade out."""
+    """3-frame white flash centred on the frame at `seam`: fade in, 60% white, fade out."""
     boxes = []
     for k, alpha in zip((-1, 0, 1), SEAM_FLASH, strict=True):
         a, b = seam + (k - 0.5) / fps, seam + (k + 0.5) / fps
@@ -173,10 +174,11 @@ def render_clip(
     """Write the finished clip to `dst`; returns sidecar extras (segments, layout, keep_ranges,
     removed_s, cut_times, zoom_steps, overlay_bands, seam, ass, ass_sha1, caption_words). Cut
     and zoom times are on the output timeline; zooms are applied before captions, so captions
-    never zoom (vertical only; empty when horizontal).
+    never zoom (vertical only; empty when horizontal). Each `layout` scene carries its zoom
+    plan (`base_zoom`, `zoom_cap`, `zoom_anchor`; see `reframe.plan_zoom`).
     `overlay_bands` is the [top, bottom] px of burned-in overlay cropped away (vertical only),
     or None. `seam` is the output time where a cold open ends (None without one); it gets a
-    3-frame white flash and the "EARLIER…" tag. `ass`/`ass_sha1` name the burned caption file
+    3-frame 60% white flash and the "EARLIER…" tag. `ass`/`ass_sha1` name the burned caption file
     in `work_dir` and its hash (None without captions). `caption_words` are the spoken words
     on the output timeline, [start, end, text], so `hookline audit` needs no transcript.
 
@@ -227,6 +229,9 @@ def render_clip(
     if settings.vertical:
         layouts, crop, bands = _plan_vertical(inter, detector, settings, size, letterbox)
         in_w, in_h = (crop[0], crop[1]) if crop else size
+        # per-scene zoom plan (soft-source cap, small-face base zoom, headroom); the layouts
+        # carry it into the sidecar and to caption placement
+        layouts = [plan_zoom(lay, in_w, in_h) for lay in layouts]
         steps = zoom_schedule(
             duration,
             cuts,
@@ -246,7 +251,7 @@ def render_clip(
     if settings.captions:
         ass = work_dir / f"{name}.ass"
         # the early line and the hook/tag position see every scene shown with hook or tag
-        until = early_until(out_words, pick.hook_text, duration, seam)
+        until = early_until(out_words, pick.hook_text, duration, seam, breaks=cuts)
         text = build_ass(
             out_words,
             pick.hook_text,
@@ -255,6 +260,7 @@ def render_clip(
             hook_y_for(layouts, until=until),
             seam=seam,
             caption_y_late=caption_y_for(layouts, late=True),
+            breaks=cuts,  # caption pages never span a cut (nor the seam)
         )
         atomic_write_text(ass, text)
         ass_ref = {"ass": ass.name, "ass_sha1": hashlib.sha1(ass.read_bytes()).hexdigest()}

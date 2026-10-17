@@ -55,7 +55,7 @@ def test_ass_header_and_styles():
     for s in ("PlayResX: 1080", "PlayResY: 1920", "WrapStyle: 2", "ScaledBorderAndShadow: yes"):
         assert s in ass
     assert "Style: Cap,Anton,136," in ass and "Style: Hook,Anton,136," in ass
-    assert "{\\pos(474,662)}" in ass  # 600 clamped to 662 (24 px below a two-line hook)
+    assert "{\\pos(474,686)}" in ass  # 600 clamped to 686 (48 px below a two-line hook)
     assert "{\\pos(474,378)\\fad" in ass  # 360 clamped: one-line box top at 290
     hook = next(e for e in _events(ass) if ",Hook," in e)
     assert hook.startswith("Dialogue: 1,0:00:00.00,0:00:03.00,")
@@ -163,7 +163,7 @@ def test_hook_and_caption_placement_per_layout():
     assert (hook_y_for([]), caption_y_for([])) == (360, 1180)
     assert (hook_y_for([_lay("FIT_BLUR")]), caption_y_for([_lay("FIT_BLUR")])) == (360, 1180)
     stacked = [_lay("STACKED"), _lay("FIT_BLUR")]
-    assert (hook_y_for(stacked), caption_y_for(stacked)) == (940, 700)  # below the seam
+    assert (hook_y_for(stacked), caption_y_for(stacked)) == (960, 700)  # below the seam
     assert hook_y_for([_lay("FACE_TRACK")]) == 360  # no face box: default
 
 
@@ -189,7 +189,7 @@ def test_face_track_hook_moves_off_the_face(tmp_path):
     hy, cy = hook_y_for(high), caption_y_for(high)
     assert cy == 1180 and hy > 900  # below the face, still above the captions
     hook, cap = _hook_box(tmp_path, high), _cap_box(tmp_path, high)
-    assert cap[1] - hook[3] >= 24  # visible separation
+    assert cap[1] - hook[3] >= 48  # visible separation
     ((rect,),) = [face_rects(lay) for lay in high]
     assert _face_share(hook, rect) == 0.0  # Q4b for the hook box
 
@@ -213,10 +213,12 @@ def test_close_up_captions_go_above_the_head_clear_of_the_hook(tmp_path):
     # 1.2x punch-in: box 622-1397, face core (top 20% = hairline removed) from 777
     core_top = 1009.5 - 1.2 * 322.5 + 0.2 * 2 * 1.2 * 322.5
     y = caption_y_for(close)
-    assert CAPTION_MIN_Y <= y and y + CAPTION_BELOW + 40 <= core_top  # over the hairline
+    # the face covers every line: the highest one the 48 px hook separation allows, its
+    # visible text still above the core at a full punch-in (the 40 px face gap gives way)
+    assert y == CAPTION_MIN_Y and y + CAPTION_BELOW <= core_top
     hook, cap = _hook_box(tmp_path, close), _cap_box(tmp_path, close)
-    assert hook is not None and cap is not None and cap[1] - hook[3] >= 24
-    # after the hook: the same rule from 526 up; the lowest clear line is still above the core
+    assert hook is not None and cap is not None and cap[1] - hook[3] >= 48
+    # after the hook: the same rule from 550 up; the lowest clear line is still above the core
     late = caption_y_for(close, late=True)
     assert CAPTION_LATE_MIN_Y <= late and late + CAPTION_BELOW + 40 <= core_top
     from hookline.quality import text_bbox
@@ -233,7 +235,7 @@ def test_late_caption_line_used_only_after_hook_and_tag():
     ass = build_ass(ws, "Hook here", 9, caption_y=900, seam=4.8, caption_y_late=600)
     caps = [e for e in _events(ass) if ",Cap," in e]
     ys = [int(e.split("\\pos(474,")[1].split(")")[0]) for e in caps]
-    assert ys == [900, 600, 900, 600]  # hook up; free; EARLIER tag 4.8-5.6 up; free
+    assert ys == [900, 600, 900, 600]  # hook up; free; EARLIER tag 4.8-6.0 up; free
     # ONE ends 0.6 then TWO at 3.2 (> 1 s): tail; TWO. ends 3.6, held until the seam (4.8)
     assert caps[1].startswith("Dialogue: 0,0:00:03.20,0:00:03.90,")
     ass = build_ass([w(4.0, 4.4, "BEFORE"), w(5.0, 5.4, "AFTER")], "", 9, seam=4.6)
@@ -413,9 +415,9 @@ def test_caption_style_outline_and_shadow():
 
 def test_caption_y_clamped_to_safe_band():
     assert "{\\pos(474,1180)}" in build_ass([w(0, 1, "x")], "", 2, caption_y=1600)
-    assert "{\\pos(474,662)}" in build_ass([w(0, 1, "x")], "", 2, caption_y=400)
+    assert "{\\pos(474,686)}" in build_ass([w(0, 1, "x")], "", 2, caption_y=400)
     late = build_ass([w(0, 1, "x")], "", 2, caption_y=400, caption_y_late=300)
-    assert "{\\pos(474,526)}" in late  # the late line may rise to 526, no further
+    assert "{\\pos(474,550)}" in late  # the late line may rise to 550, no further
 
 
 def test_rendered_boxes_inside_q4_at_band_extremes(tmp_path):
@@ -523,7 +525,69 @@ def test_early_until_covers_hook_tag_and_groups_shown_with_them():
     from hookline.captions.ass import early_until
 
     assert early_until([], "Hook", 20) == 3.0
-    assert early_until([], "Hook", 20, seam=5.0) == pytest.approx(5.8)
+    assert early_until([], "Hook", 20, seam=5.0) == pytest.approx(6.2)  # 1.2 s EARLIER tag
     # a group starting under the hook (2.8 s) holds until the next one (3.6 s, gap <= 1 s)
     ws = [w(2.6, 2.8, "SO."), w(2.8, 3.4, "LONG."), w(3.6, 4.0, "NEXT.")]
     assert early_until(ws, "Hook", 20) == pytest.approx(3.6)
+
+
+# --- M2.5 wave B: caption pages break at cuts and the seam; face rects follow the zoom plan --
+
+
+def _secs(ts):
+    h, m, s = ts.split(":")
+    return int(h) * 3600 + int(m) * 60 + float(s)
+
+
+def _cap_spans(ass):
+    out = []
+    for e in _events(ass):
+        f = e.split(",", 9)
+        if f[3] == "Cap":
+            out.append((_secs(f[1]), _secs(f[2]), f[9]))
+    return out
+
+
+def test_no_caption_event_spans_a_cut_or_the_seam():
+    # clip 05: "CAPITALISM THE" was one page across the cold-open seam at 3.67-4.49 s
+    ws = [
+        w(3.2, 3.66, "capitalism"),
+        w(3.67, 3.9, "the"),
+        w(3.9, 4.49, "market"),
+        w(6.0, 6.3, "and"),
+        w(6.3, 6.9, "then"),
+        w(7.0, 7.4, "we"),
+        w(7.45, 7.9, "won"),
+    ]
+    cuts, seam = [3.667, 6.95], 3.667
+    ass = build_ass(ws, "Hook", 10, seam=seam, breaks=cuts)
+    spans = _cap_spans(ass)
+    for b in {*cuts, seam}:
+        for start, end, text in spans:
+            assert not (start < b - 0.01 and end > b + 0.01), (b, start, end, text)
+    pages = [text for _, _, text in spans]
+    assert not any("CAPITALISM" in p and "THE" in p for p in pages)
+    assert not any("THEN" in p and "WE" in p for p in pages)
+
+
+def test_group_words_breaks_pages_at_break_times():
+    ws = [w(0, 0.3, "one"), w(0.3, 0.6, "two"), w(0.6, 0.9, "three")]
+    assert [len(g) for g in group_words(ws)] == [3]
+    assert [len(g) for g in group_words(ws, breaks=[0.6])] == [2, 1]
+    assert [len(g) for g in group_words(ws, breaks=[0.595])] == [2, 1]  # cut a frame early
+
+
+def test_held_page_ends_at_the_next_cut():
+    spans = _cap_spans(build_ass([w(1.0, 1.5, "hold"), w(2.2, 2.5, "next")], "", 5, breaks=[1.8]))
+    assert spans[0][1] == pytest.approx(1.8)  # would hold to 2.2 without the cut
+
+
+def test_face_rects_follow_the_planned_zoom():
+    lay = SceneLayout(start=0, end=4, kind="FACE_TRACK", face_box=(0.3, 0.2))
+    ((_, _, _, y1),) = face_rects(lay, 1.2)  # unplanned: about the face centre
+    assert y1 == pytest.approx(0.4 * 1920 + 1.2 * 0.1 * 1920)  # chin, 1.2x about the centre
+    planned = lay.model_copy(update={"base_zoom": 1.1, "zoom_cap": 1.3, "zoom_anchor": 0.1})
+    ((_, p0, _, p1),) = face_rects(planned, 1.0)
+    a = 0.1 * 1920
+    assert p1 == pytest.approx(a + 1.1 * (0.5 * 1920 - a))  # chin mapped about the anchor
+    assert p1 - p0 == pytest.approx(1.1 * 0.2 * 1920 * 0.8)  # core = bottom 80%, base zoom

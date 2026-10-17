@@ -1,5 +1,6 @@
 """Per-scene 9:16 layout choice: STACKED facecam, FACE_TRACK, SPLIT, or FIT_BLUR."""
 
+import math
 import statistics
 from pathlib import Path
 from typing import Literal, Protocol
@@ -28,6 +29,11 @@ CAM_VETO_MIN_H = 0.5  # ... "comparable" = at least half the cam face's height
 CAM_MIN_PX = 160  # grown cam box must be this many source pixels tall
 GROUP_MIN_SHARE = 0.5  # share of samples showing a small-face group -> wide shot (FIT_BLUR)
 GROUP_MAX_RATIO = 2.0  # faces within 2x height of the largest are "comparable"
+TRACK_HOLD_S = 3.0  # a face lost for up to this long: the crop holds its last good x ...
+TRACK_EASE_S = 1.0  # ... beyond it, eases to the scene's median face x over this long
+HAIR_SHARE = 0.5  # head top ~ face box top - half a face height (hair)
+HEAD_QUANTILE = 0.1  # the head top budgeted for: this low quantile of the samples (highest)
+ZOOM_TOP = 1.2  # the highest zoom step level (a punch); see reframe.ZOOM_PUNCH
 
 
 class SceneLayout(BaseModel):
@@ -38,6 +44,35 @@ class SceneLayout(BaseModel):
     track_x: list[tuple[float, float]] = []
     split_x: tuple[float, float] | None = None
     face_box: tuple[float, float] | None = None  # median face (y, h), normalized; captions
+    face_w: float | None = None  # median face width (FACE_TRACK), normalized to source width
+    head_top: float | None = None  # highest head top (HEAD_QUANTILE), normalized source y
+    # Zoom plan (reframe.plan_zoom): step level s shows as zoom_level(s); zooms keep the panel
+    # row zoom_anchor (normalized panel y; None = face centre / panel centre) fixed.
+    base_zoom: float = 1.0
+    zoom_cap: float | None = None
+    zoom_anchor: float | None = None
+
+    def zoom_level(self, s: float) -> float:
+        """Rendered zoom for schedule level `s` (1.0 / ZOOM_IN / ZOOM_TOP): base_zoom times
+        the step, the step part compressed (never clipped flat) so ZOOM_TOP lands on zoom_cap
+        when the full range would pass it; every distinct level stays distinct."""
+        k = 1.0
+        if self.zoom_cap is not None:
+            k = min(1.0, max(self.zoom_cap / self.base_zoom - 1.0, 0.0) / (ZOOM_TOP - 1.0))
+        return self.base_zoom * (1.0 + (s - 1.0) * k)
+
+    def zoom_y(self, y: float, s: float, panel_h: float) -> float:
+        """Where panel row `y` (px, unzoomed) lands at schedule level `s`: zooms scale about
+        the anchor row (zoom_anchor, else the face centre, else the panel centre)."""
+        a = self.anchor_px(panel_h)
+        return a + self.zoom_level(s) * (y - a)
+
+    def anchor_px(self, panel_h: float) -> float:
+        if self.zoom_anchor is not None:
+            return self.zoom_anchor * panel_h
+        if self.kind == "FACE_TRACK" and self.face_box is not None:
+            return (self.face_box[0] + self.face_box[1] / 2) * panel_h
+        return panel_h / 2
 
 
 class _Detector(Protocol):
@@ -139,6 +174,7 @@ def classify_scene(
             kind="SPLIT",
             split_x=(min(left, right), max(left, right)),
             face_box=_median_box(pair_boxes),
+            head_top=_quantile([y - HAIR_SHARE * h for y, h in pair_boxes], HEAD_QUANTILE),
         )
 
     largest = [(t, max(faces, key=lambda f: f.w * f.h)) for t, faces in kept if faces]
@@ -147,11 +183,43 @@ def classify_scene(
             start=start,
             end=end,
             kind="FACE_TRACK",
-            track_x=[(t, f.cx) for t, f in largest],
+            track_x=_track_keyframes(kept),
             face_box=_median_box([(f.y, f.h) for _, f in largest]),
+            face_w=statistics.median(f.w for _, f in largest),
+            head_top=_head_top([f for _, f in largest]),
         )
 
     return SceneLayout(start=start, end=end, kind="FIT_BLUR")
+
+
+def _quantile(values: list[float], q: float) -> float:
+    """Nearest-rank `q` quantile (q=0.1: a low value that ignores a stray outlier or two)."""
+    ordered = sorted(values)
+    return ordered[max(math.ceil(q * len(ordered)) - 1, 0)]
+
+
+def _head_top(faces: list[Face]) -> float:
+    return _quantile([f.y - HAIR_SHARE * f.h for f in faces], HEAD_QUANTILE)
+
+
+def _track_keyframes(kept: list[tuple[float, list[Face]]]) -> list[tuple[float, float]]:
+    """(t, centre x) of the largest face per sample. A sample with no face (none passed
+    MIN_SCORE) HOLDS the last good x rather than following whatever else is in frame; after
+    TRACK_HOLD_S without a face it eases to the scene's median face x over TRACK_EASE_S.
+    Samples before the first face add nothing (the first x holds back to the scene start), so
+    the track only interpolates between valid samples and hold points."""
+    xs = [max(faces, key=lambda f: f.w * f.h).cx for _, faces in kept if faces]
+    median = statistics.median(xs) if xs else 0.5
+    out: list[tuple[float, float]] = []
+    last: tuple[float, float] | None = None
+    for t, faces in sorted(kept, key=lambda s: s[0]):
+        if faces:
+            last = (t, max(faces, key=lambda f: f.w * f.h).cx)
+            out.append(last)
+        elif last is not None:
+            ease = min(max((t - last[0] - TRACK_HOLD_S) / TRACK_EASE_S, 0.0), 1.0)
+            out.append((t, last[1] + (median - last[1]) * ease))
+    return out
 
 
 def _median_box(boxes: list[tuple[float, float]]) -> tuple[float, float]:
@@ -179,7 +247,7 @@ def plan_layouts(
     video: Path,
     detector: _Detector | None,
     facecam_override: Box | None = None,
-    sample_every: float = 1.0,
+    sample_every: float = 0.5,
     crop: Crop | None = None,
 ) -> list[SceneLayout]:
     """One layout per scene. With no detector (and no override) the whole video is a single

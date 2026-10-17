@@ -4,14 +4,14 @@ import logging
 import math
 import re
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from itertools import pairwise
 from pathlib import Path
 
 import numpy as np
 
 from hookline.media.ffmpeg import FFmpegError, _run, probe_duration, probe_size
-from hookline.pipeline.layout import SceneLayout
+from hookline.pipeline.layout import ZOOM_TOP, SceneLayout
 from hookline.vision.faces import sample_frames
 
 log = logging.getLogger(__name__)
@@ -22,13 +22,14 @@ STACK_GAME_H = OUT_H - STACK_CAM_H  # 1280
 SPLIT_H = OUT_H // 2  # 960
 TRACK_ALPHA = 0.3
 TRACK_DEADBAND = 0.05
+TRACK_MARGIN = 0.1  # the face stays this share of the crop width inside the crop's edges
 BLUR = "boxblur=20:2"
 MIN_SCENE = 1 / 30
 
-# Pacing zooms: alternate 1.0 / 1.12 at cuts and at least every 4.5 s; punch to 1.2 on
+# Pacing zooms: alternate 1.0 / 1.12 at every cut and at least every 4.5 s; punch to 1.2 on
 # emphasis beats. Steps ease (smoothstep) over 0.2 s; a punch holds 1.2 s and releases over 0.3 s.
 ZOOM_IN = 1.12
-ZOOM_PUNCH = 1.2
+ZOOM_PUNCH = ZOOM_TOP  # 1.2
 ZOOM_EASE = 0.2
 PUNCH_HOLD = 1.2
 PUNCH_RELEASE = 0.3
@@ -37,6 +38,18 @@ ZOOM_MIN_STEP = 0.5  # no two steps closer than this
 BOUNDARY_SNAP = 1.0  # a filler step moves to a sentence end within this of its nominal time
 SHARPEN = "unsharp=5:5:0.6:5:5:0.0"
 SHARPEN_ABOVE = 1.3  # sharpen panels upscaled more than this
+# Per-scene zoom plan (plan_zoom). Soft sources: a scene upscaled more than UPSCALE_SOFT keeps
+# every zoom level (punches included) at or under ZOOM_IN and scales with lanczos.
+UPSCALE_SOFT = 2.0
+LANCZOS = ":flags=lanczos"
+# Small faces: a FACE_TRACK face under SMALL_FACE of the output height gets a base zoom toward
+# FACE_TARGET, within MAX_UPSCALE total upscale and MAX_ZOOM total zoom.
+SMALL_FACE = 0.20
+FACE_TARGET = 0.22
+MAX_UPSCALE = 2.5
+MAX_ZOOM = 1.4
+HEADROOM = 0.04  # the head top (face top - half a face height) stays this share below the top
+_CAP_STEP = 0.005
 
 _CROP_RE = re.compile(r"crop=(\d+):(\d+):(\d+):(\d+)")
 _CROP_SAMPLES = 5
@@ -304,13 +317,17 @@ def _aspect_crop(in_w: int, in_h: int, aw: int, ah: int) -> tuple[int, int]:
     return _even(in_w), _even(in_w * ah / aw)
 
 
-def _fill(w: int, h: int) -> str:
-    return f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}"
+def _fill(w: int, h: int, flags: str = "") -> str:
+    return f"scale={w}:{h}:force_original_aspect_ratio=increase{flags},crop={w}:{h}"
 
 
-def _smooth(keyframes: list[tuple[float, float]]) -> list[tuple[float, float]]:
+def _smooth(
+    keyframes: list[tuple[float, float]], allow: float | None = None
+) -> list[tuple[float, float]]:
     """EMA (alpha 0.3) chasing a deadbanded target: the target jumps to the raw value only
-    when it differs by more than 0.05; the output eases toward the target every step."""
+    when it differs by more than 0.05; the output eases toward the target every step. With
+    `allow`, the output never lags more than that behind the raw value (the face stays in the
+    crop when it moves fast, e.g. a lean)."""
     out: list[tuple[float, float]] = []
     target = smoothed = 0.0
     for i, (t, x) in enumerate(sorted(keyframes)):
@@ -320,6 +337,8 @@ def _smooth(keyframes: list[tuple[float, float]]) -> list[tuple[float, float]]:
             if abs(x - target) > TRACK_DEADBAND:
                 target = x
             smoothed += TRACK_ALPHA * (target - smoothed)
+        if allow is not None:
+            smoothed = min(max(smoothed, x - allow), x + allow)
         out.append((t, smoothed))
     return out
 
@@ -344,11 +363,17 @@ def _pwl_expr(pts: list[tuple[float, float]], smooth: bool = False) -> str:
     return f"if(lt(t,{_fmt(pts[0][0])}),{_fmt(pts[0][1])},{expr})"
 
 
-def track_x_expr(keyframes: list[tuple[float, float]], in_w: int, crop_w: int) -> str:
+def track_x_expr(
+    keyframes: list[tuple[float, float]], in_w: int, crop_w: int, face_w: float | None = None
+) -> str:
     """ffmpeg expression (in `t`) for the crop's left edge: piecewise-linear over smoothed,
-    clamped keyframes (normalized centre x). Commas are NOT escaped."""
+    clamped keyframes (normalized centre x). The smoothing never lets the face (`face_w`,
+    normalized; 0 when unknown) of a keyframe come closer than TRACK_MARGIN of the crop width
+    to the crop's edge. Commas are NOT escaped."""
     hi = max(in_w - crop_w, 0)
-    pts = [(t, min(max(s * in_w - crop_w / 2, 0.0), hi)) for t, s in _smooth(keyframes)]
+    room = crop_w / 2 - (face_w or 0.0) * in_w / 2 - TRACK_MARGIN * crop_w
+    allow = max(room, 0.0) / in_w
+    pts = [(t, min(max(s * in_w - crop_w / 2, 0.0), hi)) for t, s in _smooth(keyframes, allow)]
     if not pts:
         return _fmt(hi / 2)
     return _pwl_expr(pts)
@@ -379,32 +404,39 @@ def zoom_schedule(
 ) -> list[tuple[float, float]]:
     """Zoom steps `(t, scale)` over an output timeline of `duration` s, starting `(0, 1.0)`.
 
-    Consecutive steps always differ: the base level alternates 1.0 / ZOOM_IN at each cut and
-    at filler times keeping every gap <= `max_gap` (fillers prefer `boundaries`, i.e. sentence
-    ends, within BOUNDARY_SNAP s of their nominal time). An emphasis time punches to ZOOM_PUNCH
-    and returns to the base level PUNCH_HOLD s after its ease completes. Punches overlapping an
-    earlier punch, and cuts within ZOOM_MIN_STEP s of a punch or of each other, are dropped."""
+    Every cut in (0, duration) gets a step at its exact time, so no cut is a bare jump cut.
+    The base level alternates 1.0 / ZOOM_IN at each cut and at filler times keeping every gap
+    <= `max_gap` (fillers prefer `boundaries`, i.e. sentence ends, within BOUNDARY_SNAP s of
+    their nominal time). An emphasis time punches to ZOOM_PUNCH and returns to the base level
+    PUNCH_HOLD s after its ease completes. A punch within ZOOM_MIN_STEP s of a cut moves onto
+    the cut (the punch is that cut's framing change); a cut during a punch (or within
+    ZOOM_MIN_STEP s after its release) ends the punch there, at 1.0, the level furthest from
+    the punch. Punches overlapping an earlier punch, or before ZOOM_MIN_STEP s, are dropped.
+    Consecutive steps always differ."""
     punch_len = ZOOM_EASE + PUNCH_HOLD
+    cuts = sorted({round(c, 3) for c in cut_times if 0 < c < duration})
     punches: list[float] = []
     for e in sorted(emphasis_times):
-        if ZOOM_MIN_STEP <= e < duration and (
-            not punches or e >= punches[-1] + punch_len + ZOOM_MIN_STEP
-        ):
+        if not ZOOM_MIN_STEP <= e < duration:
+            continue
+        near = [c for c in cuts if abs(c - e) < ZOOM_MIN_STEP]
+        if near:
+            e = min(near, key=lambda c: abs(c - e))
+        if not punches or e >= punches[-1] + punch_len + ZOOM_MIN_STEP:
             punches.append(e)
-    busy = [(p - ZOOM_MIN_STEP, p + punch_len + ZOOM_MIN_STEP) for p in punches]
-    cuts: list[float] = []
-    for c in sorted(cut_times):
-        if not ZOOM_MIN_STEP <= c <= duration - ZOOM_MIN_STEP:
-            continue
-        # A cut inside a punch window is swallowed: the punch already changes the framing
-        # there, and a second step within 0.5 s would read as a stutter. The cut itself is
-        # still a framing change (and stays in the sidecar's cut_times).
-        if any(lo < c < hi for lo, hi in busy) or (cuts and c - cuts[-1] < ZOOM_MIN_STEP):
-            continue
-        cuts.append(c)
-    events: list[tuple[float, str]] = [(c, "toggle") for c in cuts]
-    events += [(p, "punch") for p in punches] + [(p + punch_len, "release") for p in punches]
-    anchors = [0.0, *sorted(t for t, _ in events), duration]
+    events: list[tuple[float, str]] = []
+    taken: set[float] = set()
+    for p in punches:
+        events.append((p, "punch"))
+        taken.add(p)
+        ender = [c for c in cuts if p < c < p + punch_len + ZOOM_MIN_STEP]
+        if ender:
+            events.append((ender[0], "cut_release"))
+            taken.add(ender[0])
+        else:
+            events.append((p + punch_len, "release"))
+    events += [(c, "toggle") for c in cuts if c not in taken]
+    anchors = sorted({0.0, *(t for t, _ in events), duration})
     for a, b in pairwise(anchors):
         events += [(f, "toggle") for f in _fill_gap(a, b, max_gap, boundaries)]
 
@@ -413,23 +445,32 @@ def zoom_schedule(
     for t, kind in sorted(events):
         if kind == "toggle":
             base = ZOOM_IN if base == 1.0 else 1.0
+        elif kind == "cut_release":
+            base = 1.0
         steps.append((round(t, 3), ZOOM_PUNCH if kind == "punch" else base))
     return [st for st in steps if st[0] < duration]  # e.g. a release past the end
 
 
 def zoom_expr(
-    steps: Sequence[Sequence[float]], offset: float = 0.0, length: float | None = None
+    steps: Sequence[Sequence[float]],
+    offset: float = 0.0,
+    length: float | None = None,
+    level: Callable[[float], float] | None = None,
 ) -> str:
     """Eased scale expression S(t) for `steps`, in scene time (`t` = output time - `offset`).
     A step eases (smoothstep) from the previous scale over ZOOM_EASE s (PUNCH_RELEASE s when
-    leaving a punch). With `length`, only points that matter for [0, length] are emitted.
-    Commas are NOT escaped."""
+    leaving a punch), cut short when the next step comes sooner. `level` maps a step's scale
+    to the rendered zoom (a scene's `SceneLayout.zoom_level`). With `length`, only points that
+    matter for [0, length] are emitted. Commas are NOT escaped."""
     if not steps:
         return "1"
-    pts = [(float(steps[0][0]), float(steps[0][1]))]
-    for (_, s0), (t1, s1) in pairwise(steps):
+    lv = level or (lambda v: v)
+    seq = [(float(t), float(v)) for t, v in steps]
+    pts = [(seq[0][0], lv(seq[0][1]))]
+    for i, ((_, s0), (t1, s1)) in enumerate(pairwise(seq)):
         d = PUNCH_RELEASE if s0 == ZOOM_PUNCH else ZOOM_EASE
-        pts += [(t1, s0), (t1 + d, s1)]
+        nxt = seq[i + 2][0] if i + 2 < len(seq) else math.inf
+        pts += [(t1, lv(s0)), (min(t1 + d, nxt), lv(s1))]
     pts = [(t - offset, v) for t, v in pts]
     if length is not None:
         first = max((i for i, (t, _) in enumerate(pts) if t <= 0), default=0)
@@ -440,7 +481,7 @@ def zoom_expr(
     return _pwl_expr(pts, smooth=True)
 
 
-def _zoom(expr: str, w: int, h: int, ay: float | None = None) -> str:
+def _zoom(expr: str, w: int, h: int, ay: float | None = None, flags: str = "") -> str:
     """Scale-then-crop zoom of a w x h panel by S(t) = `expr`, keeping (w/2, ay) fixed
     (ay defaults to the centre). Empty when S is constant 1. crop's iw/ih stay at their
     configure-time values when the input size changes per frame, so x/y come from S itself."""
@@ -451,20 +492,23 @@ def _zoom(expr: str, w: int, h: int, ay: float | None = None) -> str:
     ay = h / 2 if ay is None else min(max(ay, 0.0), float(h))
     x = rf"min({_fmt(w / 2)}*({s}-1)\,{sw}-{w})"
     y = rf"min({_fmt(ay)}*({s}-1)\,{sh}-{h})"
-    return f",scale=w='{sw}':h='{sh}':eval=frame,crop={w}:{h}:x='{x}':y='{y}'"
+    return f",scale=w='{sw}':h='{sh}':eval=frame{flags},crop={w}:{h}:x='{x}':y='{y}'"
 
 
 def _sharpen(factor: float) -> str:
     return f",{SHARPEN}" if factor > SHARPEN_ABOVE else ""
 
 
-def _fit_blur(label_in: str, label_out: str, in_w: int, in_h: int, zoom: str = "1") -> str:
+def _fit_blur(
+    label_in: str, label_out: str, in_w: int, in_h: int, zoom: str = "1", flags: str = ""
+) -> str:
     bg, fg, bgo, fgo = (f"[{label_out}_{n}]" for n in ("bg", "fg", "bgo", "fgo"))
     fh = _even(OUT_W * in_h / in_w)
     return (
         f"[{label_in}]split=2{bg}{fg};"
         f"{bg}{_fill(OUT_W, OUT_H)},{BLUR}{bgo};"
-        f"{fg}scale={OUT_W}:{fh}{_zoom(zoom, OUT_W, fh)}{_sharpen(OUT_W / in_w)}{fgo};"
+        f"{fg}scale={OUT_W}:{fh}{flags}{_zoom(zoom, OUT_W, fh, flags=flags)}"
+        f"{_sharpen(OUT_W / in_w)}{fgo};"
         f"{bgo}{fgo}overlay=(W-w)/2:(H-h)/2,setsar=1[{label_out}]"
     )
 
@@ -515,16 +559,23 @@ def scene_filter(
 ) -> str:
     """Filter chain [label_in] (already trimmed to the scene) -> [label_out] at 1080x1920, SAR 1.
 
-    `zoom_steps` (output time, from `zoom_schedule`) zoom the speaker panel after the layout:
-    FACE_TRACK whole frame (anchored on the face centre), STACKED facecam panel, both SPLIT
-    panels, FIT_BLUR foreground. Panels upscaled more than SHARPEN_ABOVE are sharpened after
-    the zoom, so the final pixels are the sharpened ones."""
+    `zoom_steps` (output time, from `zoom_schedule`) zoom the speaker panel after the layout,
+    each level mapped through the scene's plan (`plan_zoom`, `SceneLayout.zoom_level`) and
+    scaled about its anchor row (`SceneLayout.anchor_px`): FACE_TRACK whole frame, STACKED
+    facecam panel, both SPLIT panels, FIT_BLUR foreground. Panels upscaled more than
+    SHARPEN_ABOVE are sharpened after the zoom, so the final pixels are the sharpened ones;
+    scenes upscaled more than UPSCALE_SOFT scale with lanczos."""
     kind = _kind(layout)
-    zoom = (
-        zoom_expr(zoom_steps, offset=layout.start, length=layout.end - layout.start)
-        if zoom_steps
-        else "1"
-    )
+    if zoom_steps:
+        zoom = zoom_expr(
+            zoom_steps,
+            offset=layout.start,
+            length=layout.end - layout.start,
+            level=layout.zoom_level,
+        )
+    else:
+        zoom = _fmt(layout.zoom_level(1.0))
+    flags = LANCZOS if scene_upscale(layout, in_w, in_h) > UPSCALE_SOFT else ""
     a, b = f"[{label_out}_a]", f"[{label_out}_b]"
     if kind == "STACKED":
         cw, ch, cx, cy = _cam_crop(layout, in_w, in_h)
@@ -533,23 +584,20 @@ def scene_filter(
         cam_up = max(OUT_W / cw, STACK_CAM_H / ch)
         return (
             f"[{label_in}]split=2{a}{b};"
-            f"{a}crop={cw}:{ch}:{cx}:{cy},{_fill(OUT_W, STACK_CAM_H)}"
-            f"{_zoom(zoom, OUT_W, STACK_CAM_H)}{_sharpen(cam_up)}{cam};"
+            f"{a}crop={cw}:{ch}:{cx}:{cy},{_fill(OUT_W, STACK_CAM_H, flags)}"
+            f"{_zoom(zoom, OUT_W, STACK_CAM_H, flags=flags)}{_sharpen(cam_up)}{cam};"
             f"{b}crop={gw}:{gh}:{(in_w - gw) // 2}:{(in_h - gh) // 2},"
-            f"scale={OUT_W}:{STACK_GAME_H}{_sharpen(OUT_W / gw)}{game};"
+            f"scale={OUT_W}:{STACK_GAME_H}{flags}{_sharpen(OUT_W / gw)}{game};"
             f"{cam}{game}vstack,setsar=1[{label_out}]"
         )
     if kind == "FACE_TRACK":
         cw = _track_w(in_w, in_h)
         rel = [(t - layout.start, x) for t, x in layout.track_x]
-        x = track_x_expr(rel, in_w, cw).replace(",", r"\,")
-        ay = None
-        if layout.face_box is not None:
-            fy, fh = layout.face_box
-            ay = (fy + fh / 2) * OUT_H
+        x = track_x_expr(rel, in_w, cw, layout.face_w).replace(",", r"\,")
+        ay = layout.anchor_px(OUT_H)
         return (
-            f"[{label_in}]crop={cw}:{_even(in_h)}:{x}:0,scale={OUT_W}:{OUT_H}"
-            f"{_zoom(zoom, OUT_W, OUT_H, ay)}{_sharpen(scene_upscale(layout, in_w, in_h))},"
+            f"[{label_in}]crop={cw}:{_even(in_h)}:{x}:0,scale={OUT_W}:{OUT_H}{flags}"
+            f"{_zoom(zoom, OUT_W, OUT_H, ay, flags)}{_sharpen(scene_upscale(layout, in_w, in_h))},"
             f"setsar=1[{label_out}]"
         )
     if kind == "SPLIT":
@@ -557,14 +605,87 @@ def scene_filter(
         sw, sh = _aspect_crop(in_w, in_h, OUT_W, SPLIT_H)
         y = (in_h - sh) // 2
         xs = [min(max(int(c * in_w - sw / 2), 0), in_w - sw) for c in layout.split_x]
-        post = f"{_zoom(zoom, OUT_W, SPLIT_H)}{_sharpen(OUT_W / sw)}"
+        post = f"{_zoom(zoom, OUT_W, SPLIT_H, layout.anchor_px(SPLIT_H), flags)}"
+        post += _sharpen(OUT_W / sw)
+        scale = f"scale={OUT_W}:{SPLIT_H}{flags}"
         return (
             f"[{label_in}]split=2{a}{b};"
-            f"{a}crop={sw}:{sh}:{xs[0]}:{y},scale={OUT_W}:{SPLIT_H}{post}[{label_out}_top];"
-            f"{b}crop={sw}:{sh}:{xs[1]}:{y},scale={OUT_W}:{SPLIT_H}{post}[{label_out}_bot];"
+            f"{a}crop={sw}:{sh}:{xs[0]}:{y},{scale}{post}[{label_out}_top];"
+            f"{b}crop={sw}:{sh}:{xs[1]}:{y},{scale}{post}[{label_out}_bot];"
             f"[{label_out}_top][{label_out}_bot]vstack,setsar=1[{label_out}]"
         )
-    return _fit_blur(label_in, label_out, in_w, in_h, zoom)
+    return _fit_blur(label_in, label_out, in_w, in_h, zoom, flags)
+
+
+def _panel_y(layout: SceneLayout, y: float, in_w: int, in_h: int) -> tuple[float, float]:
+    """(unzoomed panel px, panel height) of normalized source row `y`: the full frame height
+    for FACE_TRACK, the vertically centred crop for SPLIT."""
+    if _kind(layout) == "SPLIT":
+        sh = _aspect_crop(in_w, in_h, OUT_W, SPLIT_H)[1]
+        return (y * in_h - (in_h - sh) // 2) / sh * SPLIT_H, SPLIT_H
+    return y * OUT_H, OUT_H
+
+
+def _headroom(layout: SceneLayout, in_w: int, in_h: int) -> tuple[float, float] | None:
+    """(largest zoom <= the scene's top level, anchor px) that keeps the head top (the
+    scene's highest, `head_top`) HEADROOM below the panel top and the median chin inside the
+    panel at every level up to it, the anchor as close to the face centre as allowed. None
+    without face geometry. A head already within HEADROOM unzoomed (the source framing cut it)
+    anchors at the top: zooming in then only moves it down."""
+    if layout.face_box is None or layout.head_top is None:
+        return None
+    if _kind(layout) not in ("FACE_TRACK", "SPLIT"):
+        return None
+    fy, fh = layout.face_box
+    hp, ph = _panel_y(layout, layout.head_top, in_w, in_h)
+    fc, _ = _panel_y(layout, fy + fh / 2, in_w, in_h)
+    fb, _ = _panel_y(layout, fy + fh, in_w, in_h)
+    m = HEADROOM * ph
+    s = layout.zoom_level(ZOOM_TOP)
+    while s > 1.0 + 1e-9:
+        # zoom s about anchor a maps row y to a + s (y - a): head top >= m and chin <= ph
+        hi = max(hp + (hp - m) / (s - 1), 0.0)
+        lo = max((s * fb - ph) / (s - 1), 0.0)
+        if lo <= hi:
+            return s, min(max(fc, lo), hi)
+        s -= _CAP_STEP
+    return 1.0, min(max(fc, 0.0), ph)
+
+
+def plan_zoom(layout: SceneLayout, in_w: int, in_h: int) -> SceneLayout:
+    """The scene with its zoom plan (base_zoom, zoom_cap, zoom_anchor) filled in:
+
+    - soft source (upscale > UPSCALE_SOFT): every level, punches included, <= ZOOM_IN;
+    - small FACE_TRACK face (< SMALL_FACE of the output height): a base zoom toward
+      FACE_TARGET, with every level <= MAX_ZOOM total zoom and MAX_UPSCALE total upscale,
+      leaving room for the full step range above the base (cut steps and punches keep their
+      size);
+    - headroom: the anchor row (and if need be a lower cap) keeps the head top >= HEADROOM of
+      the panel height below its top at every level (`_headroom`)."""
+    up = scene_upscale(layout, in_w, in_h)
+    cap: float | None = ZOOM_IN if up > UPSCALE_SOFT else None
+    base = 1.0
+    face_h = layout.face_box[1] if layout.face_box else 0.0
+    if _kind(layout) == "FACE_TRACK" and 0 < face_h < SMALL_FACE:
+        room = min(MAX_ZOOM, MAX_UPSCALE / up, cap or MAX_ZOOM)
+        base = max(1.0, min(FACE_TARGET / face_h, room / ZOOM_PUNCH))
+        if base > 1.0:
+            cap = room
+    plan = layout.model_copy(update={"base_zoom": math.floor(base * 1e4) / 1e4, "zoom_cap": cap})
+    head = _headroom(plan, in_w, in_h)
+    if head is None:
+        return plan
+    top, anchor = head
+    if top < plan.zoom_level(ZOOM_TOP) - 1e-9:
+        base, cap = max(1.0, min(base, top / ZOOM_PUNCH)), top
+    ph = _panel_y(layout, 0.0, in_w, in_h)[1]
+    return plan.model_copy(
+        update={
+            "base_zoom": math.floor(base * 1e4) / 1e4,
+            "zoom_cap": cap,
+            "zoom_anchor": anchor / ph,
+        }
+    )
 
 
 def _merge_short(layouts: list[SceneLayout]) -> list[SceneLayout]:
