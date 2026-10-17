@@ -27,6 +27,8 @@ line is `[timestamp] sentence`, where the timestamp is when the sentence starts,
 words, so read energy from them: exclamations, laughter, sudden reversals, arguments, reveals, \
 fails, wins, confessions and strong opinions.
 
+Some lines end with markers in angle brackets, such as `⟨🔥chat×4 🔊loud⟩`. They are audience and audio reactions inside that sentence: `🔥chat×N` means chat activity ran about N times the usual rate, and `🔊loud` means the audio got far louder than normal. Treat them as evidence of emotional intensity, not a requirement: a moment without markers can still be great, and a marked one can still be a poor clip.
+
 ## Your task
 
 Find the strongest self-contained moments and return them as clip candidates, ranked best \
@@ -367,14 +369,16 @@ def _ask(
     raise AssertionError("unreachable")
 
 
-def _chunks(sentences: list[Sentence], max_chars: int) -> list[list[Sentence]]:
+def _chunks(
+    sentences: list[Sentence], max_chars: int, markers: dict[int, list[str]] | None = None
+) -> list[list[Sentence]]:
     """Split sentences (one compact line each) into chunks of at most `max_chars` of new lines;
     each chunk after the first is prefixed with the previous chunk's final 2 minutes."""
     primaries: list[list[Sentence]] = []
     cur: list[Sentence] = []
     size = 0
     for s in sentences:
-        line_len = len(compact_transcript([s])) + 1
+        line_len = len(compact_transcript([s], markers)) + 1
         if cur and size + line_len > max_chars:
             primaries.append(cur)
             cur, size = [], 0
@@ -395,15 +399,17 @@ def select_clips(
     settings: Settings,
     exclude: list[tuple[float, float]] = [],  # noqa: B006 - never mutated
     raw_sink: list[dict] | None = None,
+    markers: dict[int, list[str]] | None = None,
 ) -> list[ClipPick]:
-    """Pick the best clips. If `raw_sink` is given, each raw LLM payload is appended to it."""
+    """Pick the best clips. If `raw_sink` is given, each raw LLM payload is appended to it.
+    `markers` (second -> heat markers) annotate the transcript lines Claude reads."""
     if transcript.duration < settings.short_input_s:
         return [polish_pick(transcript)]
 
     duration = transcript.duration
     words = transcript.words()
     sentences = split_sentences(words)
-    compact = compact_transcript(sentences)
+    compact = compact_transcript(sentences, markers)
 
     def valid(raws: list[_RawClip]) -> list[ClipPick]:
         return [
@@ -413,7 +419,7 @@ def select_clips(
         ]
 
     if len(compact) / 4 > settings.max_prompt_tokens:
-        chunks = _chunks(sentences, settings.max_prompt_tokens * 4)
+        chunks = _chunks(sentences, settings.max_prompt_tokens * 4, markers)
         logger.info("transcript over prompt budget; selecting across %d chunks", len(chunks))
         raws = []
         for i, chunk in enumerate(chunks, 1):
@@ -422,7 +428,7 @@ def select_clips(
                 f"{format_timestamp(chunk[0].start)}-{format_timestamp(chunk[-1].end)})"
             )
             prompt = build_prompt(
-                compact_transcript(chunk),
+                compact_transcript(chunk, markers),
                 settings.clips,
                 duration,
                 exclude,

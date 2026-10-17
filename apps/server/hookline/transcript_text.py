@@ -44,5 +44,17 @@ def format_timestamp(t: float) -> str:
     return f"{m:02d}:{s:04.1f}"
 
 
-def compact_transcript(sentences: list[Sentence]) -> str:
-    return "\n".join(f"[{format_timestamp(s.start)}] {s.text}" for s in sentences)
+def compact_transcript(
+    sentences: list[Sentence], markers: dict[int, list[str]] | None = None
+) -> str:
+    """One `[mm:ss.s] sentence` line each; markers whose second lies in [start, end) are
+    appended as ` ⟨a b⟩` in ascending second order, de-duplicated."""
+    markers = markers or {}
+    lines = []
+    for s in sentences:
+        found: list[str] = []
+        for sec in sorted(k for k in markers if s.start <= k < s.end):
+            found.extend(m for m in markers[sec] if m not in found)
+        suffix = f" ⟨{' '.join(found)}⟩" if found else ""
+        lines.append(f"[{format_timestamp(s.start)}] {s.text}{suffix}")
+    return "\n".join(lines)

@@ -280,6 +280,9 @@ def test_system_prompt_covers_brief():
         '"And", "So", "But", "Because", "Which"',
         "introduces the subject",
         "score `hook` and `context` lower",
+        "⟨🔥chat×4 🔊loud⟩",
+        "audience and audio reactions",
+        "not a requirement",
     ):
         assert needle in SYSTEM_PROMPT
 
@@ -441,3 +444,17 @@ def test_cold_open_without_whole_words_logs_reason(long_transcript, fake_llm, se
         caplog, fake_llm, long_transcript, settings, raw(30, 60, cold_open=(46.75, 46.78))
     )
     assert len(msgs) == 1 and "no whole words fit" in msgs[0]
+
+
+def test_markers_reach_the_prompt(long_transcript, fake_llm, settings):
+    fake_llm.queue(make_payload(8))
+    select_clips(long_transcript, fake_llm, settings, markers={31: ["🔊loud"]})
+    assert "⟨🔊loud⟩" in fake_llm.calls[0]["prompt"]
+
+
+def test_markers_reach_chunk_prompts(long_transcript, fake_llm, settings):
+    s = settings.model_copy(update={"max_prompt_tokens": 500})
+    fake_llm.queue_forever(make_payload(5))
+    select_clips(long_transcript, fake_llm, s, markers={31: ["🔊loud"], 400: ["🔊loud"]})
+    assert len(fake_llm.calls) > 1
+    assert sum("⟨🔊loud⟩" in c["prompt"] for c in fake_llm.calls) >= 2
