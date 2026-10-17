@@ -10,6 +10,18 @@ YELLOW = "{\\c&H00FFFF&}"
 RESET = "{\\r}"
 SENTENCE_END = (".", "!", "?", "…")
 
+OUT_H = 1920
+SPLIT_PANEL_H = OUT_H // 2
+CAPTION_Y = 1300
+CAPTION_HALF_H = 60  # half the caption line's height
+CAPTION_FACE_GAP = 120  # caption centre below a face that would cover the 1300 line
+CAPTION_MAX_Y = 1600
+STACKED_CAPTION_Y = 640  # the cam/game seam
+HOOK_Y = 260
+HOOK_BAND_BOTTOM = 440  # up to 3 hook lines around y=260 reach about this far down
+HOOK_ABOVE_CAPTION = 260
+STACKED_HOOK_Y = 860  # below the seam captions, over the top of the game
+
 HEADER = """[Script Info]
 ScriptType: v4.00+
 PlayResX: 1080
@@ -92,11 +104,18 @@ def _wrap_hook(text: str) -> str:
     return "\\N".join(_esc(line) for line in lines)
 
 
-def build_ass(words: list[Word], hook_text: str, duration: float, caption_y: int = 1300) -> str:
+def build_ass(
+    words: list[Word],
+    hook_text: str,
+    duration: float,
+    caption_y: int = CAPTION_Y,
+    hook_y: int = HOOK_Y,
+) -> str:
     lines = [HEADER.rstrip("\n")]
     hook = _wrap_hook(hook_text)
     if hook:
-        lines.append(_dialogue(1, 0.0, min(HOOK_S, duration), "Hook", f"{{\\pos(540,260)}}{hook}"))
+        pos = f"{{\\pos(540,{hook_y})}}"
+        lines.append(_dialogue(1, 0.0, min(HOOK_S, duration), "Hook", pos + hook))
     pos = f"{{\\pos(540,{caption_y})}}"
     for group in group_words(_normalise(words)):
         for i, active in enumerate(group):
@@ -109,6 +128,38 @@ def build_ass(words: list[Word], hook_text: str, duration: float, caption_y: int
     return "\n".join(lines) + "\n"
 
 
+def _face_px(layout: SceneLayout) -> tuple[float, float] | None:
+    """Top and bottom (output px) of the layout's median face; for SPLIT, in the top panel."""
+    if layout.face_box is None or layout.kind not in ("FACE_TRACK", "SPLIT"):
+        return None
+    scale = OUT_H if layout.kind == "FACE_TRACK" else SPLIT_PANEL_H
+    y, h = layout.face_box
+    return y * scale, (y + h) * scale
+
+
 def caption_y_for(layouts: list[SceneLayout]) -> int:
-    """Caption height: 640 (the seam) when the first scene is stacked, else 1300."""
-    return 640 if layouts and layouts[0].kind == "STACKED" else 1300
+    """Caption line for the first scene: 640 (the seam) when STACKED; below the face when a
+    FACE_TRACK face covers the 1300 line; else 1300."""
+    if not layouts:
+        return CAPTION_Y
+    first = layouts[0]
+    if first.kind == "STACKED":
+        return STACKED_CAPTION_Y
+    face = _face_px(first) if first.kind == "FACE_TRACK" else None
+    if face and face[0] < CAPTION_Y + CAPTION_HALF_H and face[1] > CAPTION_Y - CAPTION_HALF_H:
+        return min(round(face[1]) + CAPTION_FACE_GAP, CAPTION_MAX_Y)
+    return CAPTION_Y
+
+
+def hook_y_for(layouts: list[SceneLayout]) -> int:
+    """Hook title centre for the first scene: 260 (top) unless that covers a face, then
+    260 px above the captions; 860 when STACKED (below the 640 seam captions)."""
+    if not layouts:
+        return HOOK_Y
+    first = layouts[0]
+    if first.kind == "STACKED":
+        return STACKED_HOOK_Y
+    face = _face_px(first)
+    if face and face[0] < HOOK_BAND_BOTTOM:
+        return caption_y_for(layouts) - HOOK_ABOVE_CAPTION
+    return HOOK_Y

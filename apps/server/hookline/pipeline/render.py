@@ -3,7 +3,7 @@
 import os
 from pathlib import Path
 
-from hookline.captions.ass import build_ass, caption_y_for
+from hookline.captions.ass import build_ass, caption_y_for, hook_y_for
 from hookline.config import Settings
 from hookline.fsutil import atomic_write_text
 from hookline.media.audio import detect_silences
@@ -93,7 +93,13 @@ def render_clip(
     if settings.captions:
         ass = work_dir / f"{name}.ass"
         cap_words = remap_words(near, keep)
-        text = build_ass(cap_words, pick.hook_text, probe_duration(inter), caption_y_for(layouts))
+        text = build_ass(
+            cap_words,
+            pick.hook_text,
+            probe_duration(inter),
+            caption_y_for(layouts),
+            hook_y_for(layouts),
+        )
         atomic_write_text(ass, text)
         graph += f";[vout]{subtitles_filter(ass, fonts_dir())}[vfinal]"
         out_label = "[vfinal]"
