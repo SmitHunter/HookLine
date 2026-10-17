@@ -1,4 +1,5 @@
 import math
+import re
 import subprocess
 
 import pytest
@@ -102,21 +103,37 @@ def test_track_tiny_time_delta_has_no_division_by_zero():
         assert math.isfinite(v) and 0 <= v <= 900
 
 
-def test_reframe_graph_rejects_empty_and_drops_tiny_scenes():
+def test_reframe_graph_rejects_empty_and_all_tiny():
     with pytest.raises(ValueError, match="no layouts"):
         reframe_graph([], 1280, 720)
     with pytest.raises(ValueError, match="no layouts"):
         reframe_graph([SceneLayout(start=1, end=1.01, kind="FIT_BLUR")], 1280, 720)
-    graph = reframe_graph(
-        [
-            SceneLayout(start=0, end=2, kind="FIT_BLUR"),
-            SceneLayout(start=2, end=2.02, kind="FIT_BLUR"),
-            SceneLayout(start=2.02, end=4, kind="FIT_BLUR"),
-        ],
-        1280,
-        720,
-    )
-    assert "split=2[" in graph and "concat=n=2:" in graph
+
+
+_TINY_MIX = [
+    SceneLayout(start=0, end=0.02, kind="STACKED", facecam=(0.75, 0.0, 0.25, 0.3)),
+    SceneLayout(start=0.02, end=2, kind="FIT_BLUR"),
+    SceneLayout(start=2, end=2.02, kind="SPLIT", split_x=(0.25, 0.75)),
+    SceneLayout(start=2.02, end=4, kind="FACE_TRACK", track_x=[(2.02, 0.3), (3, 0.7), (4, 0.5)]),
+]
+
+
+def _trim_spans(graph: str) -> list[tuple[float, float]]:
+    return [(float(a), float(b)) for a, b in re.findall(r"trim=start=([\d.]+):end=([\d.]+)", graph)]
+
+
+def test_reframe_graph_merges_tiny_scenes_without_gaps():
+    graph = reframe_graph(_TINY_MIX, 1280, 720)
+    spans = _trim_spans(graph)
+    assert spans == [(0, 2.02), (2.02, 4)]  # tiny lead pulled into next, tiny middle into prev
+    assert sum(b - a for a, b in spans) == pytest.approx(4.0)
+    assert "concat=n=2:" in graph
+
+
+def test_render_merged_tiny_scenes_keeps_duration(src, tmp_path):
+    out = _render(src, reframe_graph(_TINY_MIX, 1280, 720), tmp_path / "merged.mp4")
+    assert probe_size(out) == (1080, 1920)
+    assert probe_duration(out) == pytest.approx(4.0, abs=0.1)
 
 
 def test_track_expression_empty_is_centre():
@@ -178,3 +195,8 @@ def test_render_with_crop(tmp_path):
     out = _render(boxed, graph, tmp_path / "out.mp4")
     assert probe_size(out) == (1080, 1920)
     assert probe_duration(out) == pytest.approx(4.0, abs=0.1)
+
+
+def test_reframe_graph_all_tiny_but_long_enough_becomes_one_scene():
+    tiny = [SceneLayout(start=i * 0.02, end=(i + 1) * 0.02, kind="FIT_BLUR") for i in range(5)]
+    assert _trim_spans(reframe_graph(tiny, 1280, 720)) == [(0, 0.1)]

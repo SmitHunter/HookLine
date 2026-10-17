@@ -154,6 +154,29 @@ def scene_filter(layout: SceneLayout, in_w: int, in_h: int, label_in: str, label
     return _fit_blur(label_in, label_out)
 
 
+def _merge_short(layouts: list[SceneLayout]) -> list[SceneLayout]:
+    """Fold scenes shorter than MIN_SCENE into a neighbour without leaving gaps: a short scene
+    extends the previous scene's end; leading short scenes pull the next scene's start back."""
+    merged: list[SceneLayout] = []
+    lead: float | None = None
+    for lay in layouts:
+        if lay.end - lay.start < MIN_SCENE:
+            if merged:
+                merged[-1] = merged[-1].model_copy(update={"end": lay.end})
+            elif lead is None:
+                lead = lay.start
+            continue
+        if lead is not None:
+            lay = lay.model_copy(update={"start": lead})
+            lead = None
+        merged.append(lay)
+    if not merged and layouts and layouts[-1].end - layouts[0].start >= MIN_SCENE:
+        merged = [layouts[0].model_copy(update={"end": layouts[-1].end})]
+    if not merged:
+        raise ValueError("no layouts")
+    return merged
+
+
 def reframe_graph(
     layouts: list[SceneLayout],
     in_w: int,
@@ -161,10 +184,9 @@ def reframe_graph(
     crop: tuple[int, int, int, int] | None = None,
 ) -> str:
     """Full -filter_complex: [0:v] (crop) -> split -> per-scene trim + scene_filter -> concat [vout].
-    When `crop` is given, in_w/in_h are the cropped size. Scenes shorter than 1/30 s are dropped."""
-    layouts = [lay for lay in layouts if lay.end - lay.start >= MIN_SCENE]
-    if not layouts:
-        raise ValueError("no layouts")
+    When `crop` is given, in_w/in_h are the cropped size. Scenes shorter than 1/30 s are merged
+    into a neighbour so the timeline keeps its full length."""
+    layouts = _merge_short(layouts)
     n = len(layouts)
     pre = f"crop={crop[0]}:{crop[1]}:{crop[2]}:{crop[3]}," if crop else ""
     parts = [f"[0:v]{pre}split={n}" + "".join(f"[s{i}]" for i in range(n))]
