@@ -277,7 +277,7 @@ SELECTION_SCHEMA: dict = _object(
 )
 
 _COLD_OPEN_MAX_S = 6.0
-_COLD_OPEN_MIN_S = 1.5
+_COLD_OPEN_MIN_S = 1.0  # shorter teasers extend back within their sentence, else drop
 _COLD_OPEN_MIN_MATCH = 0.8
 _BEAT_SNAP_S = 3.0
 _REACTION_PEAK_MIN_S = 12.0
@@ -668,7 +668,7 @@ def _teaser(
 
 def _extend_teaser_back(words: list[Word], i: int, k: int, src: _Source) -> int | None:
     """The latest earlier start inside the sentence holding words[i] that, after stripping
-    lead-ins from it, makes the teaser words[start..k] last >= 1.5 s (and <= 6 s); None."""
+    lead-ins from it, makes the teaser words[start..k] last >= _COLD_OPEN_MIN_S (and <= 6 s); None."""
     lo = i
     line_start = max(s.start for s in src.sentences if s.start <= words[i].start + 1e-6)
     while lo > 0 and words[lo - 1].start >= line_start - 1e-6:

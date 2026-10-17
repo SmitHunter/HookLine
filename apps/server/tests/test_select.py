@@ -1339,18 +1339,42 @@ def test_prompt_length_bound_follows_settings(long_transcript, fake_llm, setting
 _SHORT = "We all knew that your husband might die."  # 8 words: 60.0 ... "die." ends 61.95
 
 
-def test_short_teaser_extends_back_within_its_sentence_to_1_5s(fake_llm, settings):
+def test_short_teaser_extends_back_within_its_sentence_to_1s(fake_llm, settings):
     tr = _lines_transcript({15: _SHORT})
     item = _line_item(
         10, 18, _FILLER.format(n=10), _FILLER.format(n=18), cold_open_words="might die."
     )
     (p,) = _one(tr, fake_llm, settings, item)
-    assert p.cold_open == (60.25, 61.95)  # "all knew that your husband might die." = 1.7 s
+    assert p.cold_open == (60.75, 61.95)  # "that your husband might die." = 1.2 s
 
 
-def test_short_teaser_that_cannot_reach_1_5s_is_dropped(fake_llm, settings, caplog):
-    tr = _lines_transcript({15: "Like, your husband might die."})  # only a lead-in before it
-    words = "your husband might die."
+def _teaser_line(timed_words):
+    """_lines_transcript with line 15 replaced by explicitly timed (start, end, text) words."""
+    tr = _lines_transcript({})
+    ws = [Word(start=a, end=b, text=t) for a, b, t in timed_words]
+    text = " ".join(t for _, _, t in timed_words)
+    tr.segments[15] = Segment(start=ws[0].start, end=ws[-1].end, text=text, words=ws)
+    return tr
+
+
+def test_real_1_2s_teaser_after_a_lead_in_is_kept(fake_llm, settings):
+    # the strongest real teaser: "Like, your husband might die." -> "your ... die." is 1.2 s
+    tr = _teaser_line(
+        [(60.0, 60.3, "Like,"), (60.4, 60.6, "your"), (60.65, 60.95, "husband"),
+         (61.0, 61.2, "might"), (61.3, 61.6, "die.")]
+    )  # fmt: skip
+    words = "Like, your husband might die."
     item = _line_item(10, 18, _FILLER.format(n=10), _FILLER.format(n=18), cold_open_words=words)
+    (p,) = _one(tr, fake_llm, settings, item)
+    assert p.cold_open == (60.4, 61.6)
+
+
+def test_0_8s_teaser_without_an_extendable_start_is_dropped(fake_llm, settings, caplog):
+    tr = _teaser_line(
+        [(60.0, 60.3, "Like,"), (60.4, 60.6, "he"), (60.65, 60.9, "might"), (60.95, 61.2, "die.")]
+    )  # "he might die." is 0.8 s; only the lead-in "Like," precedes it
+    item = _line_item(
+        10, 18, _FILLER.format(n=10), _FILLER.format(n=18), cold_open_words="he might die."
+    )
     (p,) = _one(tr, fake_llm, settings, item, caplog)
-    assert p.cold_open is None and "1.5s" in caplog.text
+    assert p.cold_open is None and "under 1.0s" in caplog.text
