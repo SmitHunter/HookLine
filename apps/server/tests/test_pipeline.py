@@ -358,3 +358,39 @@ def test_encoder_is_resolved_once_per_job(fixture_video, fake_llm, settings_tmp,
     s = settings_tmp.model_copy(update={"clips": 2, "vertical": False, "captions": False})
     run_job(str(fixture_video), s, fake_llm, FakeTranscriber(duration=150))
     assert picks[0] == 1 and seen == ["libx264", "libx264"]
+
+
+def _old_format(fixture_video, fake_llm, s, timing: str):
+    fake_llm.queue(make_payload_for(150, 1, 21), make_payload_for(150, 1, 21))
+    t = FakeTranscriber(duration=150)
+    run_job(str(fixture_video), s, fake_llm, t)
+    tpath = s.workspace_dir / job_id_for(str(fixture_video)) / "transcript.json"
+    saved = json.loads(tpath.read_text(encoding="utf-8"))
+    old = saved["transcript"]
+    old["timing"] = timing
+    tpath.write_text(json.dumps(old), encoding="utf-8")
+    return tpath
+
+
+def test_old_format_dtw_transcript_is_migrated(fixture_video, fake_llm, settings_tmp):
+    s = settings_tmp.model_copy(update={"clips": 1, "vertical": False, "captions": False})
+    tpath = _old_format(fixture_video, fake_llm, s, "dtw")
+    b = KeyedTranscriber(150, "ggml-large-v3-turbo.bin", "large.v3.turbo")
+    logs: list[str] = []
+    run_job(str(fixture_video), s, fake_llm, b, logs.append)
+    assert b.calls == 0
+    assert any("transcript: migrated cached DTW transcript" in m for m in logs)
+    saved = json.loads(tpath.read_text(encoding="utf-8"))
+    assert saved["key"] == b.cache_key and saved["transcript"]["timing"] == "dtw"
+    assert not tpath.with_name("transcript.json.tmp").exists()
+
+
+def test_old_format_segment_transcript_with_dtw_backend_retranscribes(
+    fixture_video, fake_llm, settings_tmp
+):
+    s = settings_tmp.model_copy(update={"clips": 1, "vertical": False, "captions": False})
+    _old_format(fixture_video, fake_llm, s, "segment")
+    b = KeyedTranscriber(150, "ggml-large-v3-turbo.bin", "large.v3.turbo")
+    logs: list[str] = []
+    run_job(str(fixture_video), s, fake_llm, b, logs.append)
+    assert b.calls == 1 and any("old format" in m for m in logs)

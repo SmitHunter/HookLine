@@ -16,6 +16,7 @@ from hookline.pipeline.render import render_clip
 from hookline.pipeline.select import select_clips
 from hookline.pipeline.signals import Signals, heat_markers
 from hookline.transcribe import Transcriber
+from hookline.transcribe.base import words_to_transcript
 from hookline.vision.faces import FaceDetector
 
 STAGES = 6
@@ -43,6 +44,21 @@ def _picks_key(settings: Settings, tkey: dict) -> dict:
     }
 
 
+def _migrate_old_transcript(
+    tpath: Path, old: Transcript, key: dict, log: Callable[[str], None]
+) -> Transcript | None:
+    """Re-key an old-format DTW transcript for a DTW whisper.cpp backend (no re-transcribe)."""
+    if old.timing != "dtw" or key.get("backend") != "whisper-cpp" or not key.get("dtw"):
+        return None
+    cleaned = words_to_transcript(old.words(), old.language, old.duration, timing="dtw")
+    atomic_write_text(
+        tpath,
+        json.dumps({"key": key, "transcript": cleaned.model_dump(mode="json")}),
+    )
+    log("transcript: migrated cached DTW transcript")
+    return cleaned
+
+
 def _load_transcript(tpath: Path, key: dict, log: Callable[[str], None]) -> Transcript | None:
     """Cached transcript when transcript.json was made with `key`; otherwise None."""
     if not tpath.exists():
@@ -50,6 +66,9 @@ def _load_transcript(tpath: Path, key: dict, log: Callable[[str], None]) -> Tran
     try:
         data = json.loads(tpath.read_text(encoding="utf-8"))
         if isinstance(data, dict) and "segments" in data and "key" not in data:
+            migrated = _migrate_old_transcript(tpath, Transcript.model_validate(data), key, log)
+            if migrated is not None:
+                return migrated
             log("[3/6] transcribe: transcript.json is in the old format; re-transcribing")
             return None
         cached_key = data["key"]

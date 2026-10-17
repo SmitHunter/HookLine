@@ -235,3 +235,64 @@ def test_backend_cache_keys(tmp_path):
     }
     fw = FasterWhisperBackend("large-v3-turbo", "cpu", "int8")
     assert fw.cache_key == {"backend": "faster-whisper", "model": "large-v3-turbo", "dtw": None}
+
+
+def _w(text: str, start: float, end: float | None = None):
+    from hookline.models import Word
+
+    return Word(start=start, end=end if end is not None else start + 0.3, text=text)
+
+
+def test_dedupe_removes_repeated_run():
+    from hookline.transcribe.clean import dedupe_segments
+
+    run = ["We", "were", "a", "little", "older"]
+    words = [_w(t, 1817.4 + i * 0.3) for i, t in enumerate(run)]
+    words += [_w(t, 1817.4 + i * 0.3) for i, t in enumerate(run)]
+    words += [_w("then", 1820.0)]
+    out = dedupe_segments(words)
+    assert [w.text for w in out] == [*run, "then"]
+
+
+def test_dedupe_handles_triple_and_punctuation():
+    from hookline.transcribe.clean import dedupe_segments
+
+    words = []
+    for _ in range(3):
+        words += [_w("It's", 10.0), _w("epic.", 10.3)]
+    assert [w.text for w in dedupe_segments(words)] == ["It's", "epic."]
+
+
+def test_dedupe_keeps_genuine_repeat_far_apart():
+    from hookline.transcribe.clean import dedupe_segments
+
+    words = [_w("no", 1.0), _w("way", 1.3), _w("no", 5.0), _w("way", 5.3)]
+    assert len(dedupe_segments(words)) == 4
+
+
+def test_spread_collapsed_words():
+    from hookline.transcribe.clean import spread_collapsed
+
+    words = [_w("a", 1817.40, 1817.45), _w("b", 1817.40, 1817.45), _w("c", 1817.40, 1817.45)]
+    words.append(_w("d", 1818.0, 1818.3))
+    out = spread_collapsed(words)
+    starts = [w.start for w in out]
+    assert starts == pytest.approx([1817.40, 1817.60, 1817.80, 1818.0])
+    assert out[0].end == pytest.approx(1817.60) and out[2].end == pytest.approx(1817.88)
+    assert all(w.end - w.start >= 0.08 - 1e-9 for w in out)
+
+
+def test_spread_leaves_run_when_no_room():
+    from hookline.transcribe.clean import spread_collapsed
+
+    words = [_w("a", 5.0, 5.05), _w("b", 5.0, 5.05), _w("c", 5.1, 5.3)]
+    out = spread_collapsed(words)
+    assert [w.start for w in out] == [5.0, 5.0, 5.1]
+
+
+def test_words_to_transcript_applies_cleaning():
+    from hookline.transcribe.base import words_to_transcript
+
+    words = [_w("hi", 1.0, 1.05), _w("there.", 1.0, 1.05), _w("ok", 2.0, 2.3)]
+    t = words_to_transcript(words, "en", 5.0, timing="dtw")
+    assert [w.start for w in t.words()] == pytest.approx([1.0, 1.5, 2.0])
