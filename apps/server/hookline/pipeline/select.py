@@ -277,6 +277,7 @@ SELECTION_SCHEMA: dict = _object(
 )
 
 _COLD_OPEN_MAX_S = 6.0
+_COLD_OPEN_MIN_S = 1.5
 _COLD_OPEN_MIN_MATCH = 0.8
 _BEAT_SNAP_S = 3.0
 _REACTION_PEAK_MIN_S = 12.0
@@ -665,6 +666,24 @@ def _teaser(
     return words, i, j
 
 
+def _extend_teaser_back(words: list[Word], i: int, k: int, src: _Source) -> int | None:
+    """The latest earlier start inside the sentence holding words[i] that, after stripping
+    lead-ins from it, makes the teaser words[start..k] last >= 1.5 s (and <= 6 s); None."""
+    lo = i
+    line_start = max(s.start for s in src.sentences if s.start <= words[i].start + 1e-6)
+    while lo > 0 and words[lo - 1].start >= line_start - 1e-6:
+        lo -= 1
+    for s in range(i - 1, lo - 1, -1):
+        if words[k].end - words[s].start > _COLD_OPEN_MAX_S + 1e-6:
+            return None
+        start = s
+        while start < i and (n := _phrase_at(words, start, _LEAD_INS)):
+            start += n
+        if start < i and words[k].end - words[start].start >= _COLD_OPEN_MIN_S - 1e-6:
+            return start
+    return None
+
+
 def _cold_open(raw: _RawClip, first: int, last: int, src: _Source) -> tuple[float, float] | None:
     """Where the verbatim `cold_open_words` are spoken inside the clip, without leading fillers
     and lead-ins ("I think", "the thing is"), ending on the first sentence end at or after the
@@ -697,6 +716,16 @@ def _cold_open(raw: _RawClip, first: int, last: int, src: _Source) -> tuple[floa
     else:
         _drop_cold_open(raw, f"{text!r} does not finish a sentence within {_COLD_OPEN_MAX_S:.0f}s")
         return None
+    if words[k].end - t0 < _COLD_OPEN_MIN_S:
+        back = _extend_teaser_back(words, i, k, src)
+        if back is None or words[back].start < sents[first].end - 1e-6:
+            _drop_cold_open(
+                raw,
+                f"{text!r} is under {_COLD_OPEN_MIN_S}s and its sentence has no earlier words "
+                "(after lead-ins) to reach it",
+            )
+            return None
+        t0 = words[back].start
     return t0, words[k].end
 
 

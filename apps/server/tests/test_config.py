@@ -68,3 +68,7 @@ def test_backend_label():
 
     assert "whisper.cpp" in _backend_label(WhisperCppBackend(Path("a"), Path("b")))
     assert _backend_label(FasterWhisperBackend("tiny", "cpu", "int8")) == "faster-whisper (cpu)"
+
+
+def test_max_clip_default_is_50s_because_claude_treats_the_max_as_a_target():
+    assert Settings().max_clip_s == 50 and Settings().min_clip_s == 20

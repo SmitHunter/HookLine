@@ -156,6 +156,7 @@ def test_valid_cold_open_is_kept(long_transcript, fake_llm, settings):
 
 
 def test_length_out_of_range_dropped(long_transcript, fake_llm, settings, caplog):
+    settings = settings.model_copy(update={"max_clip_s": 60})  # arithmetic assumes 60 s
     too_short, too_long, ok = raw(30, 40), raw(100, 190), raw(300, 330)
     fake_llm.queue({"clips": [too_short, too_long, ok]}, EMPTY)
     with caplog.at_level(logging.INFO, logger="hookline.pipeline.select"):
@@ -423,6 +424,7 @@ def _long_sentence_transcript():
 
 
 def test_cold_open_that_cannot_end_a_sentence_within_6s_is_dropped(fake_llm, settings, caplog):
+    settings = settings.model_copy(update={"max_clip_s": 60})  # arithmetic assumes 60 s
     tr = _long_sentence_transcript()  # L10: 30.0-39.5, its only terminal word is "end."
     item = raw(0, 60, cold_open_words="w0 w1 w2 w3", first_words="line0 says something here.")
     item["last_words"] = "line15 says something here."
@@ -437,6 +439,7 @@ def test_cold_open_that_cannot_end_a_sentence_within_6s_is_dropped(fake_llm, set
 def test_cold_open_pushing_over_max_length_is_dropped_pick_kept(
     long_transcript, fake_llm, settings
 ):
+    settings = settings.model_copy(update={"max_clip_s": 60})  # arithmetic assumes 60 s
     # main clip 30.0-104.3 = 74.3s: the teaser on L11 leaves no later start, so it stays
     # untrimmed (<= 75 s); with the 2.3 s cold open it would be 76.6 s
     fake_llm.queue({"clips": [raw(30, 103, cold_open_words=_L(11))]}, EMPTY)
@@ -501,6 +504,7 @@ def test_dropped_cold_open_not_in_transcript_logs_reason(
 
 
 def test_dropped_cold_open_over_max_length_logs_reason(long_transcript, fake_llm, settings, caplog):
+    settings = settings.model_copy(update={"max_clip_s": 60})  # arithmetic assumes 60 s
     msgs = _cold_open_warnings_keep(
         caplog, fake_llm, long_transcript, settings, raw(30, 103, cold_open_words=_L(11))
     )
@@ -1178,7 +1182,7 @@ def test_build_prompt_states_the_length_bounds(long_transcript, fake_llm, settin
     )
     fake_llm.queue(make_payload(8))
     select_clips(long_transcript, fake_llm, settings)
-    assert "Never exceed 60 s" in fake_llm.calls[0]["prompt"]
+    assert "Never exceed 50 s" in fake_llm.calls[0]["prompt"]  # the 50 s default
 
 
 def _trim_item(overrides=None, **kw):
@@ -1187,6 +1191,7 @@ def _trim_item(overrides=None, **kw):
 
 
 def test_86s_candidate_is_trimmed_from_the_front(fake_llm, settings, caplog):
+    settings = settings.model_copy(update={"max_clip_s": 60})  # arithmetic assumes 60 s
     tr, item = _trim_item()  # L10-L31: 40.0-125.2 = 85.2 s
     (p,) = _one(tr, fake_llm, settings, item, caplog)
     assert (p.start, p.end) == (68.0, _end_of(tr, 31))  # L17: earliest start within 60 s
@@ -1200,13 +1205,16 @@ def test_front_trim_skips_weak_openers_and_backchannels(fake_llm, settings):
 
 
 def test_front_trim_never_cuts_into_the_cold_open(fake_llm, settings):
-    tr, item = _trim_item(cold_open_words=_FILLER.format(n=16))
+    settings = settings.model_copy(update={"max_clip_s": 60})  # arithmetic assumes 60 s
+    teaser = "Rent doubled in one year for everyone."  # L16, 1.7 s
+    tr, item = _trim_item({16: teaser}, cold_open_words=teaser)
     (p,) = _one(tr, fake_llm, settings, item)
     # starts must end before the teaser (L16 at 64.0): none fits 60 s; L13 fits 1.25 x 60
     assert p.start == 52.0 and p.cold_open == (64.0, _end_of(tr, 16))
 
 
 def test_untrimmable_long_candidate_is_dropped_with_a_log(fake_llm, settings, caplog):
+    settings = settings.model_copy(update={"max_clip_s": 60})  # arithmetic assumes 60 s
     tr = _lines_transcript({})
     item = _line_item(10, 39, _FILLER.format(n=10), _FILLER.format(n=39))
     item["cold_open_words"] = _FILLER.format(n=12)  # no start may pass L11: 113 s minimum
@@ -1262,6 +1270,7 @@ def _timed_transcript(lines: list[tuple[float, str]], duration: float) -> Transc
 
 
 def test_opener_guard_moves_at_most_12s(fake_llm, settings, caplog):
+    settings = settings.model_copy(update={"max_clip_s": 60})  # arithmetic assumes 60 s
     lines = [(4.0 * i, _FILLER.format(n=i)) for i in range(10)]
     lines += [(40.0, "So that was it."), (53.0, "Rent doubled in a year.")]
     lines += [(57.0 + 4.0 * i, _FILLER.format(n=i + 12)) for i in range(12)]
@@ -1272,7 +1281,7 @@ def test_opener_guard_moves_at_most_12s(fake_llm, settings, caplog):
 
 
 def test_cold_open_strips_quoted_conversation_lead_ins(fake_llm, settings):
-    tr = _lines_transcript({15: "I was like, you think it is worth it?"})
+    tr = _lines_transcript({15: "I was like, you really think it is worth it for you?"})
     item = _line_item(
         10, 18, _FILLER.format(n=10), _FILLER.format(n=18), cold_open_words=tr.segments[15].text
     )
@@ -1310,8 +1319,38 @@ def test_straight_single_quoted_title_spans(fake_llm, settings, title, expected)
 def test_opener_guard_never_moves_into_the_cold_open(fake_llm, settings, caplog):
     # real case: "And, of course, I'm very snarky." / "I was like, so, ...?" / teaser on L12
     bad = {10: "And, of course, I'm very snarky.", 11: "I was like, so, is it worth it?"}
-    tr, item = _guard_item({**bad, 12: "Like, your husband might die."}, bad[10])
-    item["cold_open_words"] = "Like, your husband might die."
+    teaser = "Like, your husband might die over there tomorrow."  # 1.7 s without "Like,"
+    tr, item = _guard_item({**bad, 12: teaser}, bad[10])
+    item["cold_open_words"] = teaser
     (p,) = _one(tr, fake_llm, settings, item, caplog)
     assert p.start == 40.0 and p.cold_open == (48.25, _end_of(tr, 12))
     assert "keeping it" in caplog.text
+
+
+# --- fix round 2: 50 s default maximum, 1.5 s minimum teaser ----------------------------------
+
+
+def test_prompt_length_bound_follows_settings(long_transcript, fake_llm, settings):
+    fake_llm.queue(make_payload(8))
+    select_clips(long_transcript, fake_llm, settings)
+    assert "Each clip lasts 20–50 seconds. Never exceed 50 s" in fake_llm.calls[0]["prompt"]
+
+
+_SHORT = "We all knew that your husband might die."  # 8 words: 60.0 ... "die." ends 61.95
+
+
+def test_short_teaser_extends_back_within_its_sentence_to_1_5s(fake_llm, settings):
+    tr = _lines_transcript({15: _SHORT})
+    item = _line_item(
+        10, 18, _FILLER.format(n=10), _FILLER.format(n=18), cold_open_words="might die."
+    )
+    (p,) = _one(tr, fake_llm, settings, item)
+    assert p.cold_open == (60.25, 61.95)  # "all knew that your husband might die." = 1.7 s
+
+
+def test_short_teaser_that_cannot_reach_1_5s_is_dropped(fake_llm, settings, caplog):
+    tr = _lines_transcript({15: "Like, your husband might die."})  # only a lead-in before it
+    words = "your husband might die."
+    item = _line_item(10, 18, _FILLER.format(n=10), _FILLER.format(n=18), cold_open_words=words)
+    (p,) = _one(tr, fake_llm, settings, item, caplog)
+    assert p.cold_open is None and "1.5s" in caplog.text
