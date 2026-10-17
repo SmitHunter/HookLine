@@ -9,19 +9,26 @@ import numpy as np
 from hookline.media.subtitles import fonts_dir, subtitles_filter
 
 OUT_W, OUT_H = 1080, 1920
+GREY = "0x808080"  # canvas on which black outlines, shadows and hook boxes are visible
 TextColor = Literal["white", "yellow", "any"]
+Box = tuple[int, int, int, int]
 
 
-def render_ass_frame(ass_path: Path, t: float) -> np.ndarray:
-    """Burn `ass_path` over a black 1080x1920 frame and return the frame at `t` s (HxWx3 RGB)."""
+def render_ass_frame(ass_path: Path, t: float, bg: str = "black") -> np.ndarray:
+    """Burn `ass_path` over a plain 1080x1920 `bg` frame (an ffmpeg colour, e.g. "black" or
+    GREY) and return the frame at `t` s (HxWx3 RGB). Raises RuntimeError with ffmpeg's stderr."""
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
-        "-f", "lavfi", "-i", f"color=black:s={OUT_W}x{OUT_H}:r=25:d={t + 1:.3f}",
+        "-f", "lavfi", "-i", f"color={bg}:s={OUT_W}x{OUT_H}:r=25:d={t + 1:.3f}",
         "-vf", subtitles_filter(Path(ass_path), fonts_dir()),
         "-ss", f"{t:.3f}", "-frames:v", "1",
         "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
     ]  # fmt: skip
-    res = subprocess.run(cmd, check=True, capture_output=True)
+    try:
+        res = subprocess.run(cmd, check=True, capture_output=True)
+    except subprocess.CalledProcessError as e:
+        stderr = e.stderr.decode("utf-8", "replace")[-2000:]
+        raise RuntimeError(f"rendering {ass_path} failed: {stderr}") from e
     return np.frombuffer(res.stdout, np.uint8).reshape(OUT_H, OUT_W, 3)
 
 
@@ -37,18 +44,28 @@ def text_mask(frame: np.ndarray, color: TextColor = "any") -> np.ndarray:
     return rgb.max(axis=2) > 128
 
 
-def text_bbox(
-    frame: np.ndarray, color: TextColor = "any", region: tuple[int, int, int, int] | None = None
-) -> tuple[int, int, int, int] | None:
-    """(x0, y0, x1, y1) inclusive bounding box of `color` text pixels, or None. `region`
-    (x0, y0, x1, y1) limits the search to part of the frame."""
-    mask = text_mask(frame, color)
+def _bbox(mask: np.ndarray, region: Box | None) -> Box | None:
     if region is not None:
         x0, y0, x1, y1 = region
         clip = np.zeros_like(mask)
         clip[y0 : y1 + 1, x0 : x1 + 1] = True
-        mask &= clip
+        mask = mask & clip
     ys, xs = np.nonzero(mask)
     if len(ys) == 0:
         return None
     return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+
+
+def text_bbox(frame: np.ndarray, color: TextColor = "any", region: Box | None = None) -> Box | None:
+    """(x0, y0, x1, y1) inclusive bounding box of `color` text pixels, or None. `region`
+    (x0, y0, x1, y1) limits the search to part of the frame."""
+    return _bbox(text_mask(frame, color), region)
+
+
+def box_bbox(
+    frame: np.ndarray, bg: tuple[int, int, int] = (128, 128, 128), region: Box | None = None
+) -> Box | None:
+    """Bounding box of everything visibly drawn over a plain `bg` canvas: text, outline,
+    shadow and hook background boxes."""
+    diff = np.abs(frame.astype(np.int16) - np.array(bg, np.int16)).max(axis=2)
+    return _bbox(diff > 24, region)

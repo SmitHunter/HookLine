@@ -45,7 +45,8 @@ def test_ass_header_and_styles():
     for s in ("PlayResX: 1080", "PlayResY: 1920", "WrapStyle: 2", "ScaledBorderAndShadow: yes"):
         assert s in ass
     assert "Style: Cap,Anton,136," in ass and "Style: Hook,Anton,136," in ass
-    assert "{\\pos(474,700)}" in ass and "{\\pos(474,360)\\fad" in ass  # 640 clamped to 700
+    assert "{\\pos(474,700)}" in ass  # 640 clamped to 700
+    assert "{\\pos(474,378)\\fad" in ass  # 360 clamped: one-line box top at 290
     hook = next(e for e in _events(ass) if ",Hook," in e)
     assert hook.startswith("Dialogue: 1,0:00:00.00,0:00:03.00,")
 
@@ -152,12 +153,12 @@ def test_hook_and_caption_placement_per_layout():
     assert (hook_y_for([]), caption_y_for([])) == (360, 1180)
     assert (hook_y_for([_lay("FIT_BLUR")]), caption_y_for([_lay("FIT_BLUR")])) == (360, 1180)
     stacked = [_lay("STACKED"), _lay("FIT_BLUR")]
-    assert (hook_y_for(stacked), caption_y_for(stacked)) == (900, 700)  # below the seam
+    assert (hook_y_for(stacked), caption_y_for(stacked)) == (940, 700)  # below the seam
     assert hook_y_for([_lay("FACE_TRACK")]) == 360  # no face box: default
 
 
 def test_face_track_hook_moves_off_the_face():
-    low = [_lay("FACE_TRACK", (0.3, 0.25))]  # face 576-1056 px: clear of hook and captions
+    low = [_lay("FACE_TRACK", (0.32, 0.23))]  # face 614-1056 px: clear of hook and captions
     assert (hook_y_for(low), caption_y_for(low)) == (360, 1180)
     high = [_lay("FACE_TRACK", (0.1, 0.3))]  # face top 192 px: under the hook band
     assert (hook_y_for(high), caption_y_for(high)) == (920, 1180)
@@ -165,16 +166,16 @@ def test_face_track_hook_moves_off_the_face():
 
 def test_face_track_captions_move_off_a_face_covering_them():
     small = [_lay("FACE_TRACK", (0.5, 0.12))]  # face 960-1190 px covers the 1180 line
-    assert caption_y_for(small) == 840  # no room below (max 1180): above the face
+    assert caption_y_for(small) == 840  # 1180 is the band bottom: move above the face
     clear = [_lay("FACE_TRACK", (0.25, 0.3))]  # face 480-1056 px: clear of the 1180 line
     assert caption_y_for(clear) == 1180
-    big = [_lay("FACE_TRACK", (0.3, 0.5))]  # face 576-1536 px: no room either side
+    big = [_lay("FACE_TRACK", (0.32, 0.5))]  # face 614-1574 px: no room above either
     assert caption_y_for(big) == 1180 and hook_y_for(big) == 360
 
 
 def test_split_hook_uses_top_panel_face():
     assert hook_y_for([_lay("SPLIT", (0.1, 0.5))]) == 920  # 96 px into the 960 px panel
-    assert hook_y_for([_lay("SPLIT", (0.55, 0.3))]) == 360  # 528 px: below the band
+    assert hook_y_for([_lay("SPLIT", (0.65, 0.3))]) == 360  # 624 px: below the band
 
 
 def test_build_ass_hook_position():
@@ -188,12 +189,35 @@ Q4_X = (60, 888)
 Q4_Y = (290, 1250)
 
 
-def _render(tmp_path, ass_text, t):
+def _render(tmp_path, ass_text, t, bg="black"):
     from hookline.quality import render_ass_frame
 
     p = tmp_path / "m.ass"
     p.write_text(ass_text, encoding="utf-8")
-    return render_ass_frame(p, t)
+    return render_ass_frame(p, t, bg)
+
+
+def _grey(tmp_path, ass_text, t=0.5):
+    """Everything visible (text, outline, shadow, hook box) over a mid-grey canvas."""
+    from hookline.quality import GREY, box_bbox
+
+    return box_bbox(_render(tmp_path, ass_text, t, GREY))
+
+
+def _first_line_cap_h(frame):
+    """Height of the first band of white text rows (the first hook line's caps)."""
+    from hookline.quality import text_mask
+
+    rows = text_mask(frame, "white").any(axis=1).nonzero()[0]
+    assert len(rows)
+    end = rows[0]
+    while end + 1 in set(rows):
+        end += 1
+    return int(end - rows[0] + 1)
+
+
+def _hook(ass):
+    return next(e for e in _events(ass) if ",Hook," in e)
 
 
 def _inside_q4(box, pad=0):
@@ -284,7 +308,7 @@ def test_hook_at_most_two_lines_of_18_chars():
         assert len(lines) <= 2 and all(len(x) <= 18 for x in lines), lines
     too_long = "this is a very long hook title that keeps on going"  # > 2 x 18 chars
     hook = next(e for e in _events(build_ass([], too_long, 5)))
-    assert hook.count("\\N") == 1 and "\\fscx" in hook  # condensed, never a third line
+    assert hook.count("\\N") == 1  # two balanced lines, never a third
 
 
 def test_hook_style_box_and_fade():
@@ -308,22 +332,82 @@ def test_caption_y_clamped_to_safe_band():
 
 
 def test_rendered_boxes_inside_q4_at_band_extremes(tmp_path):
-    from hookline.quality import text_bbox
-
     words = [w(0, 1, "INCREDIBLE"), w(1, 2, "TEST")]
-    for cy, hy in ((1180, 360), (700, 360), (1180, 920)):
+    for cy, hy in ((1180, 360), (700, 360), (1180, 920), (1180, 2000), (700, 0)):
         ass = build_ass(words, "Parks. Open space. All under siege.", 3, caption_y=cy, hook_y=hy)
-        box = text_bbox(_render(tmp_path, ass, 0.5), "any")
-        assert box is not None and _inside_q4(box, pad=10), (cy, hy, box)  # 10 px outline
+        box = _grey(tmp_path, ass)  # includes the hook's background box and caption outline
+        assert box is not None and _inside_q4(box), (cy, hy, box)
 
 
-def test_wide_caption_group_shrinks_to_828(tmp_path):
+def test_two_line_hook_box_top_stays_in_q4():
+    hook = _hook(build_ass([], "Parks. Open space. All under siege.", 4))
+    assert "\\pos(474,446)" in hook  # 290 + 2 lines x 68 + 20 px box pad
+
+
+def _tag(event, name):
+    import re
+
+    m = re.search(rf"\\{name}(\d+)", event)
+    return int(m.group(1)) if m else None
+
+
+def test_seven_long_words_hook_steps_size_not_squash(tmp_path):
+    ass = build_ass([], "Women remember moments when summer mornings mattered", 4)
+    hook = _hook(ass)
+    assert (_tag(hook, "fscx") or 100) >= 80
+    assert _tag(hook, "fs") is not None  # 80% alone was not enough: the size stepped down
+    assert "…" not in hook  # 7 words: never truncated
+    assert _first_line_cap_h(_render(tmp_path, ass, 0.5)) >= 60
+    box = _grey(tmp_path, ass)
+    assert box is not None and _inside_q4(box), box
+
+
+def test_ten_word_hook_too_wide_is_cut_to_seven_words(tmp_path):
+    text = "everybody remembers the moment the internet stopped being free forever"
+    ass = build_ass([], text, 4)
+    hook = _hook(ass)
+    body = hook.split("}")[-1].replace("\\N", " ")
+    assert body == "EVERYBODY REMEMBERS THE MOMENT THE INTERNET STOPPED…"
+    assert (_tag(hook, "fscx") or 100) >= 80
+    box = _grey(tmp_path, ass)
+    assert box is not None and _inside_q4(box), box
+
+
+def test_worst_case_wide_caption_group_inside_q4(tmp_path):
+    ass = build_ass([w(0, 1, "WWWWWW"), w(1, 2, "MMMMM"), w(2, 3, "WWWWW")], "", 4)
+    cap = next(e for e in _events(ass) if ",Cap," in e)
+    assert "WWWWWW MMMMM WWWWW" in cap.replace("{\\c&H00FFFF&}", "").replace("{\\c&HFFFFFF&}", "")
+    assert (_tag(cap, "fscx") or 100) >= 80
+    box = _grey(tmp_path, ass)
+    assert box is not None and _inside_q4(box), box
+
+
+def test_over_long_caption_word_keeps_min_size(tmp_path):
     from hookline.quality import text_bbox
 
     ass = build_ass([w(0, 1, "SUPERCALIFRAGILISTICEXPIALIDOCIOUS")], "", 2)
-    assert "\\fscx" in ass and "\\fscy" in ass
-    box = text_bbox(_render(tmp_path, ass, 0.5), "any")
-    assert box is not None and box[2] - box[0] + 1 + 20 <= 828 and _inside_q4(box, pad=10)
+    cap = next(e for e in _events(ass) if ",Cap," in e)
+    assert _tag(cap, "fscx") >= 80 and _tag(cap, "fs") is not None
+    box = text_bbox(_render(tmp_path, ass, 0.5), "yellow")
+    assert box is not None and box[3] - box[1] + 1 >= 55  # Q2 holds even when too wide
+
+
+def test_stacked_hook_and_captions_do_not_overlap(tmp_path):
+    stacked = [_lay("STACKED"), _lay("FIT_BLUR")]
+    cy, hy = caption_y_for(stacked), hook_y_for(stacked)
+    hook_text = "Parks. Open space. All under siege."
+    cap = _grey(tmp_path, build_ass([w(0, 2, "INCREDIBLE"), w(2, 3, "TEST")], "", 3, cy, hy))
+    hook = _grey(tmp_path, build_ass([], hook_text, 3, cy, hy))
+    assert cap is not None and hook is not None
+    assert cap[3] < hook[1] or hook[3] < cap[1], (cap, hook)
+    assert _inside_q4(cap) and _inside_q4(hook)
+
+
+def test_render_failure_reports_ffmpeg_stderr(tmp_path):
+    from hookline.quality import render_ass_frame
+
+    with pytest.raises(RuntimeError, match=r"m\.ass failed: \S"):  # ffmpeg's stderr included
+        render_ass_frame(tmp_path / "missing" / "m.ass", 0.5)
 
 
 def test_trailing_backslash_does_not_break_highlight_reset(tmp_path):

@@ -10,8 +10,10 @@ HOOK_S = 3.0
 HOOK_FADE_MS = 250
 HOOK_LINE_CHARS = 18
 HOOK_MAX_LINES = 2
+HOOK_MAX_WORDS = 7  # renderer safety net only; selection owns Q5's word limit
+ELLIPSIS = "…"
 YELLOW = "{\\c&H00FFFF&}"
-WHITE = "{\\c&HFFFFFF&}"  # back to the style colour; `{\r}` would also drop \fscx/\fscy
+WHITE = "{\\c&HFFFFFF&}"  # back to the style colour; `{\r}` would also drop \fs/\fscx
 SENTENCE_END = (".", "!", "?", "…", '."', '!"', '?"', '…"', ".”", "!”", "?”", "…”")
 HOLD_GAP_S = 1.0  # a group stays up until the next one if the silence is at most this
 TAIL_S = 0.3  # otherwise it ends this long after its last word
@@ -22,31 +24,47 @@ WORD_JOINER = "⁠"  # invisible; stops a literal "\" escaping the next characte
 # only 1760 / 3550 = 0.496 x Fontsize (Fontsize 96 rendered 48 px caps). 136 -> 67-69 px.
 FONT_SIZE = 136
 _EM = 2876 + 674
-CAP_TOP = (2876 - 1760) / _EM * FONT_SIZE  # line-box top to cap top (px)
-DESCENT = 674 / _EM * FONT_SIZE  # baseline to line-box bottom (px)
-# Rendered width of uppercase A-Z at Fontsize 100 is 708 px: 0.272 x Fontsize per character.
-CHAR_W = 0.272 * FONT_SIZE
+_CAP_FRAC = 1760 / _EM
+HOOK_MIN_FS = math.ceil(60 / _CAP_FRAC)  # 122: hook caps stay >= 60 px (Q5)
+CAP_MIN_FS = math.ceil(55 / _CAP_FRAC)  # 111: caption caps stay >= 55 px (Q2)
+MIN_SCALE_X = 80  # never condense horizontally below this; step the size down instead
+# Anton advance widths (font units, hmtx) for the characters captions use; px = adv / _EM * fs.
+# Checked on a render: 10 x "W" at Fontsize 100 is 408 px (1458 / 3550 * 100 = 41.1 each).
+_ADV = {
+    **dict(zip("ABCDEFGHIJKLM", (994, 980, 971, 1010, 843, 817, 993, 1022, 464, 955, 967, 814, 1528), strict=True)),
+    **dict(zip("NOPQRSTUVWXYZ", (1020, 996, 967, 1011, 976, 945, 810, 970, 961, 1458, 991, 914, 840), strict=True)),
+    **dict.fromkeys("0234567890", 1012), "1": 677,
+    " ": 480, ".": 468, ",": 484, "!": 469, "?": 1008, "'": 438, '"': 878, "-": 637,
+    ":": 495, ";": 502, "&": 1065, "%": 2164, "$": 946, "(": 596, ")": 596, "/": 830,
+    ELLIPSIS: 1450, "‘": 481, "’": 475, "“": 950, "”": 948,
+}  # fmt: skip
+_ADV_DEFAULT = 1100  # anything else (fallback-font glyphs): a little wider than average
 CAP_OUTLINE = 10
 CAP_SHADOW = 4
+CAP_SIDE = CAP_OUTLINE + CAP_SHADOW  # visible extra each side of the glyphs (shadow is right)
 HOOK_PAD = 20  # BorderStyle 3 box padding
+HOOK_SIDE = HOOK_PAD + 2  # the box measured ~2 px wider than advance + pad
 
 OUT_H = 1920
 SPLIT_PANEL_H = OUT_H // 2
-# Q4 safe zone for text boxes: x in [60, 888], y in [290, 1250].
+# Q4 safe zone for everything visible (text, outline, hook box): x in [60, 888], y in [290, 1250].
 TEXT_X = 474  # centre of [60, 888]
 MAX_TEXT_W = 828
-SAFE_TOP = 300  # 290 + margin
-SAFE_BOTTOM = 1240  # 1250 - margin
+SAFE_TOP = 290
+SAFE_BOTTOM = 1250
 CAPTION_MIN_Y = 700
 CAPTION_MAX_Y = 1180
 CAPTION_Y = CAPTION_MAX_Y
-CAPTION_HALF_H = 60  # half the caption line's height
-CAPTION_FACE_GAP = 120  # caption centre clear of a face that would cover the caption line
+# Visible caption extent around its \pos y at Fontsize 136, outline and shadow included
+# (measured over grey: y-36 .. y+56; the glyphs sit low in Anton's tall line box).
+CAPTION_ABOVE = 36
+CAPTION_BELOW = 56
+CAPTION_FACE_GAP = 120  # caption centre this far above a face that covers the caption line
 STACKED_CAPTION_Y = 700  # just below the cam/game seam (640), inside the safe band
-HOOK_Y = 360
-HOOK_BAND_BOTTOM = 500  # two hook lines around y=360 reach about this far down
+HOOK_Y = 360  # requested centre; clamped so the box stays in Q4 (1 line: 378, 2 lines: 446)
+HOOK_BAND_BOTTOM = 600  # a two-line hook box at the top reaches about this far down
 HOOK_ABOVE_CAPTION = 260
-STACKED_HOOK_Y = 900  # below the seam captions, over the top of the game
+STACKED_HOOK_Y = 940  # a two-line hook box clears the 700 captions (visible to 756)
 
 HEADER = f"""[Script Info]
 ScriptType: v4.00+
@@ -127,22 +145,30 @@ def _dialogue(layer: int, start: float, end: float, style: str, text: str) -> st
     return f"Dialogue: {layer},{_ts(cs_start / 100)},{_ts(cs_end / 100)},{style},,0,0,0,,{text}"
 
 
-def _text_w(text: str, pad: float) -> float:
-    """Estimated rendered width (px) of an uppercase Anton line, plus `pad` each side."""
-    return len(text) * CHAR_W + 2 * pad
+def _line_w(text: str, fs: int) -> float:
+    """Estimated rendered glyph width (px) of an uppercase Anton line at Fontsize `fs`."""
+    return sum(_ADV.get(c, _ADV_DEFAULT) for c in text) / _EM * fs
 
 
-def _fit_scale(text: str, pad: float) -> int:
-    """Percent scale (<= 100) that keeps the line within MAX_TEXT_W."""
-    if _text_w(text, pad) <= MAX_TEXT_W:
-        return 100
-    return math.floor(100 * (MAX_TEXT_W - 2 * pad) / (len(text) * CHAR_W))
+def _fit(lines: list[str], side: int, min_fs: int) -> tuple[int, int] | None:
+    """Largest (Fontsize, \\fscx percent) with fscx >= MIN_SCALE_X and fs >= min_fs that keeps
+    every line plus `side` px each side within MAX_TEXT_W; None if none does."""
+    avail = MAX_TEXT_W - 2 * side
+    for fs in range(FONT_SIZE, min_fs - 1, -1):
+        w = max(_line_w(line, fs) for line in lines)
+        scale = 100 if w <= avail else math.floor(100 * avail / w)
+        if scale >= MIN_SCALE_X:
+            return fs, scale
+    return None
 
 
-def _hook_lines(text: str) -> list[str]:
+def _size_tags(fs: int, scale: int) -> str:
+    return (f"\\fs{fs}" if fs != FONT_SIZE else "") + (f"\\fscx{scale}" if scale < 100 else "")
+
+
+def _hook_lines(words: list[str]) -> list[str]:
     """Greedy wrap to lines of at most HOOK_LINE_CHARS; if that needs more than
-    HOOK_MAX_LINES, split the words into two balanced lines instead (condensed later)."""
-    words = _clean(text).upper().split()
+    HOOK_MAX_LINES, split the words into two balanced lines instead (sized by _fit)."""
     if not words:
         return []
     lines: list[str] = []
@@ -160,12 +186,30 @@ def _hook_lines(text: str) -> list[str]:
     return [" ".join(words[:best]), " ".join(words[best:])]
 
 
-def _clamp_block_y(y: int, n_lines: int) -> int:
-    """Keep an n-line block centred at y with its cap tops/bottoms inside the safe band."""
-    half = n_lines * FONT_SIZE / 2
-    lo = math.ceil(SAFE_TOP + half - CAP_TOP)
-    hi = math.floor(SAFE_BOTTOM - half + DESCENT)
-    return min(max(y, lo), hi)
+def _layout_hook(text: str) -> tuple[list[str], int, int]:
+    """Hook lines, Fontsize and \\fscx: condense to 80%, then step the size down to the
+    60 px-cap minimum; if it still does not fit, keep the first 7 words plus an ellipsis; as a
+    last resort condense below 80% so the box stays inside Q4."""
+    words = _clean(text).upper().split()
+    lines = _hook_lines(words)
+    if not lines:
+        return [], FONT_SIZE, 100
+    fit = _fit(lines, HOOK_SIDE, HOOK_MIN_FS)
+    if fit is None and len(words) > HOOK_MAX_WORDS:
+        words = words[:HOOK_MAX_WORDS]
+        words[-1] = words[-1].rstrip(".,;:!?…") + ELLIPSIS
+        lines = _hook_lines(words)
+        fit = _fit(lines, HOOK_SIDE, HOOK_MIN_FS)
+    if fit is None:
+        w = max(_line_w(line, HOOK_MIN_FS) for line in lines)
+        fit = HOOK_MIN_FS, math.floor(100 * (MAX_TEXT_W - 2 * HOOK_SIDE) / w)
+    return lines, *fit
+
+
+def _clamp_hook_y(y: int, n_lines: int, fs: int) -> int:
+    """Keep the hook's background box (line boxes plus pad) inside Q4's y range."""
+    half = n_lines * fs / 2 + HOOK_PAD
+    return min(max(y, math.ceil(SAFE_TOP + half)), math.floor(SAFE_BOTTOM - half))
 
 
 def _hold_ends(groups: list[list[Word]], duration: float) -> list[float]:
@@ -188,23 +232,19 @@ def build_ass(
     hook_y: int = HOOK_Y,
 ) -> str:
     lines = [HEADER.rstrip("\n")]
-    hook = _hook_lines(hook_text)
+    hook, fs, scale = _layout_hook(hook_text)
     if hook:
-        y = _clamp_block_y(hook_y, len(hook))
-        scale = min(_fit_scale(line, HOOK_PAD) for line in hook)
-        tags = f"\\pos({TEXT_X},{y})\\fad(0,{HOOK_FADE_MS})"
-        if scale < 100:
-            tags += f"\\fscx{scale}"
+        y = _clamp_hook_y(hook_y, len(hook), fs)
+        tags = f"\\pos({TEXT_X},{y})\\fad(0,{HOOK_FADE_MS})" + _size_tags(fs, scale)
         body = "\\N".join(_esc(line) for line in hook)
         lines.append(_dialogue(1, 0.0, min(HOOK_S, duration), "Hook", f"{{{tags}}}{body}"))
     cy = min(max(caption_y, CAPTION_MIN_Y), CAPTION_MAX_Y)
     groups = group_words(_normalise(words))
     for group, hold_end in zip(groups, _hold_ends(groups, duration), strict=True):
         texts = [word.text.upper() for word in group]
-        scale = _fit_scale(" ".join(texts), CAP_OUTLINE)
-        tags = f"\\pos({TEXT_X},{cy})"
-        if scale < 100:
-            tags += f"\\fscx{scale}\\fscy{scale}"
+        # A single over-long word that cannot fit even at the minimum size keeps that size.
+        fs, scale = _fit([" ".join(texts)], CAP_SIDE, CAP_MIN_FS) or (CAP_MIN_FS, MIN_SCALE_X)
+        tags = f"\\pos({TEXT_X},{cy})" + _size_tags(fs, scale)
         for i, active in enumerate(group):
             end = group[i + 1].start if i + 1 < len(group) else hold_end
             parts = [
@@ -225,19 +265,16 @@ def _face_px(layout: SceneLayout) -> tuple[float, float] | None:
 
 def caption_y_for(layouts: list[SceneLayout]) -> int:
     """Caption line for the first scene, always inside [CAPTION_MIN_Y, CAPTION_MAX_Y]: just
-    below the seam when STACKED; off a FACE_TRACK face that covers the default line (below it
-    if there is room, else above it, else the default); else the default (the band bottom)."""
+    below the seam when STACKED; above a FACE_TRACK face that covers the default line (the
+    band bottom) if there is room, else the default."""
     if not layouts:
         return CAPTION_Y
     first = layouts[0]
     if first.kind == "STACKED":
         return STACKED_CAPTION_Y
     face = _face_px(first) if first.kind == "FACE_TRACK" else None
-    if face and face[0] < CAPTION_Y + CAPTION_HALF_H and face[1] > CAPTION_Y - CAPTION_HALF_H:
-        below = round(face[1]) + CAPTION_FACE_GAP
+    if face and face[0] < CAPTION_Y + CAPTION_BELOW and face[1] > CAPTION_Y - CAPTION_ABOVE:
         above = round(face[0]) - CAPTION_FACE_GAP
-        if below <= CAPTION_MAX_Y:
-            return below
         if above >= CAPTION_MIN_Y:
             return above
     return CAPTION_Y
@@ -245,7 +282,7 @@ def caption_y_for(layouts: list[SceneLayout]) -> int:
 
 def hook_y_for(layouts: list[SceneLayout]) -> int:
     """Hook title centre for the first scene: 360 (top) unless that covers a face, then
-    260 px above the captions; 900 when STACKED (below the seam captions)."""
+    260 px above the captions; 940 when STACKED (below the seam captions)."""
     if not layouts:
         return HOOK_Y
     first = layouts[0]
