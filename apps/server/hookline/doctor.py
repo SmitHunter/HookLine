@@ -5,7 +5,9 @@ import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from hookline.assets import TWITCH_DL_EXE, YUNET_URL, tools_dir
 from hookline.config import Settings
+from hookline.media.subtitles import fonts_dir
 
 
 @dataclass
@@ -98,7 +100,31 @@ def run_doctor(
             "whisper.cpp",
             cpp_ok,
             False,
-            "configured" if cpp_ok else "not configured (set HOOKLINE_WHISPER_CPP_BIN/_MODEL)",
+            "configured (DTW on)"
+            if cpp_ok
+            else "not configured (set HOOKLINE_WHISPER_CPP_BIN/_MODEL)",
+        )
+    )
+    font = fonts_dir() / "Anton-Regular.ttf"
+    checks.append(
+        Check("Anton font", font.exists(), True, str(font) if font.exists() else "missing")
+    )
+    yunet = tools_dir() / "models" / YUNET_URL.rsplit("/", 1)[-1]
+    checks.append(
+        Check(
+            "YuNet model",
+            yunet.exists(),
+            False,
+            "cached" if yunet.exists() else "downloads on first vertical render",
+        )
+    )
+    tdl = tools_dir() / "bin" / TWITCH_DL_EXE
+    checks.append(
+        Check(
+            "TwitchDownloaderCLI",
+            tdl.exists(),
+            False,
+            "cached" if tdl.exists() else "downloads on first Twitch VOD (chat signals)",
         )
     )
     cuda = _cuda_available()

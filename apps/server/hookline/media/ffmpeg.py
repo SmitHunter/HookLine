@@ -133,7 +133,16 @@ def pick_encoder() -> str:
     return "libx264"
 
 
-def cut_segments(src: Path, segments: list[tuple[float, float]], dst: Path, encoder: str) -> Path:
+def cut_segments(
+    src: Path,
+    segments: list[tuple[float, float]],
+    dst: Path,
+    encoder: str,
+    quality: list[str] | None = None,
+) -> Path:
+    """Concatenate `segments` of `src` into `dst`. `quality`, when given, replaces the
+    encoder's default rate-control args."""
+    video = encoder_args(encoder) if quality is None else ["-c:v", encoder, *quality]
     cmd = ["ffmpeg", "-hide_banner", "-y"]
     for start, end in segments:
         cmd += ["-ss", f"{start:.3f}", "-to", f"{end:.3f}", "-i", str(src)]
@@ -146,7 +155,7 @@ def cut_segments(src: Path, segments: list[tuple[float, float]], dst: Path, enco
         "[v]",
         "-map",
         "[a]",
-        *encoder_args(encoder),
+        *video,
         "-pix_fmt",
         "yuv420p",
         "-c:a",

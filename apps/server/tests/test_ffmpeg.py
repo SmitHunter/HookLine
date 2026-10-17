@@ -88,3 +88,19 @@ def test_amf_cut_has_sane_bitrate_when_available(fixture_video, tmp_path):
         pytest.skip("h264_amf not usable here")
     out = cut_segments(fixture_video, [(10.0, 50.0)], tmp_path / "c.mp4", "h264_amf")
     assert out.stat().st_size * 8 / probe_duration(out) < 2_000_000
+
+
+def test_cut_segments_quality_replaces_rate_control(monkeypatch, tmp_path):
+    seen: list[list[str]] = []
+
+    def fake_run(cmd):
+        seen.append(cmd)
+        (tmp_path / "o.tmp.mp4").write_bytes(b"x")
+
+    monkeypatch.setattr(ffmpeg_mod, "_run", fake_run)
+    q = ["-preset", "veryfast", "-crf", "12"]
+    cut_segments(tmp_path / "in.mp4", [(0.0, 1.0)], tmp_path / "o.mp4", "libx264", quality=q)
+    cmd = seen[0]
+    i = cmd.index("-c:v")
+    assert cmd[i : i + 6] == ["-c:v", "libx264", *q]
+    assert cmd.count("-crf") == 1

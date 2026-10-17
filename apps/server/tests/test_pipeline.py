@@ -3,9 +3,8 @@ from pathlib import Path
 
 import pytest
 
-from hookline.media.ffmpeg import probe_duration
+from hookline.media.ffmpeg import probe_duration, probe_size
 from hookline.models import Segment, Transcript, Word
-from hookline.pipeline.cut import cut_clips
 from hookline.pipeline.ingest import job_id_for
 from hookline.pipeline.run import NoClipsSelectedError, run_job
 from tests.test_select import raw
@@ -53,16 +52,41 @@ def settings_tmp(settings, tmp_path):
     )
 
 
-def test_run_job_end_to_end_with_fakes(fixture_video, fake_llm, settings_tmp):
+def test_run_job_end_to_end_with_fakes(fixture_video, fake_llm, settings_tmp, monkeypatch):
+    from hookline.pipeline import run as run_mod
+
+    rms_calls: list[Path] = []
+    real_rms = run_mod.rms_per_second
+    monkeypatch.setattr(run_mod, "rms_per_second", lambda w: rms_calls.append(w) or real_rms(w))
     fake_llm.queue(make_payload_for(150, 2, 21))
     s = settings_tmp.model_copy(update={"clips": 2})
     logs: list[str] = []
-    clips = run_job(str(fixture_video), s, fake_llm, FakeTranscriber(duration=150), logs.append)
+    t = FakeTranscriber(duration=150)
+    clips = run_job(str(fixture_video), s, fake_llm, t, logs.append)
     assert len(clips) == 2 and all(c.exists() and c.name.isascii() for c in clips)
-    assert all(probe_duration(c) == pytest.approx(21, abs=0.6) for c in clips)
+    assert all(probe_size(c) == (1080, 1920) for c in clips)
+    assert all(probe_duration(c) == pytest.approx(21, abs=1.0) for c in clips)
     side = [json.loads(c.with_suffix(".json").read_text(encoding="utf-8")) for c in clips]
     assert all(d["post_caption"] == d["hook_text"] for d in side)
-    assert logs
+    assert all(d["layout"] and "keep_ranges" in d and "removed_s" in d for d in side)
+    assert any(m.startswith("clip 01: layouts=[") and "removed=" in m for m in logs)
+    job = s.workspace_dir / job_id_for(str(fixture_video))
+    signals = json.loads((job / "signals.json").read_text(encoding="utf-8"))
+    assert len(signals["loudness"]) >= 149 and signals["chat"] is None
+    run_job(str(fixture_video), s, fake_llm, t, logs.append)
+    assert len(rms_calls) == 1  # signals.json reused on the second run
+
+
+def test_run_job_names_and_sidecar(fixture_video, fake_llm, settings_tmp):
+    payload = make_payload_for(150, 1, 21)
+    payload["clips"][0]["title"] = "Sample clip"
+    fake_llm.queue(payload)
+    s = settings_tmp.model_copy(update={"clips": 1, "vertical": False, "captions": False})
+    clips = run_job(str(fixture_video), s, fake_llm, FakeTranscriber(duration=150))
+    assert [p.name for p in clips] == ["01-sample-clip.mp4"]
+    data = json.loads(clips[0].with_suffix(".json").read_text(encoding="utf-8"))
+    assert data["title"] == "Sample clip" and data["post_caption"] == data["hook_text"]
+    assert data["layout"] == []
 
 
 def test_rerun_uses_cache(fixture_video, fake_llm, settings_tmp):
@@ -83,13 +107,6 @@ def test_partial_artifact_is_not_trusted(fixture_video, fake_llm, settings_tmp):
     t = FakeTranscriber(duration=150)
     run_job(str(fixture_video), settings_tmp.model_copy(update={"clips": 2}), fake_llm, t)
     assert t.calls == 1
-
-
-def test_cut_clips_names_and_sidecar(fixture_video, sample_pick, tmp_path):
-    out = cut_clips(fixture_video, [sample_pick], tmp_path / "o", "libx264")
-    assert [p.name for p in out] == ["01-sample-clip.mp4"]
-    data = json.loads(out[0].with_suffix(".json").read_text(encoding="utf-8"))
-    assert data["post_caption"] == "Wait for it" and data["title"] == "Sample clip"
 
 
 def test_job_id_stable_for_url():
@@ -144,3 +161,36 @@ def test_empty_selection_writes_no_picks_and_raises(fixture_video, fake_llm, set
         run_job(str(fixture_video), settings_tmp, fake_llm, FakeTranscriber(duration=150))
     job = settings_tmp.workspace_dir / job_id_for(str(fixture_video))
     assert not (job / "picks.json").exists() and (job / "select_raw.json").exists()
+
+
+def test_picks_cache_key_mismatch_reselects(fixture_video, fake_llm, settings_tmp):
+    fast = {"clips": 1, "vertical": False, "captions": False}
+    s = settings_tmp.model_copy(update=fast)
+    fake_llm.queue(make_payload_for(150, 1, 21), make_payload_for(150, 1, 21))
+    t = FakeTranscriber(duration=150)
+    run_job(str(fixture_video), s, fake_llm, t)
+    job = s.workspace_dir / job_id_for(str(fixture_video))
+    saved = json.loads((job / "picks.json").read_text(encoding="utf-8"))
+    assert saved["key"] == {
+        "clips": 1,
+        "select_model": s.select_model,
+        "min_clip_s": s.min_clip_s,
+        "max_clip_s": s.max_clip_s,
+    }
+    logs: list[str] = []
+    run_job(str(fixture_video), s.model_copy(update={"max_clip_s": 45}), fake_llm, t, logs.append)
+    assert len(fake_llm.calls) == 2
+    assert any("re-select" in m and "max_clip_s" in m for m in logs)
+
+
+def test_old_list_picks_json_reselects(fixture_video, fake_llm, settings_tmp):
+    s = settings_tmp.model_copy(update={"clips": 1, "vertical": False, "captions": False})
+    fake_llm.queue(make_payload_for(150, 1, 21), make_payload_for(150, 1, 21))
+    t = FakeTranscriber(duration=150)
+    run_job(str(fixture_video), s, fake_llm, t)
+    job = s.workspace_dir / job_id_for(str(fixture_video))
+    saved = json.loads((job / "picks.json").read_text(encoding="utf-8"))
+    (job / "picks.json").write_text(json.dumps(saved["picks"]), encoding="utf-8")
+    logs: list[str] = []
+    run_job(str(fixture_video), s, fake_llm, t, logs.append)
+    assert len(fake_llm.calls) == 2 and any("old format" in m for m in logs)

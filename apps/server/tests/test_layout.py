@@ -239,3 +239,9 @@ def test_plan_layouts_finds_facecam_in_synthetic_stream(synthetic_stream: Path):
     assert [s.kind for s in layouts] == ["STACKED"]
     x, y, w, _ = layouts[0].facecam
     assert x > 0.5 and y < 0.2 and x + w <= 1.0
+
+
+def test_plan_layouts_without_detector_is_fit_blur(fixture_video):
+    layouts = plan_layouts(fixture_video, None)
+    assert [lay.kind for lay in layouts] == ["FIT_BLUR"]
+    assert layouts[0].start == 0 and layouts[0].end == pytest.approx(150, abs=0.1)

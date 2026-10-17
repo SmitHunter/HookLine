@@ -124,17 +124,22 @@ def _sample_times(start: float, end: float, every: float) -> list[float]:
 
 def plan_layouts(
     video: Path,
-    detector: _Detector,
+    detector: _Detector | None,
     facecam_override: Box | None = None,
     sample_every: float = 1.0,
     crop: Crop | None = None,
 ) -> list[SceneLayout]:
+    """One layout per scene. With no detector (and no override) the whole video is a single
+    FIT_BLUR scene: without faces every scene would be FIT_BLUR anyway."""
+    if detector is None and facecam_override is None:
+        return [SceneLayout(start=0.0, end=probe_duration(video), kind="FIT_BLUR")]
     layouts = []
     for start, end in _scenes(video):
         if facecam_override is not None:
             layouts.append(classify_scene([], start, end, facecam_override))
             continue
         times = _sample_times(start, end, sample_every)
+        assert detector is not None
         try:
             frames = sample_frames(video, times, crop=crop)
             samples = [(t, detector.detect(f)) for t, f in zip(times, frames, strict=True)]

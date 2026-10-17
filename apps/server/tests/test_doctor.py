@@ -78,3 +78,11 @@ def test_cli_run_no_clips_selected(monkeypatch):
     res = CliRunner().invoke(cli.app, ["run", "x.mp4"])
     assert res.exit_code == 1 and "No clips were selected" in res.output
     assert "workspace/abc/select_raw.json" in res.output and "Traceback" not in res.output
+
+
+def test_doctor_m2_asset_rows():
+    checks = run_doctor(which=lambda name: f"/bin/{name}", run=fake_completed(""))
+    by = {c.name: c for c in checks}
+    assert by["Anton font"].required and by["Anton font"].ok
+    assert not by["YuNet model"].required and not by["TwitchDownloaderCLI"].required
+    assert "DTW on" in by["whisper.cpp"].detail or not by["whisper.cpp"].ok
