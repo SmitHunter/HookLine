@@ -177,14 +177,31 @@ def test_hook_on_the_face_fails_q4b(good_mp4, tmp_path):
 
 
 def test_zoomed_face_overlap_detected_q4b(good_mp4, tmp_path):
-    # face 1240-1320 px misses the 1180 caption text (~1146-1214) unzoomed; a 3x step
-    # (centre 1280, half 120) reaches up to 1160 while it is in effect
+    # face 1240-1320 px misses the 1180 caption text (~1155-1221) unzoomed; a 4x step
+    # (centre 1280, half 160: box 1120-1440, face core from 1184) reaches it
     low = [{"start": 0.0, "end": DUR, "kind": "FACE_TRACK", "face_box": [1240 / 1920, 80 / 1920]}]
     flat = _sidecar(layout=low, zoom_steps=[[0.0, 1.0]], cut_times=[2.5, 5.0])
     assert _by_id(audit_clip(good_mp4, flat, _ass(tmp_path)))["Q4b"].ok
-    zoomed = _sidecar(layout=low, zoom_steps=[[0.0, 1.0], [4.0, 3.0]], cut_times=[2.5])
+    zoomed = _sidecar(layout=low, zoom_steps=[[0.0, 1.0], [4.0, 4.0]], cut_times=[2.5])
     by = _by_id(audit_clip(good_mp4, zoomed, _ass(tmp_path)))
     assert not by["Q4b"].ok and by["Q4b"].value > 0.10
+
+
+@pytest.mark.parametrize(
+    ("top", "ok"),
+    [(1140, True), (1000, False)],
+    ids=["hairline-only", "eyes-and-mouth"],
+)
+def test_q4b_measures_the_face_core_not_the_hairline(good_mp4, tmp_path, top, ok):
+    # 400 px face box. top=1140: the 1180 caption band (~1155-1221) lies in the box's top 20%
+    # (1140-1220, hairline/upper forehead): acceptable. top=1000: core from 1080, so the
+    # band sits on the eyes/nose: not acceptable.
+    lay = [{"start": 0.0, "end": DUR, "kind": "FACE_TRACK", "face_box": [top / 1920, 400 / 1920]}]
+    side = _sidecar(layout=lay, zoom_steps=[[0.0, 1.0]])
+    q4b = _by_id(audit_clip(good_mp4, side, _ass(tmp_path)))["Q4b"]
+    assert q4b.ok is ok
+    if not ok:
+        assert "face core" in q4b.detail and "face-core" in q4b.threshold
 
 
 def test_one_overflowing_group_among_many_fails_q4(good_mp4, tmp_path):

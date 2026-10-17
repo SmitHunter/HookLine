@@ -395,8 +395,9 @@ def _check_safe_zone(boxes: list[Box | None]) -> CheckResult:
 
 
 def _face_share(box: Box, layouts: list[dict], steps: list, t: float) -> float:
-    """Largest share of `box` covered by a face of the scene at `t`, the face scaled by the
-    zoom step in effect at `t`."""
+    """Largest share of `box` covered by a face core (detector box minus its top 20%,
+    hairline/forehead; see `face_rects`) of the scene at `t`, scaled by the zoom step in
+    effect at `t`."""
     lay = _layout_at(layouts, t)
     if lay is None:
         return 0.0
@@ -421,8 +422,8 @@ def _check_face(
         share = _face_share(box, layouts, steps, t)
         if share > worst:
             worst, where = share, f"{what} at {t:.1f}s"
-    detail = f"worst {worst:.0%} ({where})" if where else "no overlap"
-    thr = f"caption/hook face overlap <= {FACE_OVERLAP_MAX:.0%}"
+    detail = f"worst {worst:.0%} of a box on the face core ({where})" if where else "no overlap"
+    thr = f"caption/hook face-core overlap <= {FACE_OVERLAP_MAX:.0%}"
     return CheckResult("Q4b", worst <= FACE_OVERLAP_MAX, round(worst, 3), thr, detail)
 
 

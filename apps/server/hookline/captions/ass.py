@@ -50,6 +50,7 @@ HOOK_SIDE = HOOK_PAD + 2  # the box measured ~2 px wider than advance + pad
 OUT_W, OUT_H = 1080, 1920
 SPLIT_PANEL_H = OUT_H // 2
 FACE_W_PER_H = 0.8  # face detector boxes are about this wide relative to their height
+FACE_CORE_TOP = 0.2  # top share of a face box (hairline/forehead) outside the face core
 # Q4 safe zone for everything visible (text, outline, hook box): x in [60, 888], y in [290, 1250].
 TEXT_X = 474  # centre of [60, 888]
 MAX_TEXT_W = 828
@@ -295,20 +296,24 @@ def build_ass(
 
 
 def face_rects(layout: SceneLayout, zoom: float = 1.0) -> list[tuple[float, float, float, float]]:
-    """Output-px (x0, y0, x1, y1) of the layout's median face(s), scaled by `zoom` about the
-    face centre: one for FACE_TRACK, one per panel for SPLIT. The layout stores only the
-    face's (y, h); tracking and split crops centre the face horizontally, and a detector box
-    is about FACE_W_PER_H as wide as tall, so x is estimated from that."""
+    """Output-px (x0, y0, x1, y1) of the layout's median FACE CORE(s), scaled by `zoom` about
+    the face centre: one for FACE_TRACK, one per panel for SPLIT.
+
+    The face core is the detector box with its top FACE_CORE_TOP (20%) removed: that strip is
+    hairline/upper forehead, where text is acceptable short-form practice; the core (eyes,
+    nose, mouth, chin) is what captions and hooks must stay off. Placement here and the Q4b
+    audit both use the core, so they agree. The layout stores only the face's (y, h); tracking
+    and split crops centre the face horizontally, and a detector box is about FACE_W_PER_H as
+    wide as tall, so x is estimated from that."""
     face = _face_px(layout)
     if face is None:
         return []
     top, bottom = face
     cy, half_h = (top + bottom) / 2, (bottom - top) / 2 * zoom
     half_w = half_h * FACE_W_PER_H
+    core_top = cy - half_h + FACE_CORE_TOP * 2 * half_h
     panels = (0, SPLIT_PANEL_H) if layout.kind == "SPLIT" else (0,)
-    return [
-        (OUT_W / 2 - half_w, cy - half_h + p, OUT_W / 2 + half_w, cy + half_h + p) for p in panels
-    ]
+    return [(OUT_W / 2 - half_w, core_top + p, OUT_W / 2 + half_w, cy + half_h + p) for p in panels]
 
 
 def _face_px(layout: SceneLayout) -> tuple[float, float] | None:

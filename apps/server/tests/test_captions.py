@@ -9,7 +9,6 @@ from hookline.captions.ass import (
     CAPTION_BELOW,
     CAPTION_LATE_MIN_Y,
     CAPTION_MIN_Y,
-    CAPTION_STEP,
     build_ass,
     caption_y_for,
     face_rects,
@@ -197,25 +196,29 @@ def test_face_track_hook_moves_off_the_face(tmp_path):
 
 def test_face_track_captions_move_off_a_face_covering_them():
     small = [_lay("FACE_TRACK", (0.5, 0.12))]  # face 960-1190 px covers the 1180 line
-    y = caption_y_for(small)  # 1180 is the band bottom: move above the face (1.2x budgeted)
-    assert 760 <= y and y + CAPTION_BELOW + 40 <= 960 - 0.1 * 230
+    y = caption_y_for(small)  # 1180 is the band bottom: move above the face core
+    # 1.2x punch-in: box 937-1213, core (top 20% removed) from 992
+    assert 760 <= y and y + CAPTION_BELOW + 40 <= 1075 - 138 + 0.2 * 276
     clear = [_lay("FACE_TRACK", (0.25, 0.3))]  # face 480-1056 px (1.2x: 422-1114): clear
     assert caption_y_for(clear) == 1180
     big = [_lay("FACE_TRACK", (0.32, 0.5))]  # face 614-1574 px covers every line
     assert hook_y_for(big) == 360
-    assert caption_y_for(big, late=True) <= CAPTION_LATE_MIN_Y + CAPTION_STEP  # above the head
+    # late line: lowest one clear of the 1.2x face core (box 518-1670, core from 748)
+    assert caption_y_for(big, late=True) + CAPTION_BELOW + 40 <= 748
 
 
 def test_close_up_captions_go_above_the_head_clear_of_the_hook(tmp_path):
     # a real podcast close-up: face 687-1332 px covers 1180 and reaches past the safe zone
     close = [_lay("FACE_TRACK", (0.358, 0.336))]
+    # 1.2x punch-in: box 622-1397, face core (top 20% = hairline removed) from 777
+    core_top = 1009.5 - 1.2 * 322.5 + 0.2 * 2 * 1.2 * 322.5
     y = caption_y_for(close)
-    assert CAPTION_MIN_Y <= y <= CAPTION_MIN_Y + CAPTION_STEP  # as high as the hook allows
+    assert CAPTION_MIN_Y <= y and y + CAPTION_BELOW + 40 <= core_top  # over the hairline
     hook, cap = _hook_box(tmp_path, close), _cap_box(tmp_path, close)
     assert hook is not None and cap is not None and cap[1] - hook[3] >= 24
-    # after the hook the line moves above the head, clear of a 1.2x punch-in
+    # after the hook: the same rule from 526 up; the lowest clear line is still above the core
     late = caption_y_for(close, late=True)
-    assert late + CAPTION_BELOW + 40 <= 1009.5 - 1.2 * 322.5 + CAPTION_STEP
+    assert CAPTION_LATE_MIN_Y <= late and late + CAPTION_BELOW + 40 <= core_top
     from hookline.quality import text_bbox
 
     box = text_bbox(
@@ -243,9 +246,13 @@ def test_caption_line_weighs_every_face_scene_by_duration():
     short_clear = SceneLayout(start=30, end=33, kind="FACE_TRACK", face_box=(0.2, 0.2))
     assert caption_y_for([short_clear, long_close], late=True) < 700  # the close-up decides
     split = [SceneLayout(start=0, end=5, kind="SPLIT", face_box=(0.3, 0.5))]
-    # faces 288-768 and 1248-1728 px: the line sits between them, clear of both
-    y = caption_y_for(split)
-    assert 768 + CAPTION_ABOVE < y < 1180 and y + CAPTION_BELOW < 1248
+    # faces 288-768 and 1248-1728 px; at 1.2x the bottom face core starts at 1315, so the
+    # default line clears both cores
+    assert caption_y_for(split) == 1180
+    tall = [SceneLayout(start=0, end=5, kind="SPLIT", face_box=(0.1, 0.5))]
+    # bottom face 1056-1536, 1.2x core from 1123: the line moves up above that core
+    y = caption_y_for(tall)
+    assert y < 1180 and y + CAPTION_BELOW + 40 <= 1123
 
 
 def test_split_hook_uses_top_panel_face():
