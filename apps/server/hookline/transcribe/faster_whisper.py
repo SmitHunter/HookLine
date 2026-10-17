@@ -31,4 +31,4 @@ class FasterWhisperBackend:
                 words.append(Word(start=w.start, end=w.end, text=w.word, prob=w.probability))
             if on_progress and info.duration:
                 on_progress(min(seg.end / info.duration, 1.0))
-        return words_to_transcript(words, info.language, info.duration)
+        return words_to_transcript(words, info.language, info.duration, timing="whisper")

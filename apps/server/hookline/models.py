@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic import BaseModel, computed_field
 
 
@@ -19,6 +21,7 @@ class Transcript(BaseModel):
     language: str
     duration: float
     segments: list[Segment]
+    timing: Literal["segment", "dtw", "whisper"] = "segment"
 
     def words(self) -> list[Word]:
         return [w for seg in self.segments for w in seg.words]

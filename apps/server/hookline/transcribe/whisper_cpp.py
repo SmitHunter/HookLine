@@ -14,18 +14,62 @@ _PROGRESS = re.compile(r"progress\s*=\s*(\d+)%")
 _NON_SPEECH = re.compile(r"^(\[[^\]]*\]|\([^)]*\)|\*[^*]*\*)$")
 
 
+def dtw_preset(model: Path) -> str:
+    """ggml-large-v3-turbo.bin -> large.v3.turbo (whisper.cpp's -dtw preset name)."""
+    return model.stem.removeprefix("ggml-").replace("-", ".")
+
+
+def _is_speech(text: str) -> bool:
+    text = text.strip()
+    return bool(text) and not text.startswith("[")
+
+
 def parse_whisper_cpp_json(data: dict, duration: float) -> Transcript:
-    words = [
-        Word(
-            start=e["offsets"]["from"] / 1000,
-            end=e["offsets"]["to"] / 1000,
-            text=e["text"].strip(),
+    # Each entry: (text, offset_start, offset_end, dtw_start | None, dtw_last | None)
+    entries: list[tuple[str, float, float, float | None, float | None]] = []
+    for e in data.get("transcription", []):
+        text = e.get("text", "").strip()
+        if not text or _NON_SPEECH.match(text):
+            continue
+        dtws = [
+            tok["t_dtw"] / 100
+            for tok in e.get("tokens", [])
+            if _is_speech(tok.get("text", "")) and tok.get("t_dtw", -1) >= 0
+        ]
+        # Ignore DTW unless the first speech token (not just a later one) has it.
+        first_tok = next((t for t in e.get("tokens", []) if _is_speech(t.get("text", ""))), None)
+        has_first = first_tok is not None and first_tok.get("t_dtw", -1) >= 0
+        entries.append(
+            (
+                text,
+                e["offsets"]["from"] / 1000,
+                e["offsets"]["to"] / 1000,
+                dtws[0] if has_first else None,
+                dtws[-1] if dtws else None,
+            )
         )
-        for e in data.get("transcription", [])
-        if e.get("text", "").strip() and not _NON_SPEECH.match(e["text"].strip())
-    ]
     language = (data.get("result") or {}).get("language", "en")
-    return words_to_transcript(words, language, duration)
+    n_dtw = sum(1 for en in entries if en[3] is not None)
+    use_dtw = bool(entries) and n_dtw * 2 >= len(entries)
+    if not use_dtw:
+        words = [Word(start=s, end=t, text=x) for x, s, t, _, _ in entries]
+        return words_to_transcript(words, language, duration)
+    starts: list[float] = []
+    prev = 0.0
+    for _, off_from, _, d_start, _ in entries:
+        prev = max(d_start if d_start is not None else off_from, prev)
+        starts.append(prev)
+    words = []
+    for i, (text, _, off_to, _, d_last) in enumerate(entries):
+        start = starts[i]
+        if i + 1 < len(entries):
+            end = starts[i + 1]
+            if d_last is not None:
+                end = min(end, d_last + 0.15)
+        else:
+            end = off_to
+        words.append(Word(start=start, end=max(end, start + 0.05), text=text))
+    return words_to_transcript(words, language, duration, timing="dtw")
 
 
 class WhisperCppBackend:
@@ -51,6 +95,9 @@ class WhisperCppBackend:
                 "1",
                 "-sow",
                 "-pp",
+                "-nfa",
+                "-dtw",
+                dtw_preset(self.model),
             ]
             try:
                 proc = subprocess.Popen(

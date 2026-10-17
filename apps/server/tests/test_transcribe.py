@@ -8,7 +8,7 @@ from hookline.config import Settings
 from hookline.transcribe import get_transcriber
 from hookline.transcribe.base import TranscriptionError
 from hookline.transcribe.faster_whisper import FasterWhisperBackend
-from hookline.transcribe.whisper_cpp import WhisperCppBackend, parse_whisper_cpp_json
+from hookline.transcribe.whisper_cpp import WhisperCppBackend, dtw_preset, parse_whisper_cpp_json
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -75,3 +75,53 @@ def test_whisper_cpp_vulkan_on_speech(speech_wav):
     t = WhisperCppBackend(Path(bin_), Path(model)).transcribe(speech_wav)
     joined = " ".join(w.text.lower() for w in t.words())
     assert "welcome" in joined and "test" in joined
+
+
+def _load(name: str) -> dict:
+    return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
+
+
+def test_dtw_preset():
+    assert dtw_preset(Path("ggml-large-v3-turbo.bin")) == "large.v3.turbo"
+    assert dtw_preset(Path("x/ggml-base.en.bin")) == "base.en"
+
+
+def test_parse_prefers_dtw_and_matches_real_pauses():
+    t = parse_whisper_cpp_json(_load("whisper_cpp_dtw_sample.json"), duration=60.0)
+    words = t.words()
+    assert t.timing == "dtw"
+    assert 1.0 <= words[0].start <= 1.4  # audio: silence until 1.11s (offsets said 0.00)
+    starts = [w.start for w in words]
+    assert starts == sorted(starts)
+    assert all(w.end > w.start for w in words)
+    after_pause = next(w for w in words if w.start > 5.5)  # silence 5.20-6.22 in the audio
+    assert 6.1 <= after_pause.start <= 6.7
+
+
+def test_parse_falls_back_to_offsets_without_dtw():
+    t = parse_whisper_cpp_json(_load("whisper_cpp_sample.json"), duration=5.0)
+    assert t.timing == "segment" and t.words()[0].start == pytest.approx(0.32)
+
+
+def test_backend_passes_dtw_flags(monkeypatch, tmp_path):
+    argv: list[str] = []
+
+    class FakePopen:
+        def __init__(self, cmd, **kwargs):
+            argv.extend(cmd)
+            stem = Path(cmd[cmd.index("-of") + 1])
+            Path(f"{stem}.json").write_text(
+                json.dumps({"result": {"language": "en"}, "transcription": []}),
+                encoding="utf-8",
+            )
+            self.stderr = iter([])
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr("hookline.transcribe.whisper_cpp.subprocess.Popen", FakePopen)
+    monkeypatch.setattr("hookline.transcribe.whisper_cpp.probe_duration", lambda p: 1.0)
+    WhisperCppBackend(tmp_path / "w.exe", tmp_path / "ggml-large-v3-turbo.bin").transcribe(
+        tmp_path / "a.wav"
+    )
+    assert "-nfa" in argv and argv[argv.index("-dtw") + 1] == "large.v3.turbo"

@@ -1,6 +1,6 @@
 from collections.abc import Callable
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
 from hookline.models import Segment, Transcript, Word
 from hookline.transcript_text import split_sentences
@@ -16,7 +16,12 @@ class Transcriber(Protocol):
     ) -> Transcript: ...
 
 
-def words_to_transcript(words: list[Word], language: str, duration: float) -> Transcript:
+def words_to_transcript(
+    words: list[Word],
+    language: str,
+    duration: float,
+    timing: Literal["segment", "dtw", "whisper"] = "segment",
+) -> Transcript:
     """Regroup a flat word list into sentence-shaped segments (shared by all backends)."""
     words = [w.model_copy(update={"text": w.text.strip()}) for w in words if w.text.strip()]
     sentences = split_sentences(words)
@@ -30,4 +35,4 @@ def words_to_transcript(words: list[Word], language: str, duration: float) -> Tr
         Segment(start=s.start, end=s.end, text=s.text, words=b)
         for s, b in zip(sentences, buckets, strict=True)
     ]
-    return Transcript(language=language, duration=duration, segments=segments)
+    return Transcript(language=language, duration=duration, segments=segments, timing=timing)
