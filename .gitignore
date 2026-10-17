@@ -1,0 +1,11 @@
+workspace/
+output/
+tools/bin/
+tools/models/
+tools/src/
+.venv/
+__pycache__/
+*.tmp
+*.tmp.mp4
+.pytest_cache/
+.ruff_cache/

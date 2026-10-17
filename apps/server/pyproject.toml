@@ -1,0 +1,34 @@
+[project]
+name = "hookline"
+version = "0.1.0"
+description = "Turn a long video into short vertical clips."
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "typer",
+    "pydantic>=2",
+    "yt-dlp",
+    "faster-whisper",
+    "av<18",
+    "anthropic",
+    "rich",
+]
+
+[project.scripts]
+hookline = "hookline.cli:app"
+
+[dependency-groups]
+dev = ["pytest", "ruff"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["hookline"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["integration: slow tests that load real models (deselect with -m 'not integration')"]
+
+[tool.ruff]
+line-length = 100
