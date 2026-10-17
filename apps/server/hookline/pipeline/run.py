@@ -8,7 +8,7 @@ from hookline.config import Settings
 from hookline.fsutil import atomic_write_text, slugify
 from hookline.llm import LLMBackend
 from hookline.media.audio import rms_per_second
-from hookline.media.ffmpeg import FFmpegError, extract_audio
+from hookline.media.ffmpeg import FFmpegError, extract_audio, pick_encoder
 from hookline.models import ClipPick, Transcript
 from hookline.pipeline.chat import chat_rate, try_fetch_chat
 from hookline.pipeline.ingest import find_source, ingest, job_id_for
@@ -119,9 +119,14 @@ def _face_detector(settings: Settings, log: Callable[[str], None]) -> FaceDetect
     if not settings.vertical or settings.facecam is not None:
         return None
     try:
-        return FaceDetector(ensure_yunet())
+        model = ensure_yunet()
     except AssetError as e:
         log(f"warning: face model unavailable ({e}); every scene uses FIT_BLUR")
+        return None
+    try:
+        return FaceDetector(model)
+    except Exception as e:  # noqa: BLE001 - cv2 raises its own error types; never abort the job
+        log(f"warning: face detector unavailable ({e}); every scene uses FIT_BLUR")
         return None
 
 
@@ -218,16 +223,26 @@ def run_job(
     # Segment-interpolated word times are contiguous (no gaps), so protecting them from cuts
     # would remove no dead air at all; only real word timings (DTW / whisper) are protected.
     protect = transcript.timing != "segment"
+    encoder = pick_encoder()
     clips: list[Path] = []
     for i, pick in enumerate(picks, 1):
         dst = out_dir / f"{i:02d}-{slugify(pick.title)}.mp4"
         try:
             extras = render_clip(
-                src, wav, pick, words, work_dir, dst, settings, detector, protect_words=protect
+                src,
+                wav,
+                pick,
+                words,
+                work_dir,
+                dst,
+                settings,
+                detector,
+                protect_words=protect,
+                encoder=encoder,
             )
-        except FFmpegError as e:
-            reason = str(e).splitlines()[0]
-            if e.stderr:
+        except (FFmpegError, ValueError, OSError) as e:
+            reason = (str(e).splitlines() or [type(e).__name__])[0]
+            if isinstance(e, FFmpegError) and e.stderr:
                 reason += f" ({e.stderr.splitlines()[-1].strip()})"
             log(f"warning: clip {i:02d} failed: {reason}")
             continue

@@ -295,3 +295,66 @@ def test_old_format_transcript_is_retranscribed(fixture_video, fake_llm, setting
     logs: list[str] = []
     run_job(str(fixture_video), s, fake_llm, t, logs.append)
     assert t.calls == 2 and any("old format" in m and "re-transcribing" in m for m in logs)
+
+
+@pytest.mark.parametrize("exc", [ValueError("no layouts"), OSError("disk full")])
+def test_clip_value_and_os_errors_are_skipped(
+    fixture_video, fake_llm, settings_tmp, monkeypatch, exc
+):
+    from hookline.pipeline import run as run_mod
+
+    real = run_mod.render_clip
+    calls = [0]
+
+    def flaky(*a, **k):
+        calls[0] += 1
+        if calls[0] == 1:
+            raise exc
+        return real(*a, **k)
+
+    monkeypatch.setattr(run_mod, "render_clip", flaky)
+    fake_llm.queue(make_payload_for(150, 2, 21))
+    s = settings_tmp.model_copy(update={"clips": 2, "vertical": False, "captions": False})
+    logs: list[str] = []
+    clips = run_job(str(fixture_video), s, fake_llm, FakeTranscriber(duration=150), logs.append)
+    assert [c.name[:2] for c in clips] == ["02"]
+    assert any(m.startswith(f"warning: clip 01 failed: {exc}") for m in logs)
+
+
+def test_face_detector_failure_falls_back(settings_tmp, monkeypatch):
+    from hookline.pipeline import run as run_mod
+
+    class Cv2Error(Exception):
+        pass
+
+    def broken(model):
+        raise Cv2Error("cv2.error: bad model")
+
+    monkeypatch.setattr(run_mod, "ensure_yunet", lambda: Path("yunet.onnx"))
+    monkeypatch.setattr(run_mod, "FaceDetector", broken)
+    logs: list[str] = []
+    assert run_mod._face_detector(settings_tmp, logs.append) is None
+    assert any("face detector unavailable" in m and "FIT_BLUR" in m for m in logs)
+
+
+def test_encoder_is_resolved_once_per_job(fixture_video, fake_llm, settings_tmp, monkeypatch):
+    from hookline.pipeline import run as run_mod
+
+    picks = [0]
+    seen = []
+    real = run_mod.render_clip
+
+    def counting():
+        picks[0] += 1
+        return "libx264"
+
+    def spy(*a, **k):
+        seen.append(k.get("encoder"))
+        return real(*a, **k)
+
+    monkeypatch.setattr(run_mod, "pick_encoder", counting)
+    monkeypatch.setattr(run_mod, "render_clip", spy)
+    fake_llm.queue(make_payload_for(150, 2, 21))
+    s = settings_tmp.model_copy(update={"clips": 2, "vertical": False, "captions": False})
+    run_job(str(fixture_video), s, fake_llm, FakeTranscriber(duration=150))
+    assert picks[0] == 1 and seen == ["libx264", "libx264"]

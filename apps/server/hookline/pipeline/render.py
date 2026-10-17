@@ -43,6 +43,7 @@ def render_clip(
     settings: Settings,
     detector: FaceDetector | None,
     protect_words: bool = True,
+    encoder: str | None = None,
 ) -> dict:
     """Write the finished clip to `dst`; returns sidecar extras (layout, keep_ranges, removed_s).
 
@@ -51,7 +52,8 @@ def render_clip(
     audio once (the intermediate's AAC, copied into the final file).
 
     `protect_words` keeps dead-air cuts out of word spans; pass False for
-    segment-interpolated word times, which tile the timeline with no gaps."""
+    segment-interpolated word times, which tile the timeline with no gaps. `encoder` is the
+    final video encoder (resolved by `pick_encoder()` when None; pass it to avoid re-probing)."""
     work_dir.mkdir(parents=True, exist_ok=True)
     dst.parent.mkdir(parents=True, exist_ok=True)
     name = dst.stem.split("-", 1)[0]
@@ -102,7 +104,7 @@ def render_clip(
             "ffmpeg", "-hide_banner", "-y", "-i", str(inter),
             "-filter_complex", graph,
             "-map", out_label, "-map", "0:a?",
-            *encoder_args(pick_encoder()), "-pix_fmt", "yuv420p",
+            *encoder_args(encoder or pick_encoder()), "-pix_fmt", "yuv420p",
             "-c:a", "copy",  # the intermediate's AAC 192k is the one lossy audio encode
             "-movflags", "+faststart",
             str(tmp),
