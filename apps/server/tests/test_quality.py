@@ -382,3 +382,31 @@ def test_audit_job_reports_a_broken_clip_and_continues(good_mp4, tmp_path):
     broken, good = report["clips"]
     assert broken["clip"] == "00-broken.mp4" and broken["checks"][0]["id"] == "ERR"
     assert good["ok"] and report["ok"] is False
+
+
+def test_seam_into_a_close_up_keeps_tag_and_early_captions_off_the_face(good_mp4, tmp_path):
+    from hookline.captions.ass import caption_y_for, early_until, hook_y_for
+    from hookline.pipeline.layout import SceneLayout
+
+    # wide shot 0-5 s, then (from the cold-open seam at 5 s) a close-up with a high face:
+    # box 230-806 px, face core from 345 px
+    scenes = [
+        {"start": 0.0, "end": 5.0, "kind": "FIT_BLUR", "face_box": None},
+        {"start": 5.0, "end": DUR, "kind": "FACE_TRACK", "face_box": [0.12, 0.3]},
+    ]
+    lays = [SceneLayout.model_validate(s) for s in scenes]
+    words, seam = _words(), 5.0
+    until = early_until(words, "Wait for the twist", DUR, seam)
+    assert until >= seam + 0.8  # the tag's window counts as "early"
+
+    def audit(caption_y: int, hook_y: int) -> CheckResult:
+        ass = build_ass(words, "Wait for the twist", DUR, caption_y, hook_y, seam=seam)
+        side = _sidecar(layout=scenes, seam=seam, zoom_steps=[[0.0, 1.0]], cut_times=[2.5, 5.0])
+        return _by_id(audit_clip(good_mp4, side, _ass(tmp_path, ass)))["Q4b"]
+
+    # first-3-s-only placement: the EARLIER tag lands at the top, on the close-up's face
+    stale = audit(caption_y_for(lays), hook_y_for(lays))
+    assert not stale.ok and "hook" in stale.detail
+    fixed = audit(caption_y_for(lays, until=until), hook_y_for(lays, until=until))
+    assert fixed.ok, fixed
+    assert hook_y_for(lays, until=until) > 806  # tag below the face, above the captions

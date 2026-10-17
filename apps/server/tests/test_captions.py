@@ -517,3 +517,13 @@ def test_group_breaks_after_closing_quote():
     for end in ('."', '!"', '?"'):
         g = group_words([w(0, 0.3, "said" + end), w(0.3, 0.6, "Then")])
         assert len(g) == 2, end
+
+
+def test_early_until_covers_hook_tag_and_groups_shown_with_them():
+    from hookline.captions.ass import early_until
+
+    assert early_until([], "Hook", 20) == 3.0
+    assert early_until([], "Hook", 20, seam=5.0) == pytest.approx(5.8)
+    # a group starting under the hook (2.8 s) holds until the next one (3.6 s, gap <= 1 s)
+    ws = [w(2.6, 2.8, "SO."), w(2.8, 3.4, "LONG."), w(3.6, 4.0, "NEXT.")]
+    assert early_until(ws, "Hook", 20) == pytest.approx(3.6)

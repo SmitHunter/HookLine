@@ -6,7 +6,7 @@ import os
 import re
 from pathlib import Path
 
-from hookline.captions.ass import build_ass, caption_y_for, hook_y_for
+from hookline.captions.ass import build_ass, caption_y_for, early_until, hook_y_for
 from hookline.config import Settings
 from hookline.fsutil import atomic_write_text
 from hookline.media.audio import detect_silences
@@ -245,12 +245,14 @@ def render_clip(
     ass_ref: dict = {"ass": None, "ass_sha1": None}
     if settings.captions:
         ass = work_dir / f"{name}.ass"
+        # the early line and the hook/tag position see every scene shown with hook or tag
+        until = early_until(out_words, pick.hook_text, duration, seam)
         text = build_ass(
             out_words,
             pick.hook_text,
             duration,
-            caption_y_for(layouts),
-            hook_y_for(layouts),
+            caption_y_for(layouts, until=until),
+            hook_y_for(layouts, until=until),
             seam=seam,
             caption_y_late=caption_y_for(layouts, late=True),
         )
