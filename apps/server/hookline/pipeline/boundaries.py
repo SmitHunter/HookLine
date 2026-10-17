@@ -21,7 +21,7 @@ FILLER_OPENERS: tuple[str, ...] = (
 _MAX_FILLER_WORDS = 3
 _MIN_MAIN_S = 15.0
 _SNAP_MARGIN_S = 0.05
-_PUNCTUATION = ",.!?…\"'"
+_PUNCTUATION = ",.!?…\"'-:;–—‘’“”"
 
 
 def _norm(word: Word) -> str:
@@ -61,23 +61,37 @@ def refine_boundaries(
     Never moves `start` past the first remaining word's start, nor `end` before the last
     word's end. Pure: no I/O."""
     start, end = pick.start, pick.end
-    clip_words = [w for w in words if start - 1e-6 <= w.start < end]
-    start = _trim_fillers(start, end, clip_words)
+    idxs = [i for i, w in enumerate(words) if start - 1e-6 <= w.start < end]
+    start = _trim_fillers(start, end, [words[i] for i in idxs])
 
-    first_start = next((w.start for w in clip_words if w.start >= start - 1e-6), None)
-    last_end = max((w.end for w in clip_words), default=None)
+    first_idx = next((i for i in idxs if words[i].start >= start - 1e-6), None)
+    last_idx = idxs[-1] if idxs else None
 
-    for s_start, s_end in silences:
-        if s_start < start + window and s_end > start - window:
-            start = s_end - _SNAP_MARGIN_S
-            break
-    for s_start, s_end in silences:
-        if s_start < end + window and s_end > end - window:
-            end = s_start + _SNAP_MARGIN_S
-            break
+    lo, hi = 0.0, float("inf")  # a snap may only move into the gap between words
+    first_start = last_end = None
+    if first_idx is not None and last_idx is not None:
+        first_start, last_end = words[first_idx].start, words[last_idx].end
+        if first_idx > 0:
+            lo = words[first_idx - 1].end
+        if last_idx + 1 < len(words):
+            hi = words[last_idx + 1].start
 
-    if first_start is not None:
-        start = min(start, first_start)
-    if last_end is not None:
-        end = max(end, last_end)
+    near = _nearest_silence(silences, start, window)
+    if near:
+        start = near[1] - _SNAP_MARGIN_S
+    near = _nearest_silence(silences, end, window)
+    if near:
+        end = near[0] + _SNAP_MARGIN_S
+
+    if first_start is not None and last_end is not None:
+        start = min(max(start, lo), first_start)
+        end = max(min(end, hi), last_end)
     return pick.model_copy(update={"start": start, "end": end})
+
+
+def _nearest_silence(
+    silences: list[tuple[float, float]], boundary: float, window: float
+) -> tuple[float, float] | None:
+    """The silence overlapping [boundary - window, boundary + window] closest to `boundary`."""
+    hits = [s for s in silences if s[0] < boundary + window and s[1] > boundary - window]
+    return min(hits, key=lambda s: max(s[0] - boundary, boundary - s[1], 0.0), default=None)

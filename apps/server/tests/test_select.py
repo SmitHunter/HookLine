@@ -433,3 +433,11 @@ def test_raw_sink_receives_every_payload(long_transcript, fake_llm, settings):
     sink: list[dict] = []
     select_clips(long_transcript, fake_llm, settings, raw_sink=sink)
     assert sink == [first, EMPTY]
+
+
+def test_cold_open_without_whole_words_logs_reason(long_transcript, fake_llm, settings, caplog):
+    # 46.75-46.78 falls between words: snapped start (46.8) is after snapped end (46.7)
+    msgs = _cold_open_warnings(
+        caplog, fake_llm, long_transcript, settings, raw(30, 60, cold_open=(46.75, 46.78))
+    )
+    assert len(msgs) == 1 and "no whole words fit" in msgs[0]

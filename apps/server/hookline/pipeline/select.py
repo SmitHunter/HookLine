@@ -278,7 +278,7 @@ def _snap_to_words(start: float, end: float, words: list[Word]) -> tuple[float, 
     at/before `end + 0.2`. None if no words qualify or they do not form a span."""
     starts = [w.start for w in words if w.start >= start - _COLD_OPEN_TOLERANCE_S]
     ends = [w.end for w in words if w.end <= end + _COLD_OPEN_TOLERANCE_S]
-    if not starts or not ends:
+    if not starts or not ends or starts[0] >= ends[-1]:
         return None
     return starts[0], ends[-1]
 
@@ -293,7 +293,7 @@ def _cold_open(raw: _RawClip, pick: ClipPick, words: list[Word]) -> tuple[float,
         return None
     snapped = _snap_to_words(raw.cold_open_start, raw.cold_open_end, words)
     if snapped is None:
-        _drop_cold_open(raw, "no words inside the cold open range")
+        _drop_cold_open(raw, "no whole words fit inside the cold open range")
         return None
     co_s, co_e = snapped
     if not pick.start <= co_s < co_e <= pick.end:
