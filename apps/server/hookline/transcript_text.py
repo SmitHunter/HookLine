@@ -1,3 +1,4 @@
+import re
 from bisect import bisect_left
 
 from hookline.models import Sentence, Word
@@ -37,22 +38,67 @@ def split_sentences(
     return sentences
 
 
+_ABBREVIATIONS = {"mr.", "mrs.", "ms.", "dr.", "st.", "vs.", "etc.", "e.g.", "i.e."}
+_DOTTED_RE = re.compile(r"^(?:[a-z]\.){2,}$", re.IGNORECASE)  # U.S., U.K.
+_ACRONYM_PAUSE_S = 0.3
+_SOFT_MIN_S = 10.0  # a soft split leaves a line of at least this long ...
+_SOFT_DECIDE_S = 20.0  # ... and is decided once the run would pass this length
+_SOFT_GAP_S = 1.0  # ... at a word gap of at least this long
+
+
+def _ends_line(word: Word, nxt: Word | None) -> bool:
+    """Terminal punctuation for selection lines: not an ellipsis, not an abbreviation; a
+    dotted acronym (U.S.) ends a sentence only before a capitalised word after a 0.3 s pause."""
+    text = word.text.strip().rstrip(_TRAILING)
+    if not ends_sentence(text) or text.endswith(("...", "…")):
+        return False
+    if text.lower().lstrip("\"'“‘(") in _ABBREVIATIONS:
+        return False
+    if _DOTTED_RE.match(text.lstrip("\"'“‘(")):
+        return (
+            nxt is not None
+            and nxt.text.strip().lstrip("\"'“‘(")[:1].isupper()
+            and nxt.start - word.end >= _ACRONYM_PAUSE_S
+        )
+    return True
+
+
+def _longest_gap_cut(buf: list[Word], nxt: Word, min_left_s: float, min_gap_s: float) -> int:
+    """Cut index (words before it form a line) at the longest gap (latest on a tie) whose
+    left part lasts >= `min_left_s` and which is >= `min_gap_s`; 0 when there is none."""
+    best, best_gap = 0, min_gap_s
+    for k, (a, b) in enumerate(zip(buf, [*buf[1:], nxt], strict=True)):
+        gap = b.start - a.end
+        if a.end - buf[0].start >= min_left_s and gap >= best_gap:
+            best, best_gap = k + 1, gap
+    return best
+
+
 def selection_lines(words: list[Word], max_len_s: float = 25.0) -> list[Sentence]:
-    """Sentences for clip selection: split ONLY on terminal punctuation (.!? before any closing
-    quotes or brackets), never on a pause. A run that would exceed `max_len_s` without
-    punctuation is split at its longest word gap (the latest one on a tie)."""
+    """Sentences for clip selection. Split on terminal punctuation (.!? before any closing
+    quotes or brackets; not "..." / "…", abbreviations such as "Mr." or "e.g.", or a dotted
+    acronym unless a capitalised word follows a 0.3 s pause), never on an ordinary pause.
+
+    Lightly punctuated speech (Twitch): a run that would pass 20 s without punctuation is
+    split at its longest gap >= 1.0 s that leaves a line of >= 10 s, so such lines run
+    ~10-20 s. Hard cap: a run that would exceed `max_len_s` is split at its longest word gap
+    (the latest one on a tie)."""
     lines: list[Sentence] = []
     buf: list[Word] = []
     for i, word in enumerate(words):
         buf.append(word)
         nxt = words[i + 1] if i + 1 < len(words) else None
-        if nxt is None or ends_sentence(word.text):
+        if nxt is None or _ends_line(word, nxt):
             lines.append(_make(buf))
             buf = []
             continue
+        if nxt.end - buf[0].start > _SOFT_DECIDE_S:
+            cut = _longest_gap_cut(buf, nxt, _SOFT_MIN_S, _SOFT_GAP_S)
+            if cut:
+                lines.append(_make(buf[:cut]))
+                buf = buf[cut:]
         while buf and nxt.end - buf[0].start > max_len_s:
-            gaps = [b.start - a.end for a, b in zip(buf, [*buf[1:], nxt], strict=True)]
-            cut = max(range(len(gaps)), key=lambda k: (gaps[k], k)) + 1
+            cut = _longest_gap_cut(buf, nxt, 0.0, float("-inf"))
             lines.append(_make(buf[:cut]))
             buf = buf[cut:]
     return lines

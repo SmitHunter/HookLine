@@ -1,3 +1,5 @@
+import pytest
+
 from hookline.models import ClipPick, Sentence, Word
 from hookline.transcript_text import compact_transcript, format_timestamp, split_sentences
 
@@ -154,3 +156,66 @@ def test_selection_lines_cap_every_run_at_25s():
     lines = selection_lines(words)
     assert all(s.end - s.start <= 25.0 for s in lines) and len(lines) >= 4
     assert selection_lines([]) == []
+
+
+# --- fix round 1: ellipses, abbreviations, lightly punctuated (Twitch) speech -------------
+
+
+def _texts(words):
+    from hookline.transcript_text import selection_lines
+
+    return [s.text for s in selection_lines(words)]
+
+
+@pytest.mark.parametrize("trail", ["going...", "going…"])
+def test_selection_lines_ellipsis_is_not_terminal(trail):
+    words = [w(0, 0.3, "I"), w(0.4, 0.7, "was"), w(0.8, 1.1, trail), w(2.0, 2.3, "home.")]
+    assert _texts(words) == [f"I was {trail} home."]
+
+
+@pytest.mark.parametrize(
+    "abbr", ["Mr.", "Mrs.", "Ms.", "Dr.", "St.", "vs.", "etc.", "e.g.", "i.e."]
+)
+def test_selection_lines_abbreviations_are_not_terminal(abbr):
+    words = [w(0, 0.3, "Ask"), w(0.4, 0.7, abbr), w(1.2, 1.5, "Smith"), w(1.6, 1.9, "now.")]
+    assert _texts(words) == [f"Ask {abbr} Smith now."]
+
+
+def test_dotted_acronym_ends_a_sentence_only_before_a_capital_after_a_pause():
+    def run(nxt, gap):
+        words = [w(0, 0.3, "in"), w(0.4, 0.8, "the"), w(0.9, 1.3, "U.S.")]
+        return _texts([*words, w(1.3 + gap, 1.6 + gap, nxt), w(1.7 + gap, 2.0 + gap, "go.")])
+
+    assert run("And", 0.5) == ["in the U.S.", "And go."]
+    assert run("And", 0.1) == ["in the U.S. And go."]
+    assert run("economy", 0.5) == ["in the U.S. economy go."]
+
+
+def _stream(seconds=60.0):
+    """Unpunctuated chatter: 0.25 s words every 0.35 s, with a 1.2 s pause every 3-8 s."""
+    words, t, k, since = [], 0.0, 0, 0.0
+    pauses = [3.0, 5.5, 8.0, 4.0, 6.5, 3.5, 7.0, 5.0]
+    while t < seconds:
+        words.append(w(round(t, 3), round(t + 0.25, 3), f"word{len(words)}"))
+        t += 0.35
+        since += 0.35
+        if since >= pauses[k % len(pauses)]:
+            t += 1.2
+            since, k = 0.0, k + 1
+    return words
+
+
+def test_unpunctuated_stream_splits_into_10_to_20s_lines():
+    from hookline.transcript_text import selection_lines
+
+    lines = selection_lines(_stream())
+    lengths = [s.end - s.start for s in lines[:-1]]  # the last line is whatever is left
+    assert all(d <= 25.0 for d in lengths) and len(lengths) >= 2
+    assert sum(10.0 <= d <= 20.0 for d in lengths) / len(lengths) >= 0.8, lengths
+
+
+def test_soft_split_never_cuts_at_a_short_gap():
+    from hookline.transcript_text import selection_lines
+
+    words = [w(round(i * 0.6, 2), round(i * 0.6 + 0.5, 2), f"w{i}") for i in range(30)]  # 18 s
+    assert len(selection_lines(words)) == 1  # gaps of 0.1 s: under 25 s nothing splits
