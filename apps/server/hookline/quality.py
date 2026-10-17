@@ -6,7 +6,7 @@ import re
 import subprocess
 import tempfile
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from difflib import SequenceMatcher
 from itertools import pairwise
 from pathlib import Path
@@ -116,14 +116,21 @@ _FSCX_RE = re.compile(r"\\fscx(\d+)")
 
 @dataclass(frozen=True)
 class CheckResult:
+    """One check's outcome. A warning (`warn`) passes (`ok`) but is reported as WARN."""
+
     id: str
     ok: bool
     value: float | str | None
     threshold: str
     detail: str = ""
+    warn: bool = False
+
+    @property
+    def status(self) -> Literal["pass", "warn", "fail"]:
+        return "fail" if not self.ok else "warn" if self.warn else "pass"
 
     def as_dict(self) -> dict:
-        return asdict(self)
+        return {**asdict(self), "status": self.status}
 
 
 @dataclass(frozen=True)
@@ -466,11 +473,25 @@ def first_words_match(first_words: str, spoken: str) -> float:
 
 
 def _check_opening(
-    words: list[Word] | None, first_words: str, seam: float | None, declared: bool = False
+    words: list[Word] | None,
+    first_words: str,
+    seam: float | None,
+    declared: bool = False,
+    moved: dict | None = None,
+    actual_first_words: str = "",
 ) -> CheckResult:
     """Q6: speech by 0.5 s, and the opening (after a cold-open seam, where the declared first
     sentence begins) matches `first_words` in order. `declared` marks Claude's own first_words
-    (`declared_first_words`), not the start the boundary code moved to."""
+    (`declared_first_words`), not the start the boundary code moved to. When the opener guard
+    recorded a move (`moved`: from_line, to_line, reason), the opening is checked against
+    `actual_first_words` (where the clip now starts) and a pass is a WARN naming the move."""
+    if moved:
+        res = _check_opening(words, actual_first_words, seam)
+        if not res.ok:
+            return res
+        move = f"L{moved.get('from_line')} -> L{moved.get('to_line')}"
+        detail = f"{res.detail}; opener guard moved the start {move}: {moved.get('reason', '')}"
+        return replace(res, detail=detail, warn=True)
     thr = f"speech <= {SPEECH_START_MAX:g}s, first_words match >= {FIRST_WORDS_MIN:.0%}"
     if words is None:
         return CheckResult("Q6", False, None, thr, "no caption_words in sidecar (re-render)")
@@ -571,6 +592,8 @@ def audit_clip(
             sidecar.get("declared_first_words") or sidecar.get("first_words") or "",
             sidecar.get("seam"),
             declared=bool(sidecar.get("declared_first_words")),
+            moved=sidecar.get("opener_moved"),
+            actual_first_words=sidecar.get("first_words") or "",
         ),
         _check_pacing(sidecar, duration),
         _check_encode(_probe(mp4)),
@@ -616,9 +639,14 @@ def audit_job(out_dir: Path, work_dir: Path) -> dict:
                 "clip": mp4.name,
                 "ass": str(ass) if ass else None,
                 "ok": all(r.ok for r in results),
+                "warnings": sum(r.status == "warn" for r in results),
                 "checks": [r.as_dict() for r in results],
             }
         )
-    report = {"ok": bool(clips) and all(c["ok"] for c in clips), "clips": clips}
+    report = {
+        "ok": bool(clips) and all(c["ok"] for c in clips),
+        "warnings": sum(c["warnings"] for c in clips),
+        "clips": clips,
+    }
     atomic_write_text(out_dir / "audit.json", json.dumps(report, indent=2, ensure_ascii=False))
     return report

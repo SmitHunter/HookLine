@@ -23,6 +23,7 @@ from hookline.models import (
     ClipPick,
     CommentRisk,
     HookType,
+    OpenerMove,
     RubricScores,
     Sentence,
     Transcript,
@@ -30,6 +31,7 @@ from hookline.models import (
     Word,
 )
 from hookline.pipeline.boundaries import FILLER_OPENERS
+from hookline.pipeline.deadair import MIN_PIECE_S
 from hookline.pipeline.signals import CLIP_MARKER
 from hookline.transcript_text import (
     compact_transcript,
@@ -153,7 +155,8 @@ may be as short as 12 seconds.
 Tuesday? No, the Monday."), an interviewer's backchannel or interjection, a one-line \
 tangent. This is how a story keeps its payoff under the maximum length: drop the detours \
 instead of cutting the ending. The length counts without the dropped lines. Leave it empty \
-when nothing needs cutting, and never drop a line the payoff depends on.
+when nothing needs cutting. Never drop a line the payoff depends on, and never drop a \
+question whose answer is kept: the viewer would hear "No, never." with no question before it.
 - Keep candidates distinct: they must not overlap each other in time, and avoid two clips on \
 the same theme; spread them across categories.
 - Moments that name famous people, brands or institutions are high-value for search; include \
@@ -368,8 +371,8 @@ _OPENER_FILLERS = ("um", "uh", "yeah", "okay", "ok", "well", "like", "oh", "anyw
 _OPENER_FILLERS += ("i mean", "you know")
 _CONTEXT_OPENERS = {"and", "so", "but", "because", "which"}
 # Matched on the lowercased text after fillers. "I like pizza" is fine; "I was like, ..." and
-# "I like, ..." quote a conversation. A self-quote with content ("I said, Hi, I'm here to
-# borrow your equipment.") is deliberately allowed: it works cold.
+# "I like, ..." quote a conversation. A self-quote with content ("I said, Hi, I'm here about
+# the broken boiler.") is deliberately allowed: it works cold.
 _QUOTED_OPENER_RE = re.compile(
     r"(?:i|he|she|they|we)(?:(?: was| were|'m| am| is| are) like\b| like[,\"“”'‘’])"
     r"|(?:he|she|they) (?:goes|go|went|said|says)\b"
@@ -379,11 +382,22 @@ _GUARD_MAX_MOVE_S = 12.0
 # A first-person self-quote ("I was like, so you want me to work for free?") works cold once
 # the quoted part carries this many words; "I was like, no way." still leans on context.
 _SELF_QUOTE_MIN_WORDS = 4
-# Leading filler stripped from a clip's first word: "um"/"uh" always; "Like," / "I mean," /
-# "you know," only with their comma ("You know what she did?" is the sentence itself).
+# Leading filler stripped from a clip's first word: "um"/"uh" always; the other opener fillers
+# ("Like,", "Okay,", "Well,", "I mean,") only with their comma ("You know what she did?" is
+# the sentence itself).
 _START_FILLERS = ("um", "umm", "uh", "uhh", "erm")
-_COMMA_FILLERS = ("like", "i mean", "you know")
+_COMMA_FILLERS = _OPENER_FILLERS
 _MAX_DROP_LINES = 3
+# A dropped question is kept when the next kept line answers it: it opens on one of these, or
+# repeats >= half of the question's content words (words not in _FUNCTION_WORDS).
+_ANSWER_OPENERS = ("no", "yes", "yeah", "nope", "sure", "absolutely", "not really")
+_ANSWER_MIN_SHARE = 0.5
+_FUNCTION_WORDS = {"i", "you", "he", "she", "it", "we", "they", "me", "him", "her", "us"}
+_FUNCTION_WORDS |= {"them", "my", "your", "his", "its", "our", "their", "this", "that"}
+_FUNCTION_WORDS |= {"a", "an", "the", "and", "or", "but", "so", "of", "to", "in", "on", "at"}
+_FUNCTION_WORDS |= {"for", "with", "do", "did", "does", "is", "are", "was", "were", "be"}
+_FUNCTION_WORDS |= {"been", "have", "has", "had", "can", "could", "would", "will", "what"}
+_FUNCTION_WORDS |= {"why", "how", "who", "when", "where", "not", "if", "any", "there"}
 _EXTEND_ACROSS_S = 20.0  # an unfinished ending may reach past one backchannel within this
 # Function words a truncated search title must not end on.
 _DANGLING = {"a", "an", "the", "and", "or", "but", "nor", "for", "to", "of", "with", "in"}
@@ -634,10 +648,12 @@ def _drop_ranges(src: "_Source", lines: list[int]) -> list[tuple[float, float]]:
     return out
 
 
-def _span(src: "_Source", first: int, last: int, drop_lines: list[int]) -> float:
-    """Length of L{first}..L{last} without the (at most 3) drop_lines inside it."""
-    lines = sorted({d for d in drop_lines if first < d < last})[:_MAX_DROP_LINES]
-    removed = sum(b - a for a, b in _drop_ranges(src, lines))
+def _span(src: "_Source", first: int, last: int, raw: "_RawClip") -> float:
+    """Length of L{first}..L{last} without the drop_lines `_to_pick` would cut for that span
+    (the same final set: lines holding a kept teaser, answered questions and lines that would
+    leave a choppy piece are restored)."""
+    ranges, _ = _drop_plan(raw, first, last, src)
+    removed = sum(b - a for a, b in ranges)
     return src.sentences[last].end - src.sentences[first].start - removed
 
 
@@ -679,7 +695,7 @@ def _fix_ending(raw: _RawClip, first: int, last: int, src: _Source) -> int:
     if _is_finished(sents[last].text):
         return last
     for j in range(last + 1, min(last + _EXTEND_MAX_LINES, len(sents) - 1) + 1):
-        if _span(src, first, j, raw.drop_lines) > cap:
+        if _span(src, first, j, raw) > cap:
             break
         if _is_backchannel(toks[j]):
             k = j + 1
@@ -688,7 +704,7 @@ def _fix_ending(raw: _RawClip, first: int, last: int, src: _Source) -> int:
                 and not _is_backchannel(toks[k])
                 and _is_finished(sents[k].text)
                 and sents[k].end - sents[last].end <= _EXTEND_ACROSS_S
-                and _span(src, first, k, raw.drop_lines) <= cap
+                and _span(src, first, k, raw) <= cap
             ):
                 logger.info(
                     "clip %r: L%d is unfinished; extended to L%d across the backchannel L%d",
@@ -708,8 +724,9 @@ def _fix_ending(raw: _RawClip, first: int, last: int, src: _Source) -> int:
     return last
 
 
-def _drop_cold_open(raw: _RawClip, reason: str) -> None:
-    logger.warning("dropped cold open for clip %r: %s", raw.title, reason)
+def _drop_cold_open(raw: _RawClip, log: bool, reason: str) -> None:
+    if log:
+        logger.warning("dropped cold open for clip %r: %s", raw.title, reason)
 
 
 def _word_norm(text: str) -> str:
@@ -799,22 +816,24 @@ def _extend_teaser_back(words: list[Word], i: int, k: int, src: _Source) -> int 
     return None
 
 
-def _cold_open(raw: _RawClip, first: int, last: int, src: _Source) -> tuple[float, float] | None:
+def _cold_open(
+    raw: _RawClip, first: int, last: int, src: _Source, log: bool = True
+) -> tuple[float, float] | None:
     """Where the verbatim `cold_open_words` are spoken inside the clip, without leading fillers
     and lead-ins ("I think", "the thing is"), ending on the first sentence end at or after the
     declared words, all within 6 s (else on an earlier sentence end within 6 s). None (with a
-    logged reason) when it cannot be used."""
+    logged reason, unless `log` is False) when it cannot be used."""
     text = (raw.cold_open_words or "").strip()
     if not _tokens(text):
         return None
     sents = src.sentences
     found = _teaser(raw, first, last, src)
     if found is None:
-        _drop_cold_open(raw, f"{text!r} not found in the clip (L{first}-L{last})")
+        _drop_cold_open(raw, log, f"{text!r} not found in the clip (L{first}-L{last})")
         return None
     words, i, j = found
     if words[i].start < sents[first].end - 1e-6:
-        _drop_cold_open(raw, f"{text!r} starts in the clip's first sentence (L{first})")
+        _drop_cold_open(raw, log, f"{text!r} starts in the clip's first sentence (L{first})")
         return None
     t0 = words[i].start
     ends = [
@@ -827,15 +846,21 @@ def _cold_open(raw: _RawClip, first: int, last: int, src: _Source) -> tuple[floa
         k = after[0]
     elif ends:
         k = ends[-1]
-        logger.info("clip %r: cold open cut to the sentence ending %r", raw.title, words[k].text)
+        if log:
+            logger.info(
+                "clip %r: cold open cut to the sentence ending %r", raw.title, words[k].text
+            )
     else:
-        _drop_cold_open(raw, f"{text!r} does not finish a sentence within {_COLD_OPEN_MAX_S:.0f}s")
+        _drop_cold_open(
+            raw, log, f"{text!r} does not finish a sentence within {_COLD_OPEN_MAX_S:.0f}s"
+        )
         return None
     if words[k].end - t0 < _COLD_OPEN_MIN_S:
         back = _extend_teaser_back(words, i, k, src)
         if back is None or words[back].start < sents[first].end - 1e-6:
             _drop_cold_open(
                 raw,
+                log,
                 f"{text!r} is under {_COLD_OPEN_MIN_S}s and its sentence has no earlier words "
                 "(after lead-ins) to reach it",
             )
@@ -849,7 +874,7 @@ def _bad_opener(words: list[Word]) -> bool:
     or (after fillers such as "um" / "yeah", and after a bare And/So followed by a 0.3 s pause,
     which the filler trimmer removes) on And/So/But/Because/Which or a quoted conversation
     ("he goes ...", "they said ...", "I was like, no."). A first-person self-quote whose quoted
-    part has >= 4 words ("I was like, so you think it's worth it?") is not weak."""
+    part has >= 4 words ("I was like, so you want me to drive all night?") is not weak."""
     text = " ".join(w.text.strip() for w in words).strip()
     if not text:
         return False
@@ -887,8 +912,11 @@ def _sentence_words(src: _Source, line: int) -> list[Word]:
 
 
 def _weak_start(src: _Source, line: int) -> bool:
+    """Whether a clip may not start on L{line}: a backchannel, or a line that is still a bad
+    or filler-led opener once its strippable leading filler ("Um,", "Like,", "Okay,") is cut."""
     words = _sentence_words(src, line)
-    return _bad_opener(words) or _is_backchannel(src.tokens[line]) or _filler_led(words)
+    rest = words[_strip_start_filler(words) :]
+    return _is_backchannel(src.tokens[line]) or _bad_opener(rest) or _filler_led(rest)
 
 
 def _filler_led(words: list[Word]) -> bool:
@@ -911,9 +939,10 @@ def _guard_opener(
     min_s: float,
     opening: list[Word] | None = None,
 ) -> int:
-    """Move a weak opening sentence forward by 1-2 sentences (at most 12 s, never onto a line
-    that opens with filler, nor onto or past the cold-open teaser's sentence) while the clip
-    keeps its minimum length (counted without drop_lines); otherwise keep it and log.
+    """Move a weak opening sentence forward by 1-2 sentences (at most 12 s, never onto a
+    dropped line, a backchannel or a line that is still a weak opener after its strippable
+    filler, nor onto or past the cold-open teaser's sentence) while the clip keeps its minimum
+    length (counted without drop_lines); otherwise keep it and log.
     `opening` is the first line's words from a mid-line start. Reaction peaks are exempt."""
     sents = src.sentences
     if opening is None:
@@ -926,24 +955,25 @@ def _guard_opener(
         cand = first + k
         if (
             cand > last
-            or _span(src, cand, last, raw.drop_lines) < min_s
+            or _span(src, cand, last, raw) < min_s
             or sents[cand].start - sents[first].start > _GUARD_MAX_MOVE_S
             or sents[cand].end > teaser_at + 1e-6  # never start on or past the teaser
         ):
             break
-        words = _sentence_words(src, cand)
-        if _filler_led(words):
-            logger.info("clip %r: L%d opens with filler; not a start", raw.title, cand)
+        if cand in raw.drop_lines:
+            logger.info("clip %r: L%d is a dropped line; not a start", raw.title, cand)
             continue
-        if not _bad_opener(words):
-            logger.info(
-                "clip %r: L%d is a weak opener (%r); start moved to L%d",
-                raw.title,
-                first,
-                sents[first].text,
-                cand,
-            )
-            return cand
+        if _weak_start(src, cand):
+            logger.info("clip %r: L%d is a weak start too; not a start", raw.title, cand)
+            continue
+        logger.info(
+            "clip %r: L%d is a weak opener (%r); start moved to L%d",
+            raw.title,
+            first,
+            sents[first].text,
+            cand,
+        )
+        return cand
     logger.warning(
         "clip %r: L%d is a weak opener (%r) with no clean start within 2 sentences / %.0fs; "
         "keeping it",
@@ -963,12 +993,12 @@ def _trim_front(raw: _RawClip, first: int, last: int, src: _Source, min_s: float
     tolerance); otherwise None (logged)."""
     sents = src.sentences
     cap = src.settings.max_clip_s
-    span = _span(src, first, last, raw.drop_lines)
+    span = _span(src, first, last, raw)
     found = _teaser(raw, first, last, src)
     teaser_at = found[0][found[1]].start if found else math.inf
     for limit in (cap, cap * 1.25):
         for c in range(first + 1, last + 1):
-            dur = _span(src, c, last, raw.drop_lines)
+            dur = _span(src, c, last, raw)
             if dur > limit:
                 continue
             if dur < min_s or sents[c].end > teaser_at + 1e-6:
@@ -1127,17 +1157,52 @@ def _strip_start_filler(words: list[Word]) -> int:
     return i
 
 
-def _drops(
-    raw: _RawClip, first: int, last: int, src: _Source, cold_open: tuple[float, float] | None
-) -> list[tuple[float, float]]:
-    """Source ranges to cut for the declared drop_lines: at most 3 lines strictly inside
-    L{first}..L{last}, none holding the cold-open teaser. Ignored lines are logged (warning),
-    and so is every line dropped."""
+def _answers(question: str, toks: list[str]) -> bool:
+    """Whether a line with tokens `toks` answers `question`: it opens on an answer word ("No,",
+    "Yes,", "Not really.") or repeats >= half of the question's content words."""
+    if any(toks[: len(a.split())] == a.split() for a in _ANSWER_OPENERS):
+        return True
+    content = {t for t in _tokens(question) if t not in _FUNCTION_WORDS}
+    return bool(content) and len(content & set(toks)) / len(content) >= _ANSWER_MIN_SHARE
+
+
+def _is_question(text: str) -> bool:
+    return text.rstrip().rstrip(_TRAILING_QUOTES).rstrip().endswith("?")
+
+
+def _drop_groups(lines: list[int]) -> list[list[int]]:
+    """The sorted `lines` grouped into runs of consecutive lines (one cut range each)."""
+    groups: list[list[int]] = []
+    for d in lines:
+        if groups and groups[-1][-1] == d - 1:
+            groups[-1].append(d)
+        else:
+            groups.append([d])
+    return groups
+
+
+def _drop_lines(
+    raw: _RawClip,
+    first: int,
+    last: int,
+    src: _Source,
+    cold_open: tuple[float, float] | None,
+    log: bool,
+) -> list[int]:
+    """The declared drop_lines that are actually cut: at most 3 lines strictly inside
+    L{first}..L{last}, none holding the cold-open teaser, no question whose next kept line
+    answers it, and none leaving a spoken piece shorter than MIN_PIECE_S between two drops (the
+    later drop is ignored). With `log`, every ignored line is logged (warning)."""
     sents = src.sentences
+
+    def warn(msg: str, *args: object) -> None:
+        if log:
+            logger.warning(msg, *args)
+
     lines = sorted(set(raw.drop_lines))
     outside = [d for d in lines if not first < d < last]
     if outside:
-        logger.warning(
+        warn(
             "clip %r: drop_lines %s ignored: not inside L%d-L%d (never the first or last line)",
             raw.title,
             ", ".join(f"L{d}" for d in outside),
@@ -1148,19 +1213,177 @@ def _drops(
     if cold_open:
         held = [d for d in lines if sents[d].start < cold_open[1] and sents[d].end > cold_open[0]]
         for d in held:
-            logger.warning("clip %r: drop_lines L%d ignored: it holds the cold open", raw.title, d)
+            warn("clip %r: drop_lines L%d ignored: it holds the cold open", raw.title, d)
         lines = [d for d in lines if d not in held]
     if len(lines) > _MAX_DROP_LINES:
-        logger.warning(
+        warn(
             "clip %r: at most %d drop_lines; ignored %s",
             raw.title,
             _MAX_DROP_LINES,
             ", ".join(f"L{d}" for d in lines[_MAX_DROP_LINES:]),
         )
         lines = lines[:_MAX_DROP_LINES]
-    for d in lines:
-        logger.info("clip %r: dropped L%d (%r)", raw.title, d, sents[d].text)
-    return _drop_ranges(src, lines)
+    for d in reversed(list(lines)):  # latest first: a restored answer may itself be a question
+        if not _is_question(sents[d].text):
+            continue
+        nxt = next((j for j in range(d + 1, last + 1) if j not in lines), None)
+        if nxt is not None and _answers(sents[d].text, src.tokens[nxt]):
+            warn(
+                "clip %r: drop_lines L%d ignored: it is a question the kept L%d answers",
+                raw.title,
+                d,
+                nxt,
+            )
+            lines.remove(d)
+    while True:
+        groups = _drop_groups(lines)
+        ranges = _drop_ranges(src, lines)
+        short = next(
+            (
+                i
+                for i in range(1, len(ranges))
+                if ranges[i][0] - ranges[i - 1][1] < MIN_PIECE_S - 1e-9
+                and _clip_words(src, ranges[i - 1][1], ranges[i][0])
+            ),
+            None,
+        )
+        if short is None:
+            return lines
+        warn(
+            "clip %r: drop_lines %s ignored: it would leave a %.2fs spoken piece (under %.1fs) "
+            "between jump cuts",
+            raw.title,
+            ", ".join(f"L{d}" for d in groups[short]),
+            ranges[short][0] - ranges[short - 1][1],
+            MIN_PIECE_S,
+        )
+        lines = [d for d in lines if d not in groups[short]]
+
+
+def _merge_wordless_pieces(
+    ranges: list[tuple[float, float]], src: _Source, label: str, log: bool = True
+) -> list[tuple[float, float]]:
+    """`ranges` with every piece shorter than MIN_PIECE_S between two of them that holds no
+    word swallowed by the earlier range (logged): a sliver of silence between jump cuts."""
+    out: list[tuple[float, float]] = []
+    for a, b in ranges:
+        if out and a - out[-1][1] < MIN_PIECE_S - 1e-9 and not _clip_words(src, out[-1][1], a):
+            if log:
+                logger.info(
+                    "clip %r: drop extended to swallow a wordless %.2fs piece at %.2fs",
+                    label,
+                    a - out[-1][1],
+                    out[-1][1],
+                )
+            out[-1] = (out[-1][0], b)
+        else:
+            out.append((a, b))
+    return out
+
+
+def _drop_plan(
+    raw: _RawClip,
+    first: int,
+    last: int,
+    src: _Source,
+    start: float | None = None,
+    log: bool = False,
+) -> tuple[list[tuple[float, float]], tuple[float, float] | None]:
+    """(source ranges cut for drop_lines, cold-open teaser) of the clip L{first}..L{last}
+    starting at `start` (default: L{first}'s start), exactly as `_to_pick` uses them. The
+    teaser holds its lines back from the drops unless the clip plus teaser would then exceed
+    1.25 x max_clip_s: the teaser is discarded and those drops stand. `log` logs each
+    decision (once, from `_to_pick`)."""
+    sents = src.sentences
+    t0 = sents[first].start if start is None else start
+    cold = _cold_open(raw, first, last, src, log=log)
+    if cold:
+        lines = _drop_lines(raw, first, last, src, cold, log=False)
+        main = sents[last].end - t0 - sum(b - a for a, b in _drop_ranges(src, lines))
+        max_s = src.settings.max_clip_s * 1.25
+        if main + (cold[1] - cold[0]) > max_s:
+            _drop_cold_open(raw, log, f"would push the clip over the {max_s:.0f}s maximum length")
+            cold = None
+    lines = _drop_lines(raw, first, last, src, cold, log=log)
+    if log:
+        for d in lines:
+            logger.info("clip %r: dropped L%d (%r)", raw.title, d, sents[d].text)
+    return _merge_wordless_pieces(_drop_ranges(src, lines), src, raw.title, log), cold
+
+
+def _opening(raw: _RawClip, first: int, src: _Source, offset: int) -> list[Word]:
+    """The clip's opening words on L{first} from word `offset`, after its strippable leading
+    filler (logged); empty when the clip starts on the line's first word."""
+    line_words = _sentence_words(src, first)
+    if offset:
+        logger.info(
+            "clip %r: first_words start mid-line in L%d; clip starts on %r",
+            raw.title,
+            first,
+            line_words[offset].text,
+        )
+    if n_filler := _strip_start_filler(line_words[offset:]):
+        logger.info(
+            "clip %r: leading filler %r stripped from the start",
+            raw.title,
+            " ".join(w.text for w in line_words[offset : offset + n_filler]),
+        )
+        offset += n_filler
+    return line_words[offset:] if offset else []
+
+
+def _assemble(
+    raw: _RawClip,
+    first: int,
+    last: int,
+    src: _Source,
+    opening: list[Word],
+    move: OpenerMove | None,
+) -> ClipPick:
+    """The pick for L{first}..L{last}, starting on `opening` (else on L{first}'s start)."""
+    start = opening[0].start if opening else src.sentences[first].start
+    start = min(max(start, 0.0), src.duration)
+    end = min(max(src.sentences[last].end, 0.0), src.duration)
+    drops, cold_open = _drop_plan(raw, first, last, src, start, log=True)
+    words = [w for w in _clip_words(src, start, end) if not any(a <= w.start < b for a, b in drops)]
+    return ClipPick(
+        start=start,
+        end=end,
+        title=_check_title(raw.title, _flat_tokens(words)[0], raw.title),
+        hook_text=raw.hook_text,
+        reason=raw.reason,
+        scores=_clamped_scores(raw.scores),
+        cold_open=cold_open,
+        edit_beats=_snap_beats(raw, words, start, end),
+        first_words=" ".join(w.text for w in opening) if opening else src.sentences[first].text,
+        declared_first_words=raw.first_words,
+        last_words=src.sentences[last].text,
+        hook_type=raw.hook_type,
+        verdict=raw.verdict,
+        post_caption=_check_caption(raw.post_caption, raw.title),
+        hashtags=_clean_hashtags(raw.hashtags, raw.title),
+        search_title=_clip_title(raw.search_title),
+        category=raw.category.strip(),
+        comment_risk=raw.comment_risk,
+        drops=drops,
+        opener_moved=move,
+    )
+
+
+def _main_duration(pick: ClipPick) -> float:
+    """The main span's length without its drops (the teaser not counted)."""
+    return pick.model_copy(update={"cold_open": None}).duration
+
+
+def _guard_move(
+    raw: _RawClip, first: int, last: int, src: _Source, min_s: float, opening: list[Word] | None
+) -> tuple[int, OpenerMove | None]:
+    """`_guard_opener`'s start line, with the move it made (None when it kept L{first})."""
+    line = _guard_opener(raw, first, last, src, min_s, opening)
+    if line == first:
+        return line, None
+    reason = f"L{first} is a weak opener ({src.sentences[first].text!r})"
+    return line, OpenerMove(from_line=first, to_line=line, reason=reason)
 
 
 def _to_pick(raw: _RawClip, src: _Source) -> ClipPick | None:
@@ -1191,7 +1414,7 @@ def _to_pick(raw: _RawClip, src: _Source) -> ClipPick | None:
         min_s = min(min_s, _REACTION_PEAK_MIN_S)
 
     def fits(a: int, b: int) -> bool:
-        return min_s <= _span(src, a, b, raw.drop_lines) <= max_s
+        return min_s <= _span(src, a, b, raw) <= max_s
 
     # Moving a boundary to match first_words / last_words must never cost the pick.
     if not fits(first, last) and first != given_first:
@@ -1210,71 +1433,36 @@ def _to_pick(raw: _RawClip, src: _Source) -> ClipPick | None:
             given_last,
         )
         last = given_last
-    line_words = _sentence_words(src, first)
     offset = _mid_line_offset(raw, first, src)
-    if _span(src, first, last, raw.drop_lines) > src.settings.max_clip_s:
-        trimmed = _trim_front(raw, first, last, src, min_s)
-        if trimmed is None:
+    move = None
+    if _span(src, first, last, raw) > src.settings.max_clip_s:
+        start_line = _trim_front(raw, first, last, src, min_s)
+        if start_line is None:
             return None
-        moved = trimmed != first
-        first = trimmed
     else:
-        guarded = _guard_opener(raw, first, last, src, min_s, line_words[offset:] or None)
-        moved = guarded != first
-        first = guarded
-    if moved:
-        line_words, offset = _sentence_words(src, first), 0
-    elif offset:
-        logger.info(
-            "clip %r: first_words start mid-line in L%d; clip starts on %r",
-            raw.title,
-            first,
-            line_words[offset].text,
-        )
-    if n_filler := _strip_start_filler(line_words[offset:]):
-        logger.info(
-            "clip %r: leading filler %r stripped from the start",
-            raw.title,
-            " ".join(w.text for w in line_words[offset : offset + n_filler]),
-        )
-        offset += n_filler
-    opening = line_words[offset:] if offset else []
-    start = opening[0].start if opening else src.sentences[first].start
-    start = min(max(start, 0.0), src.duration)
-    end = min(max(src.sentences[last].end, 0.0), src.duration)
-    cold_open = _cold_open(raw, first, last, src)
-    drops = _drops(raw, first, last, src, cold_open)
-    words = [w for w in _clip_words(src, start, end) if not any(a <= w.start < b for a, b in drops)]
-    pick = ClipPick(
-        start=start,
-        end=end,
-        title=_check_title(raw.title, _flat_tokens(words)[0], raw.title),
-        hook_text=raw.hook_text,
-        reason=raw.reason,
-        scores=_clamped_scores(raw.scores),
-        edit_beats=_snap_beats(raw, words, start, end),
-        first_words=" ".join(w.text for w in opening) if opening else src.sentences[first].text,
-        declared_first_words=raw.first_words,
-        last_words=src.sentences[last].text,
-        hook_type=raw.hook_type,
-        verdict=raw.verdict,
-        post_caption=_check_caption(raw.post_caption, raw.title),
-        hashtags=_clean_hashtags(raw.hashtags, raw.title),
-        search_title=_clip_title(raw.search_title),
-        category=raw.category.strip(),
-        comment_risk=raw.comment_risk,
-        drops=drops,
-    )
-    if not min_s <= pick.duration <= max_s:
+        opening = _sentence_words(src, first)[offset:] or None
+        start_line, move = _guard_move(raw, first, last, src, min_s, opening)
+    if start_line != first:
+        offset = 0
+    pick = _assemble(raw, start_line, last, src, _opening(raw, start_line, src, offset), move)
+    if pick.start > src.sentences[start_line].start and _main_duration(pick) < min_s:
+        # Only the mid-line start or the filler strip broke the minimum length: start on the
+        # whole line (judged by the opener guard again) rather than lose the pick.
         logger.warning(
-            "dropped clip %r: %.1fs is outside %.1f-%.1fs", raw.title, pick.duration, min_s, max_s
+            "clip %r: the cut start leaves %.1fs (under %.1fs); starting on the whole line",
+            raw.title,
+            _main_duration(pick),
+            min_s,
+        )
+        if move is None:
+            start_line, move = _guard_move(raw, start_line, last, src, min_s, None)
+        pick = _assemble(raw, start_line, last, src, [], move)
+    duration = _main_duration(pick)
+    if not min_s <= duration <= max_s:
+        logger.warning(
+            "dropped clip %r: %.1fs is outside %.1f-%.1fs", raw.title, duration, min_s, max_s
         )
         return None
-    if cold_open:
-        if pick.duration + (cold_open[1] - cold_open[0]) <= max_s:
-            pick = pick.model_copy(update={"cold_open": cold_open})
-        else:
-            _drop_cold_open(raw, f"would push the clip over the {max_s:.0f}s maximum length")
     if any(min(pick.end, e) - max(pick.start, s) > 0 for s, e in src.exclude):
         return None
     return pick

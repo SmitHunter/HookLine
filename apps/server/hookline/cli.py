@@ -163,14 +163,17 @@ def audit(job_id: Annotated[str, typer.Argument(help="Job id (the output/<job> f
         )  # fmt: skip
         raise typer.Exit(1)
     report = audit_job(out_dir, settings.workspace_dir / job_id)
-    failed = 0
+    failed = warned = 0
+    result = {"pass": "[green]PASS[/green]", "warn": "[yellow]WARN[/yellow]"}
     for clip in report["clips"]:
         table = Table("Check", "Result", "Value", "Threshold", "Detail", title=clip["clip"])
         for c in clip["checks"]:
-            failed += not c["ok"]
+            status = c.get("status") or ("pass" if c["ok"] else "fail")
+            failed += status == "fail"
+            warned += status == "warn"
             table.add_row(
                 c["id"],
-                "[green]PASS[/green]" if c["ok"] else "[red]FAIL[/red]",
+                result.get(status, "[red]FAIL[/red]"),
                 escape("" if c["value"] is None else str(c["value"])),
                 escape(c["threshold"]),
                 escape(c["detail"]),
@@ -179,7 +182,8 @@ def audit(job_id: Annotated[str, typer.Argument(help="Job id (the output/<job> f
     n_ok = sum(c["ok"] for c in report["clips"])
     style = "green" if report["ok"] else "red"
     console.print(
-        f"{n_ok}/{len(report['clips'])} clips pass; {failed} failed checks"
+        f"{n_ok}/{len(report['clips'])} clips pass; {failed} failed checks, "
+        f"{warned} warning{'' if warned == 1 else 's'}"
         f" - report: {out_dir / 'audit.json'}",
         style=style, highlight=False, markup=False,
     )  # fmt: skip

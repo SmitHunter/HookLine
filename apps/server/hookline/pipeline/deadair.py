@@ -3,6 +3,7 @@ from hookline.models import Word
 MIN_RANGE = 0.05
 MIN_PIECE_S = 1.5  # a cut may not leave a kept piece shorter than this (choppy jump cuts)
 MIN_WORD_S = 0.05  # captions drop shorter words; edge-clipped words are stretched to this
+DEFAULT_FPS = 30.0  # for the one-frame sliver threshold when the clip's fps is unknown
 
 
 def _word_free(
@@ -83,14 +84,20 @@ MERGE_GAP_S = 0.15
 
 
 def snap_ranges(
-    keep: list[tuple[float, float]], fps: float, merge_gap: float = MERGE_GAP_S
+    keep: list[tuple[float, float]],
+    fps: float,
+    merge_gap: float = MERGE_GAP_S,
+    keep_gaps: list[tuple[float, float]] | None = None,
 ) -> list[tuple[float, float]]:
     """Merge each range into the previous one when it starts less than `merge_gap` after it
-    ends (forward gaps only), then snap every bound to the source frame grid (k / fps) and
+    ends (forward gaps only), unless the gap overlaps one of `keep_gaps` (explicit drops are
+    intentional, however short), then snap every bound to the source frame grid (k / fps) and
     drop ranges that become empty. The output timeline is then exactly sum(end - start)."""
     merged: list[tuple[float, float]] = []
     for start, end in keep:
-        if merged and 0 <= start - merged[-1][1] < merge_gap:
+        gap = (merged[-1][1], start) if merged else (0.0, 0.0)
+        explicit = any(min(gap[1], b) - max(gap[0], a) > 1e-9 for a, b in keep_gaps or [])
+        if merged and 0 <= start - merged[-1][1] < merge_gap and not explicit:
             merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
         else:
             merged.append((start, end))
@@ -102,8 +109,12 @@ def snap_ranges(
     return out
 
 
-def remap_words(words: list[Word], keep: list[tuple[float, float]]) -> list[Word]:
-    """Move word timings onto the output timeline of the kept ranges."""
+def remap_words(
+    words: list[Word], keep: list[tuple[float, float]], fps: float | None = None
+) -> list[Word]:
+    """Move word timings onto the output timeline of the kept ranges. A word a range edge
+    clips to less than one frame (1 / fps; 30 fps when unknown) is left out of that range."""
+    frame = 1 / (fps or DEFAULT_FPS)
     out: list[Word] = []
     offset = 0.0
     for k_start, k_end in keep:
@@ -112,7 +123,10 @@ def remap_words(words: list[Word], keep: list[tuple[float, float]]) -> list[Word
             end = min(word.end, k_end)
             if end <= start:
                 continue
-            if end - start < MIN_WORD_S and (word.start < k_start or word.end > k_end):
+            clipped = word.start < k_start or word.end > k_end
+            if clipped and end - start < frame - 1e-9:
+                continue  # a sliver of a word cut away at the seam: no caption flash
+            if end - start < MIN_WORD_S and clipped:
                 # A cut clipped this word to a sliver: keep it visible, inside the range.
                 if word.end > k_end:
                     start = max(k_start, end - MIN_WORD_S)

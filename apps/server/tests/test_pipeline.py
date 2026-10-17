@@ -521,11 +521,15 @@ def test_packaging_pass_runs_once_and_fixes_captions(
         "hashtags": ["linecook", "kitchenlife", "chefstories"],
         "search_title": "Line Cook Handed the Kitchen Keys at 19",
         "verdict": "post",
-        "caption_fixes": [{"index": 1, "text": "sails"}],
+        "caption_fixes": [{"index": 1, "original": "says", "text": "sails"}],
     }
     fake_llm.queue(make_payload_for(150, 1, 21), {"clips": [answer]})
     t = FakeTranscriber(duration=150)
-    (clip,) = run_job(str(fixture_video), s, fake_llm, t)
+    logs: list[str] = []
+    (clip,) = run_job(str(fixture_video), s, fake_llm, t, logs.append)
+    assert "[5/6] select: packaging started" in logs
+    assert any(x.startswith("[5/6] select: packaging done") for x in logs)
+    assert not any("package:" in x for x in logs)  # one stage, one label
     side = json.loads(clip.with_suffix(".json").read_text(encoding="utf-8"))
     assert side["hook_text"] == "Kitchen keys at nineteen"
     assert side["search_title"] == "Line Cook Handed the Kitchen Keys at 19"

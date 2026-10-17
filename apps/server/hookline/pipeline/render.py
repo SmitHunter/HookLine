@@ -205,6 +205,7 @@ def render_clip(
             words=near if protect_words else None,
         ),
         fps,
+        keep_gaps=refined.drops,
     )
 
     inter = cut_segments(
@@ -217,7 +218,7 @@ def render_clip(
     crop, bands = letterbox, None
 
     duration = probe_duration(inter)
-    out_words = remap_words(near, keep)
+    out_words = remap_words(near, keep, fps)
     cuts = cut_times_for(keep)
     layouts: list[SceneLayout] = []
     steps: list[tuple[float, float]] = []

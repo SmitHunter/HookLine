@@ -23,7 +23,7 @@ from hookline.vision.faces import FaceDetector
 
 STAGES = 6
 PICKS_SCHEMA = 4  # bump when picks change shape or meaning, so old picks.json re-select
-PACKAGE_SCHEMA = 1  # bump when the packaging pass changes, so old package.json re-runs
+PACKAGE_SCHEMA = 2  # bump when the packaging pass changes, so old package.json re-runs
 
 
 def transcript_key(transcriber: Transcriber) -> dict:
@@ -129,11 +129,11 @@ def _package(
         try:
             data = json.loads(ppath.read_text(encoding="utf-8"))
             if data["key"] == key:
-                log("[5/6] package: skipped (cached)")
+                log("[5/6] select: packaging skipped (cached)")
                 return [ClipPick.model_validate(d) for d in data["picks"]]
         except (ValueError, TypeError, KeyError):
             log("warning: package.json is corrupt; re-running packaging")
-    log("[5/6] package: started")
+    log("[5/6] select: packaging started")
     raw: list[dict] = []
     packaged = package_clips(picks, words, llm, settings, raw_sink=raw)
     atomic_write_text(job_dir / "package_raw.json", json.dumps(raw, indent=2, ensure_ascii=False))
@@ -149,7 +149,7 @@ def _package(
         ),
     )
     fixes = sum(len(p.caption_fixes) for p in packaged)
-    log(f"[5/6] package: done ({len(packaged)} clips, {fixes} caption fixes)")
+    log(f"[5/6] select: packaging done ({len(packaged)} clips, {fixes} caption fixes)")
     return packaged
 
 

@@ -110,7 +110,10 @@ def test_packaging_replaces_copy_and_cleans_it(fake_llm, settings):
 
 
 def test_caption_fixes_are_recorded_with_source_times(fake_llm, settings):
-    fixes = [{"index": 5, "text": "keys,"}, {"index": 8, "text": "three!"}]
+    fixes = [
+        {"index": 5, "original": "keys", "text": "keys,"},
+        {"index": 8, "original": "three.", "text": "three!"},
+    ]
     fake_llm.queue({"clips": [_answer(caption_fixes=fixes)]})
     (p,) = package_clips([_pick()], WORDS, fake_llm, settings)
     assert p.caption_fixes == [
@@ -120,17 +123,19 @@ def test_caption_fixes_are_recorded_with_source_times(fake_llm, settings):
 
 
 def test_caption_fix_keeps_the_original_trailing_punctuation(fake_llm, settings):
-    fake_llm.queue({"clips": [_answer(caption_fixes=[{"index": 8, "text": "tree"}])]})
+    fake_llm.queue(
+        {"clips": [_answer(caption_fixes=[{"index": 8, "original": "three", "text": "tree"}])]}
+    )
     (p,) = package_clips([_pick()], WORDS, fake_llm, settings)
     assert p.caption_fixes == [CaptionFix(start=14.0, end=14.4, original="three.", text="tree.")]
 
 
 def test_invalid_caption_fixes_are_ignored(fake_llm, settings, caplog):
     fixes = [
-        {"index": 99, "text": "x"},  # out of range
-        {"index": 2, "text": "gave us all the"},  # 4 tokens: an insert, not a replacement
-        {"index": 3, "text": ""},  # empty
-        {"index": 1, "text": "manager"},  # fine
+        {"index": 99, "original": "x", "text": "x"},  # out of range
+        {"index": 2, "original": "handed", "text": "gave us all the"},  # 4 tokens: an insert
+        {"index": 3, "original": "me", "text": ""},  # empty
+        {"index": 1, "original": "Boss", "text": "manager"},  # fine (case-insensitive)
     ]
     fake_llm.queue({"clips": [_answer(caption_fixes=fixes)]})
     with caplog.at_level(logging.WARNING, logger="hookline.pipeline.package"):
@@ -141,7 +146,7 @@ def test_invalid_caption_fixes_are_ignored(fake_llm, settings, caplog):
 
 def test_too_many_caption_fixes_reject_them_all(fake_llm, settings, caplog):
     # 24 words in the clip; 4 fixes is over 15%
-    fixes = [{"index": i, "text": "word"} for i in (0, 1, 2, 3)]
+    fixes = [{"index": i, "original": MAIN[i], "text": "word"} for i in (0, 1, 2, 3)]
     fake_llm.queue({"clips": [_answer(caption_fixes=fixes)]})
     with caplog.at_level(logging.WARNING, logger="hookline.pipeline.package"):
         (p,) = package_clips([_pick()], WORDS, fake_llm, settings)
@@ -156,13 +161,15 @@ def test_packaging_failure_keeps_selection_copy(fake_llm, settings, caplog, fail
     assert out == [_pick()] and "packaging" in caplog.text
 
 
-def test_clip_missing_from_the_answer_keeps_its_copy(fake_llm, settings, caplog):
-    fake_llm.queue({"clips": [_answer(2)]})
-    a, b = _pick(), _pick(start=40.0, end=43.0, title="Other")
+@pytest.mark.parametrize(
+    "numbers", [[2], [0, 1], [1, 1], [1, 2, 3]], ids=["missing", "0-based", "duplicate", "extra"]
+)
+def test_clip_numbers_other_than_1_to_n_fail_the_whole_pass(fake_llm, settings, caplog, numbers):
+    fake_llm.queue({"clips": [_answer(n) for n in numbers]})
+    picks = [_pick(), _pick(start=40.0, end=43.0, title="Other")]
     with caplog.at_level(logging.WARNING, logger="hookline.pipeline.package"):
-        out = package_clips([a, b], WORDS, fake_llm, settings)
-    assert out[0] == a and out[1].hook_text == "Handed the keys on day three"
-    assert "clip 1" in caplog.text
+        out = package_clips(picks, WORDS, fake_llm, settings)
+    assert out is picks and "clip numbers" in caplog.text
 
 
 def test_overlong_hook_text_keeps_the_selection_hook(fake_llm, settings, caplog):
@@ -205,3 +212,55 @@ def test_packaging_rules_are_shared_with_selection():
         assert needle in PACKAGING_SYSTEM_PROMPT and needle in SYSTEM_PROMPT, needle
     for needle in ("give away the payoff", "true of the final words", "1:1"):
         assert needle in PACKAGING_SYSTEM_PROMPT, needle
+
+
+# --- fix wave C review round 1 ----------------------------------------------------------------
+
+
+def test_caption_fix_schema_names_the_original_word():
+    item = PACKAGING_SCHEMA["properties"]["clips"]["items"]["properties"]["caption_fixes"]
+    assert set(item["items"]["required"]) == {"index", "original", "text"}
+    assert "`original`" in PACKAGING_SYSTEM_PROMPT
+
+
+def test_off_by_one_caption_fix_is_rejected(fake_llm, settings, caplog):
+    # "keys" is word 5; Claude numbered it 6 ("on"): the index and the original disagree
+    fixes = [{"index": 6, "original": "keys", "text": "locks"}]
+    fake_llm.queue({"clips": [_answer(caption_fixes=fixes)]})
+    with caplog.at_level(logging.WARNING, logger="hookline.pipeline.package"):
+        (p,) = package_clips([_pick()], WORDS, fake_llm, settings)
+    assert p.caption_fixes == [] and "'on'" in caplog.text and "keys" in caplog.text
+
+
+def test_two_words_sharing_a_start_keep_both_fixes(fake_llm, settings):
+    words = [*WORDS[:13], WORDS[13].model_copy(update={"start": WORDS[12].start})]
+    words += WORDS[14:]  # "the" and "keys" now both start at 12.0
+    fixes = [
+        {"index": 4, "original": "the", "text": "da"},
+        {"index": 5, "original": "keys", "text": "kays"},
+    ]
+    fake_llm.queue({"clips": [_answer(caption_fixes=fixes)]})
+    (p,) = package_clips([_pick()], words, fake_llm, settings)
+    assert [f.text for f in p.caption_fixes] == ["da", "kays"]
+
+
+def test_caption_fix_keeps_the_original_leading_quote(fake_llm, settings):
+    words = [w.model_copy(update={"text": "“keys"}) if w.text == "keys" else w for w in WORDS]
+    fixes = [{"index": 5, "original": "keys", "text": "locks"}]
+    fake_llm.queue({"clips": [_answer(caption_fixes=fixes)]})
+    (p,) = package_clips([_pick()], words, fake_llm, settings)
+    assert [f.text for f in p.caption_fixes] == ["“locks"]
+
+
+def test_transcript_without_word_confidence_is_logged_once(fake_llm, settings, caplog):
+    fake_llm.queue({"clips": [_answer(1), _answer(2)]})
+    picks = [_pick(), _pick(start=40.0, end=43.0, title="Other")]
+    with caplog.at_level(logging.INFO, logger="hookline.pipeline.package"):
+        package_clips(picks, WORDS, fake_llm, settings)
+    assert caplog.text.count("no word confidence in this transcript") == 1
+    caplog.clear()
+    words = [w.model_copy(update={"prob": 0.9}) if w.text == "keys" else w for w in WORDS]
+    fake_llm.queue({"clips": [_answer(1), _answer(2)]})
+    with caplog.at_level(logging.INFO, logger="hookline.pipeline.package"):
+        package_clips(picks, words, fake_llm, settings)
+    assert "no word confidence" not in caplog.text

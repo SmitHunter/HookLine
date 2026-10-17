@@ -102,16 +102,40 @@ def test_silence_split_by_word_only_cuts_long_pieces():
 
 
 def test_remap_keeps_word_clipped_to_a_sliver():
-    out = remap_words([w(1.0, 1.5, "didn't")], [(0.0, 1.013)])
+    # 40 ms kept (over one 30 fps frame): stretched to 50 ms, inside the range
+    out = remap_words([w(1.0, 1.5, "didn't")], [(0.0, 1.04)])
     assert len(out) == 1 and out[0].end - out[0].start == pytest.approx(0.05)
-    assert out[0].end <= 1.013 + 1e-9
+    assert out[0].end <= 1.04 + 1e-9
 
 
 def test_remap_sliver_at_range_start_extends_forward_within_range():
-    out = remap_words([w(0.5, 1.007, "x")], [(1.0, 2.0)])
+    out = remap_words([w(0.5, 1.04, "x")], [(1.0, 2.0)])
     assert (out[0].start, out[0].end) == pytest.approx((0.0, 0.05))
+
+
+@pytest.mark.parametrize(
+    ("word", "fps"),
+    [((1.0, 1.5), None), ((1.0, 1.5), 30.0), ((0.5, 1.007), None), ((1.0, 1.5), 60.0)],
+)
+def test_remap_drops_a_word_clipped_to_under_one_frame(word, fps):
+    # real case: "order." kept for 3 ms at a cold-open seam showed as a 0.05 s sliver
+    keep = [(0.0, 1.013)] if word[0] == 1.0 else [(1.0, 2.0)]
+    assert remap_words([w(*word, "order.")], keep, fps) == []
+
+
+def test_remap_one_frame_threshold_follows_the_fps():
+    # 25 ms kept: under a 30 fps frame (33 ms) but over a 60 fps frame (17 ms)
+    keep = [(0.0, 1.025)]
+    assert remap_words([w(1.0, 1.5, "x")], keep, 30.0) == []
+    (out,) = remap_words([w(1.0, 1.5, "x")], keep, 60.0)
+    assert out.end - out.start == pytest.approx(0.05)
 
 
 def test_remap_does_not_stretch_uncut_short_words():
     out = remap_words([w(1.0, 1.02, "a")], [(0.0, 2.0)])
     assert out[0].end - out[0].start == pytest.approx(0.02)
+
+
+def test_snap_ranges_never_merges_an_explicit_drop():
+    keep = [(1.0, 2.0), (2.12, 3.0), (3.04, 4.0)]
+    assert snap_ranges(keep, 25, keep_gaps=[(2.0, 2.12)]) == [(1.0, 2.0), (2.12, 4.0)]

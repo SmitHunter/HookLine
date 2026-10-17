@@ -118,6 +118,19 @@ def test_parse_keeps_word_probability_from_tokens():
     assert all(w.prob == 1.0 for w in no_tokens.words())
 
 
+@pytest.mark.parametrize("p", [None, "", "nan?", "missing"])
+def test_parse_tolerates_a_null_or_missing_token_probability(p):
+    data = _load("whisper_cpp_dtw_sample.json")
+    for e in data["transcription"]:
+        for tok in e.get("tokens", []):
+            if p == "missing":
+                tok.pop("p", None)
+            else:
+                tok["p"] = p
+    words = parse_whisper_cpp_json(data, duration=60.0).words()
+    assert words and all(w.prob == 1.0 for w in words)
+
+
 def test_parse_falls_back_to_offsets_without_dtw():
     t = parse_whisper_cpp_json(_load("whisper_cpp_sample.json"), duration=5.0)
     assert t.timing == "segment" and t.words()[0].start == pytest.approx(0.32)

@@ -302,6 +302,49 @@ def test_q6_compares_against_the_declared_first_words(good_mp4, tmp_path):
     assert _by_id(audit_clip(good_mp4, side, _ass(tmp_path)))["Q6"].ok
 
 
+_MOVE = {"from_line": 10, "to_line": 11, "reason": "L10 is a weak opener ('So yes.')"}
+
+
+def test_q6_warns_when_the_opener_guard_moved_the_start(good_mp4, tmp_path):
+    side = _sidecar(declared_first_words="So yes.", opener_moved=_MOVE)
+    q6 = _by_id(audit_clip(good_mp4, side, _ass(tmp_path)))["Q6"]
+    assert q6.ok and q6.status == "warn" and q6.as_dict()["status"] == "warn"
+    assert "L10" in q6.detail and "L11" in q6.detail and "weak opener" in q6.detail
+
+
+def test_q6_with_a_guard_move_still_fails_on_late_speech_or_a_wrong_start(good_mp4, tmp_path):
+    late = _words(t0=1.2)
+    side = _sidecar(
+        caption_words=[[w.start, w.end, w.text] for w in late],
+        declared_first_words="So yes.",
+        opener_moved=_MOVE,
+    )
+    ass = _ass(tmp_path, build_ass(late, "Wait for the twist", DUR))
+    assert _by_id(audit_clip(good_mp4, side, ass))["Q6"].status == "fail"
+    side = _sidecar(
+        first_words="Nobody saw it coming.", declared_first_words="So yes.", opener_moved=_MOVE
+    )
+    assert _by_id(audit_clip(good_mp4, side, _ass(tmp_path)))["Q6"].status == "fail"
+
+
+def test_check_status_is_pass_or_fail_without_a_warning(good_mp4, tmp_path):
+    by = _by_id(audit_clip(good_mp4, _sidecar(), _ass(tmp_path)))
+    assert by["Q6"].status == "pass" and by["Q6"].as_dict()["status"] == "pass"
+
+
+def test_audit_counts_warnings_separately(good_mp4, tmp_path, monkeypatch):
+    out, ws = _job(tmp_path, good_mp4)
+    side = _sidecar(declared_first_words="So yes.", opener_moved=_MOVE)
+    (out / "job1" / "01-good.json").write_text(json.dumps(side), encoding="utf-8")
+    report = audit_job(out / "job1", ws / "job1")
+    assert report["ok"] is True and report["warnings"] == 1 and report["clips"][0]["warnings"] == 1
+    monkeypatch.setenv("HOOKLINE_OUTPUT_DIR", str(out))
+    monkeypatch.setenv("HOOKLINE_WORKSPACE_DIR", str(ws))
+    res = CliRunner().invoke(cli.app, ["audit", "job1"])
+    assert res.exit_code == 0, res.output
+    assert "WARN" in res.output and "0 failed checks, 1 warning" in res.output
+
+
 def test_first_words_checked_after_the_cold_open_seam(good_mp4, tmp_path):
     side = _sidecar(first_words="Then something big happens.", seam=2.5)
     assert _by_id(audit_clip(good_mp4, side, _ass(tmp_path)))["Q6"].ok

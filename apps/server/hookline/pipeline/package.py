@@ -25,6 +25,7 @@ from hookline.pipeline.select import (
     _clip_title,
     _flat_tokens,
     _object,
+    _word_norm,
 )
 
 logger = logging.getLogger(__name__)
@@ -53,19 +54,23 @@ is a `maybe` at best); `skip` if the cut no longer works.
 ## Caption fixes
 
 `caption_fixes` corrects transcription errors in the burned-in captions. Each fix is a 1:1 \
-replacement: `index` is a word number from the list and `text` replaces that one word (1–3 \
-words; keep its punctuation and capitalisation). You cannot insert or delete words, so the \
-timing stays exact. Fix only words that are clearly misheard in context (a wrong homophone, \
-a garbled name, a word that makes the sentence nonsense) or flagged `(?)` and wrong. Never \
-restyle, censor, tidy grammar or paraphrase; most clips need no fixes. Read every sentence \
-for sense: a stray word inside a repeated phrase, a missing little word ("we're all going \
-the shop" is "going to the shop": replace "going" with "going to"), or an idiom with one \
-word wrong is misheard. When a phrase is misheard across several words, fix every one of \
-them, not just the last. For example (invented), in "4:for 5:all 6:intensive 7:purposes, \
-8:the 9:deal 10:was 11:done." the fix is `{"index": 6, "text": "intents and"}`, and in \
-"20:it's 21:a 22:dog 23:eat 24:dot 25:world." it is `{"index": 24, "text": "dog"}`.
+replacement: `index` is a word number from the list, `original` is that word exactly as \
+listed (without the `(?)` flag), and `text` replaces that one word (1–3 words; keep its \
+punctuation and capitalisation). A fix whose `original` is not the word at `index` is \
+discarded. You cannot insert or delete words, so the timing stays exact. Fix only words \
+that are clearly misheard in context (a wrong homophone, a garbled name, a word that makes \
+the sentence nonsense) or flagged `(?)` and wrong. Never restyle, censor, tidy grammar or \
+paraphrase; most clips need no fixes. Read every sentence for sense: a stray word inside a \
+repeated phrase, a missing little word ("we're all going the shop" is "going to the shop": \
+replace "going" with "going to"), or an idiom with one word wrong is misheard. When a \
+phrase is misheard across several words, fix every one of them, not just the last. For \
+example (invented), in "4:for 5:all 6:intensive 7:purposes, 8:the 9:deal 10:was 11:done." \
+the fix is `{"index": 6, "original": "intensive", "text": "intents and"}`, and in \
+"20:it's 21:a 22:dog 23:eat 24:dot 25:world." it is \
+`{"index": 24, "original": "dot", "text": "dog"}`.
 
-Return one entry per clip, with `clip` set to the clip's number.
+Return exactly one entry per clip, with `clip` set to the clip's number as given (1, 2, \
+3, …).
 """
 )
 
@@ -84,7 +89,9 @@ PACKAGING_SCHEMA: dict = _object(
                     "verdict": {"type": "string", "enum": ["post", "maybe", "skip"]},
                     "caption_fixes": {
                         "type": "array",
-                        "items": _object({"index": {"type": "integer"}, "text": _STRING}),
+                        "items": _object(
+                            {"index": {"type": "integer"}, "original": _STRING, "text": _STRING}
+                        ),
                     },
                 }
             ),
@@ -97,10 +104,12 @@ _HOOK_MAX_WORDS = 7
 _FIX_MAX_TOKENS = 3
 _FIX_MAX_SHARE = 0.15  # more fixes than this share of a clip's words: none are applied
 _TRAILING_PUNCT_RE = re.compile(r"[.,!?;:…]+$")
+_LEADING_PUNCT_RE = re.compile(r'^["“‘«(\[¿¡]+')  # opening quotes; never an apostrophe
 
 
 class _RawFix(BaseModel):
     index: int
+    original: str = ""
     text: str
 
 
@@ -168,26 +177,42 @@ def build_packaging_prompt(picks: list[ClipPick], words: list[Word]) -> str:
 
 
 def _with_punct(original: str, text: str) -> str:
-    """`text` with the original word's trailing punctuation when the fix dropped it."""
+    """`text` with the original word's leading (opening quote) and trailing punctuation when
+    the fix dropped it."""
     m = _TRAILING_PUNCT_RE.search(original)
     if m and not _TRAILING_PUNCT_RE.search(text):
-        return text + m.group(0)
+        text += m.group(0)
+    m = _LEADING_PUNCT_RE.search(original)
+    if m and not _LEADING_PUNCT_RE.search(text):
+        text = m.group(0) + text
     return text
 
 
 def _caption_fixes(raw: list[_RawFix], final: list[Word], label: str) -> list[CaptionFix]:
-    """Valid fixes keyed to source words: index in range, 1-3 tokens, an actual change. When
-    they would change more than 15% of the clip's words, none are applied (logged)."""
-    good: dict[float, CaptionFix] = {}
+    """Valid fixes keyed to source words: index in range, `original` (normalised) the word at
+    that index, 1-3 tokens, an actual change. When they would change more than 15% of the
+    clip's words, none are applied (logged)."""
+    good: dict[tuple[float, int], CaptionFix] = {}
     for f in raw:
         text = " ".join(f.text.split())
         if not 0 <= f.index < len(final) or not text or len(text.split()) > _FIX_MAX_TOKENS:
             logger.warning("clip %r: caption fix %r ignored (bad index or length)", label, f)
             continue
         w = final[f.index]
+        if _word_norm(f.original) != _word_norm(w.text):
+            logger.warning(
+                "clip %r: caption fix %r ignored: word %d is %r, not %r",
+                label,
+                f.text,
+                f.index,
+                w.text,
+                f.original,
+            )
+            continue
         text = _with_punct(w.text, text)
         if text != w.text:
-            good[w.start] = CaptionFix(start=w.start, end=w.end, original=w.text, text=text)
+            fix = CaptionFix(start=w.start, end=w.end, original=w.text, text=text)
+            good[(w.start, f.index)] = fix
     if len(good) > _FIX_MAX_SHARE * len(final):
         logger.warning(
             "clip %r: %d caption fixes would change more than %.0f%% of %d words; none applied",
@@ -258,21 +283,25 @@ def package_clips(
     warning and returns `picks` itself, so callers can tell nothing was packaged."""
     if not picks:
         return picks
+    if words and all(w.prob >= 1.0 for w in words):
+        logger.info("no word confidence in this transcript; caption fixes use context only")
     finals = [clip_words(p, words) for p in picks]
     try:
         answer = _ask(llm, build_packaging_prompt(picks, words), settings, raw_sink)
     except Exception as e:  # noqa: BLE001 - packaging is polish; it must never fail the job
         logger.warning("packaging pass failed; keeping the selection-time packaging: %s", e)
         return picks
+    numbers = sorted(a.clip for a in answer.clips)
+    if numbers != list(range(1, len(picks) + 1)):
+        logger.warning(
+            "packaging pass failed: clip numbers %s are not 1-%d; keeping the selection-time "
+            "packaging",
+            numbers,
+            len(picks),
+        )
+        return picks
     by_clip = {a.clip: a for a in answer.clips}
-    out: list[ClipPick] = []
-    for n, (pick, final) in enumerate(zip(picks, finals, strict=True), 1):
-        raw = by_clip.get(n)
-        if raw is None:
-            logger.warning("packaging: clip %d missing from the answer; kept its packaging", n)
-            out.append(pick)
-        else:
-            out.append(_apply(pick, raw, final))
+    out = [_apply(p, by_clip[n], f) for n, (p, f) in enumerate(zip(picks, finals, strict=True), 1)]
     kept = [p for p in out if p.verdict != "skip"]
     for p in out:
         if p.verdict == "skip":

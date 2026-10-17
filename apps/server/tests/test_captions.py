@@ -147,11 +147,11 @@ def test_burns_captions_in_emoji_space_dir(fixture_video, tmp_path):
     assert r.returncode == 0, r.stderr[-1500:]
 
 
-def test_word_clipped_to_13ms_by_a_cut_still_captioned():
+def test_word_clipped_to_40ms_by_a_cut_still_captioned():
     from hookline.pipeline.deadair import remap_words
 
     words = [w(0.0, 0.4, "But"), w(0.5, 0.9, "I"), w(1.0, 1.5, "didn't")]
-    cap = remap_words(words, [(0.0, 1.013), (1.6, 2.0)])
+    cap = remap_words(words, [(0.0, 1.04), (1.6, 2.0)])
     assert "DIDN'T" in build_ass(cap, "", 1.5)
 
 

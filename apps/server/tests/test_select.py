@@ -1403,11 +1403,21 @@ def test_first_person_self_quote_with_content_is_not_moved(fake_llm, settings, c
     assert p.start == 40.0 and "weak opener" not in caplog.text
 
 
-def test_opener_guard_never_lands_on_a_filler_led_line(fake_llm, settings, caplog):
-    bad = {10: "So the point is this.", 11: "Like, the rent doubled in a year."}
+def test_opener_guard_never_lands_on_a_filler_led_bad_opener(fake_llm, settings, caplog):
+    bad = {10: "So the point is this.", 11: "Like, so the rent doubled in a year."}
     tr, item = _guard_item(bad, bad[10])
     (p,) = _one(tr, fake_llm, settings, item, caplog)
     assert p.start == 48.0 and "start moved to L12" in caplog.text
+
+
+def test_opener_guard_lands_on_a_line_whose_only_problem_is_a_comma_filler(
+    fake_llm, settings, caplog
+):
+    bad = {10: "So the point is this.", 11: "Like, the rent doubled in a year."}
+    tr, item = _guard_item(bad, bad[10])
+    (p,) = _one(tr, fake_llm, settings, item, caplog)
+    assert p.start == 44.25 and p.first_words == "the rent doubled in a year."
+    assert "start moved to L11" in caplog.text
 
 
 def test_leading_filler_is_stripped_from_the_clip_start(fake_llm, settings, caplog):
@@ -1558,3 +1568,128 @@ def test_search_title_never_ends_on_a_function_word(text):
 def test_search_title_schema_states_the_limit():
     props = SELECTION_SCHEMA["properties"]["clips"]["items"]["properties"]
     assert "70" in props["search_title"].get("description", "")
+
+
+# --- fix wave C review round 1 ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("overrides", "drops"),
+    [({11: "Yeah."}, [11]), ({11: "Yeah."}, []), ({}, [11])],
+    ids=["dropped-backchannel", "backchannel", "dropped"],
+)
+def test_opener_guard_never_lands_on_a_dropped_line_or_backchannel(
+    fake_llm, settings, caplog, overrides, drops
+):
+    tr, item = _guard_item(
+        {10: "So the point is this.", **overrides}, "So the point is this.", drop_lines=drops
+    )
+    (p,) = _one(tr, fake_llm, settings, item, caplog)
+    assert p.start == 48.0 and "start moved to L12" in caplog.text
+
+
+def test_guard_move_is_recorded_on_the_pick(fake_llm, settings):
+    tr, item = _guard_item({10: "So the point is this."}, "So the point is this.")
+    (p,) = _one(tr, fake_llm, settings, item)
+    assert p.opener_moved is not None
+    assert (p.opener_moved.from_line, p.opener_moved.to_line) == (10, 11)
+    assert "weak opener" in p.opener_moved.reason
+    tr, item = _guard_item({10: _CLAIM}, _CLAIM)
+    (p,) = _one(tr, fake_llm, settings, item)
+    assert p.opener_moved is None
+
+
+@pytest.mark.parametrize("filler", ["Okay,", "Well,", "Yeah,", "Oh,", "Anyway,"])
+def test_comma_followed_opener_fillers_are_stripped_from_the_start(fake_llm, settings, filler):
+    line = f"{filler} my landlord raised the rent forty percent."
+    tr, item = _guard_item({10: line}, line)
+    (p,) = _one(tr, fake_llm, settings, item)
+    assert p.start == 40.25 and p.first_words == "my landlord raised the rent forty percent."
+
+
+@pytest.mark.parametrize(
+    ("line", "first_words", "min_clip_s"),
+    [
+        (_MID, "the original investors walked out of the room.", 32),  # min 24.0 s
+        ("Um, like, my landlord raised the rent forty percent.", None, 33.4),  # min 25.05 s
+    ],
+    ids=["mid-line", "filler-strip"],
+)
+def test_start_falls_back_to_the_whole_line_when_the_cut_start_breaks_min_length(
+    fake_llm, settings, caplog, line, first_words, min_clip_s
+):
+    s = settings.model_copy(update={"min_clip_s": min_clip_s})
+    tr = _lines_transcript({10: line})
+    item = _line_item(10, 16, first_words or line, _FILLER.format(n=16))  # L10-L16: 25.2 s
+    (p,) = _one(tr, fake_llm, s, item, caplog)
+    assert p.start == 40.0 and p.first_words == line
+    assert "whole line" in caplog.text
+
+
+def test_length_estimate_keeps_drops_restored_for_the_teaser(fake_llm, settings, caplog):
+    # L10-L23 is 53.2 s; dropping L15 would make it 49.2 s, but L15 holds the teaser, so the
+    # drop is restored: the clip is over 50 s and must be trimmed from the front
+    teaser = "Rent doubled in one year for everyone."
+    tr = _lines_transcript({15: teaser})
+    item = _line_item(
+        10, 23, _FILLER.format(n=10), _FILLER.format(n=23), drop_lines=[15], cold_open_words=teaser
+    )
+    (p,) = _one(tr, fake_llm, settings, item, caplog)
+    assert p.start == 44.0 and p.drops == [] and p.cold_open == (60.0, _end_of(tr, 15))
+    assert p.end - p.start <= settings.max_clip_s
+
+
+_QUESTION = {13: "Did I do this alone?", 14: "No, I did not do this alone."}
+
+
+@pytest.mark.parametrize(
+    "answer",
+    ["No, I did not do this alone.", "Absolutely, every single day.", "This alone took years."],
+)
+def test_a_question_whose_answer_is_kept_is_never_dropped(fake_llm, settings, caplog, answer):
+    tr, item = _guard_item({**_QUESTION, 14: answer}, _FILLER.format(n=10), drop_lines=[13])
+    (p,) = _one(tr, fake_llm, settings, item, caplog)
+    assert p.drops == [] and "L13" in caplog.text and "answer" in caplog.text
+
+
+def test_a_question_without_a_kept_answer_may_be_dropped(fake_llm, settings):
+    over = {13: "Did I do this alone?", 14: "The weather turned bad that week."}
+    tr, item = _guard_item(over, _FILLER.format(n=10), drop_lines=[13])
+    (p,) = _one(tr, fake_llm, settings, item)
+    assert len(p.drops) == 1
+    tr, item = _guard_item(_QUESTION, _FILLER.format(n=10), drop_lines=[13, 14])
+    (p,) = _one(tr, fake_llm, settings, item)
+    assert len(p.drops) == 1  # the answer is dropped too, so the question may go
+
+
+def test_system_prompt_never_drops_a_question_whose_answer_is_kept():
+    assert "never drop a question" in SYSTEM_PROMPT
+
+
+def _piece_transcript():
+    """Filler lines on the 4 s grid, except L12-L14: an aside, a 0.2 s "Okay." and another
+    aside packed into 50.0-52.3 s, so dropping L12 and L14 leaves a 0.55 s piece between."""
+    lines = [(4.0 * i, _FILLER.format(n=i)) for i in range(12)]
+    lines += [(50.0, "aside one here."), (51.0, "Okay."), (51.6, "aside two here.")]
+    lines += [(4.0 * i - 2.5, _FILLER.format(n=i)) for i in range(15, 40)]
+    return _timed_transcript(lines, 160.0)
+
+
+def test_a_drop_leaving_a_short_spoken_piece_is_ignored(fake_llm, settings, caplog):
+    tr = _piece_transcript()
+    item = _line_item(10, 20, _FILLER.format(n=10), _FILLER.format(n=20), drop_lines=[12, 14])
+    (p,) = _one(tr, fake_llm, settings, item, caplog)
+    assert p.drops == [(pytest.approx(47.6), pytest.approx(50.85))]
+    assert "L14" in caplog.text and "1.5" in caplog.text
+
+
+def test_drop_ranges_swallow_a_short_wordless_piece(settings, caplog):
+    import dataclasses
+
+    from hookline.pipeline.select import _merge_wordless_pieces
+
+    words = [Word(start=0.0, end=0.2, text="a"), Word(start=5.0, end=5.2, text="b")]
+    src = dataclasses.replace(_fix_src({}, settings), words=words)
+    with caplog.at_level(logging.INFO, logger="hookline.pipeline.select"):
+        out = _merge_wordless_pieces([(1.0, 2.0), (2.5, 3.0), (5.5, 6.0)], src, "t")
+    assert out == [(1.0, 3.0), (5.5, 6.0)] and "swallow" in caplog.text

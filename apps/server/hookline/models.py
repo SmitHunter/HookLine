@@ -84,6 +84,14 @@ class CaptionFix(BaseModel):
     text: str
 
 
+class OpenerMove(BaseModel):
+    """The opener guard moved the clip's start off Claude's `start_line` (Q6 then warns)."""
+
+    from_line: int
+    to_line: int
+    reason: str
+
+
 class ClipPick(BaseModel):
     start: float
     end: float
@@ -108,6 +116,8 @@ class ClipPick(BaseModel):
     declared_first_words: str = ""
     drops: list[tuple[float, float]] = []
     caption_fixes: list[CaptionFix] = []
+    # Fix wave C round 1: where the opener guard moved the start (None when it did not).
+    opener_moved: OpenerMove | None = None
 
     @property
     def duration(self) -> float:

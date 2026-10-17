@@ -1,4 +1,5 @@
 import json
+import math
 import re
 import subprocess
 import tempfile
@@ -78,6 +79,15 @@ def _is_speech(text: str) -> bool:
     return bool(text) and not text.startswith("[")
 
 
+def _prob(tok: dict) -> float | None:
+    """A token's probability `p`, or None when it is missing, null or not a number."""
+    try:
+        p = float(tok["p"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return p if math.isfinite(p) else None
+
+
 def parse_whisper_cpp_json(data: dict, duration: float) -> Transcript:
     # Each entry: (text, offset_start, offset_end, dtw_start | None, dtw_last | None, prob)
     entries: list[tuple[str, float, float, float | None, float | None, float]] = []
@@ -95,9 +105,10 @@ def parse_whisper_cpp_json(data: dict, duration: float) -> Transcript:
         has_first = first_tok is not None and first_tok.get("t_dtw", -1) >= 0
         # the word's confidence: its least likely speech token (punctuation tokens excluded)
         probs = [
-            float(tok["p"])
+            p
             for tok in e.get("tokens", [])
-            if _is_speech(tok.get("text", "")) and "p" in tok and _WORDISH.search(tok["text"])
+            if _is_speech(tok.get("text", "")) and _WORDISH.search(tok["text"])
+            if (p := _prob(tok)) is not None
         ]
         entries.append(
             (
