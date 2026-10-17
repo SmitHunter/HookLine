@@ -5,7 +5,8 @@ from hookline.models import Sentence, Word
 _TRAILING = "\"'”’)]}»"
 
 
-def _ends_sentence(text: str) -> bool:
+def ends_sentence(text: str) -> bool:
+    """True when `text` ends in terminal punctuation (.!?), ignoring closing quotes/brackets."""
     return text.rstrip(_TRAILING).endswith((".", "?", "!"))
 
 
@@ -27,13 +28,34 @@ def split_sentences(
         nxt = words[i + 1] if i + 1 < len(words) else None
         if (
             nxt is None
-            or _ends_sentence(word.text)
+            or ends_sentence(word.text)
             or nxt.start - word.end > max_gap
             or nxt.end - buf[0].start > max_len_s
         ):
             sentences.append(_make(buf))
             buf = []
     return sentences
+
+
+def selection_lines(words: list[Word], max_len_s: float = 25.0) -> list[Sentence]:
+    """Sentences for clip selection: split ONLY on terminal punctuation (.!? before any closing
+    quotes or brackets), never on a pause. A run that would exceed `max_len_s` without
+    punctuation is split at its longest word gap (the latest one on a tie)."""
+    lines: list[Sentence] = []
+    buf: list[Word] = []
+    for i, word in enumerate(words):
+        buf.append(word)
+        nxt = words[i + 1] if i + 1 < len(words) else None
+        if nxt is None or ends_sentence(word.text):
+            lines.append(_make(buf))
+            buf = []
+            continue
+        while buf and nxt.end - buf[0].start > max_len_s:
+            gaps = [b.start - a.end for a, b in zip(buf, [*buf[1:], nxt], strict=True)]
+            cut = max(range(len(gaps)), key=lambda k: (gaps[k], k)) + 1
+            lines.append(_make(buf[:cut]))
+            buf = buf[cut:]
+    return lines
 
 
 def format_timestamp(t: float) -> str:

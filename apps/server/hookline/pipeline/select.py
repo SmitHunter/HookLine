@@ -12,6 +12,7 @@ import re
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from typing import get_args
 
 from pydantic import BaseModel, ValidationError
@@ -28,8 +29,14 @@ from hookline.models import (
     Verdict,
     Word,
 )
+from hookline.pipeline.boundaries import FILLER_OPENERS
 from hookline.pipeline.signals import CLIP_MARKER
-from hookline.transcript_text import compact_transcript, format_timestamp, split_sentences
+from hookline.transcript_text import (
+    compact_transcript,
+    ends_sentence,
+    format_timestamp,
+    selection_lines,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -87,19 +94,27 @@ the `start_line` line. Read it as a stranger mid-scroll would. If it needs earli
 begins with "And", "So", "But", "Because" or "Which", answers a question the viewer never \
 heard, quotes a conversation the viewer never saw ("I was like…", "he goes…"), or leans on a \
 pronoun from earlier), move the start or use a cold open. Setup lines \
-such as "So I've been thinking about this" or "Okay, so basically" are not hooks.
+such as "So I've been thinking about this" or "Okay, so basically" are not hooks. If a strong \
+moment has a messy first line, move `start_line` forward; never mark it skip only because of \
+its opening.
 - Cold opens. When a clip genuinely needs its setup but its strongest line comes later, set \
-`cold_open_line` to that later line. It plays first as a teaser (at most 5 seconds; a longer \
-line is trimmed to its first 5 seconds), then the clip runs from `start_line`. Otherwise leave \
-it null. It must lie inside the clip and must not be the clip's first line.
+`cold_open_words` to that later line, copied verbatim from the transcript: a complete thought \
+that finishes its sentence, without lead-ins such as "I think" or "the thing is". It plays \
+first as a teaser of at most 6 seconds, then the clip runs from `start_line`; a teaser that \
+cannot finish its sentence within 6 seconds is dropped. Otherwise leave it null. It must lie \
+inside the clip and must not be in the clip's first sentence.
 - End on the payoff line: the punchline, reveal, outcome or reaction that rewards watching. \
 Never end on "yeah", "mm-hmm", "right" or any other interviewer backchannel, on dead air, or \
-on the start of the next topic. If the payoff lands within 15 seconds after where you would \
-stop, extend the clip to include it. `last_words` is the verbatim last sentence heard, copied \
-from the `end_line` line. Prefer endings that echo the opening, so a replay loops naturally.
-- Length: prefer 20–40 seconds for talking heads. Go up to 60 seconds only if the tension \
-holds the whole way.
-- Keep candidates distinct: they must not overlap each other in time.
+on the start of the next topic. Before you fix `end_line`, read the next 20 seconds after \
+it: if a more concrete or emotional line follows (the example, the number, the punchline), \
+extend the clip to include it. `last_words` is the verbatim last sentence heard, copied from \
+the `end_line` line. Prefer endings that echo the opening, so a replay loops naturally.
+- Length: keep clips at or under 45 seconds unless the payoff requires more; 20–40 seconds \
+suits most talking heads. A `reaction_peak` clip may be as short as 12 seconds.
+- Keep candidates distinct: they must not overlap each other in time, and avoid two clips on \
+the same theme; spread them across categories.
+- Moments that name famous people, brands or institutions are high-value for search; include \
+the best one among your candidates.
 - Controversy, hot takes and confrontations are assets, not risks. `safety` penalises only \
 slurs, sexual content and gore.
 
@@ -132,7 +147,10 @@ or heart.
 
 Calibration matters more than generosity. Give `hook` 20 or higher only if a stranger would \
 stop scrolling on the first sentence alone. Most sources yield 1–4 postable clips, so most \
-candidates should not score like hits; use the whole range.
+candidates should not score like hits; use the whole range. For example, a clip opening on \
+"So I want to talk about the housing market for a second." is a setup opener and scores 12 \
+for `hook`; one opening on "My landlord raised the rent 40 percent and told me to sell my \
+car." puts the stake first and scores 22.
 
 ## Verdict
 
@@ -147,13 +165,19 @@ Use `skip` honestly; a source with no strong moments should get mostly skips.
 Everything in packaging must be literally true to the clip.
 
 - `title`: short and specific, under 60 characters.
-- `hook_text`: on-screen text over the first seconds. 3–7 words, built from concrete nouns or \
-numbers in the clip, and literally true: never exaggerate what happens (if someone was "a \
-little rude", they did not "come to mock" anyone). Tease the payoff without spoiling it, and \
-do not just repeat the first spoken line. Never use template phrases such as "Then this", \
-"Wait for it", "You won't believe" or "Watch till the end".
+- `hook_text`: on-screen text over the first seconds. 3–7 words that name the stake or the \
+tension as a claim or a question (for example "Asked her: was the war worth it?"), never a \
+topic label such as "Activists versus big money". Build it from concrete nouns or numbers in \
+the clip, and keep it literally true: never exaggerate what happens (if someone was "a \
+little rude", they did not "come to mock" anyone), and never promise visuals or footage the \
+clip does not show; the viewer sees only the speakers. For a cold-open clip, `hook_text` must \
+complement the teaser line, not contradict or repeat it. Tease the payoff without spoiling \
+it, and do not just repeat the first spoken line. Never use template phrases such as "Then \
+this", "Wait for it", "You won't believe" or "Watch till the end".
 - `post_caption`: the caption under the post, 1–2 lines, that ends with a question inviting \
-comments.
+comments: a specific question with two plausible answers, so viewers pick a side. Template \
+questions are banned: "Agree or disagree?", "Thoughts?", "What do you think?" and \
+"Has X ever…?".
 - `hashtags`: 3–5 specific tags, without the `#`, about the clip's actual topic, people or \
 game. Generic reach tags such as #fyp, #foryou or #viral are banned.
 - `search_title`: a keyword-first title for search, at most 70 characters, that leads with the \
@@ -176,7 +200,7 @@ L214 [14:10.2] I ran a three-hundred-cover Saturday on my own when I was ninetee
 L226 [14:44.0] He walked in at close, looked at the tickets, and handed me his knives.
 L227 [14:48.3] Yeah.
 
-A good pick (37 seconds): `start_line` 214, `end_line` 226, `cold_open_line` null.
+A good pick (37 seconds): `start_line` 214, `end_line` 226, `cold_open_words` null.
 - `first_words`: "I ran a three-hundred-cover Saturday on my own when I was nineteen." It works \
 cold; L212 and L213 are setup, so the clip starts after them.
 - `last_words`: "He walked in at close, looked at the tickets, and handed me his knives." The \
@@ -184,8 +208,8 @@ payoff; the backchannel "Yeah." on L227 is left out.
 - `hook_type`: `bold_claim`. `verdict`: `post`.
 - `hook_text`: "Head chef walked in at close" (it teases the payoff rather than restating \
 the first line)
-- `post_caption`: "Nineteen, no head chef, a full Saturday rush. What's the hardest shift you've \
-ever covered?"
+- `post_caption`: "Nineteen, no head chef, a full Saturday rush. Was handing over his knives \
+a promotion or a test?"
 - `hashtags`: ["linecook", "kitchenlife", "restaurantstories", "cheflife"]
 - `search_title`: "Running a 300-Cover Restaurant Service Alone at 19"
 - `edit_beats`: ["zoom: 'knives' @ 887.2s"]
@@ -231,7 +255,7 @@ SELECTION_SCHEMA: dict = _object(
                     "first_words": _STRING,
                     "end_line": {"type": "integer"},
                     "last_words": _STRING,
-                    "cold_open_line": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+                    "cold_open_words": {"anyOf": [_STRING, {"type": "null"}]},
                     "hook_type": {"type": "string", "enum": list(get_args(HookType))},
                     "title": _STRING,
                     "hook_text": _STRING,
@@ -250,7 +274,10 @@ SELECTION_SCHEMA: dict = _object(
     }
 )
 
-_COLD_OPEN_MAX_S = 5.0
+_COLD_OPEN_MAX_S = 6.0
+_COLD_OPEN_MIN_MATCH = 0.8
+_BEAT_SNAP_S = 3.0
+_REACTION_PEAK_MIN_S = 12.0
 _CHUNK_OVERLAP_S = 120.0
 _WORDS_MIN_OVERLAP = 0.6
 _REANCHOR_RADIUS = 3
@@ -279,6 +306,23 @@ _UNFINISHED_ENDINGS = ("...", "…", "--", "—", "-")
 _TRAILING_QUOTES = "\"'”’)]}»"
 _TOKEN_RE = re.compile(r"[a-z0-9']+")
 _BEAT_TIME_RE = re.compile(r"@\s*(\d+(?:\.\d+)?)\s*s?\s*$")
+_BEAT_WORD_RE = re.compile(r"\s*zoom:\s*['\"‘“](.+?)['\"’”]\s*@")
+_WORD_PUNCT = ",.!?…\"'-:;–—‘’“”()[]"
+_QUOTE_CHARS = "\"“”‘'"
+_QUOTED_SPAN_RE = re.compile(r'"([^"]+)"|“([^”]+)”|(?<!\w)‘([^’]+)’(?!\w)')
+# Lead-ins stripped from the start of a cold-open teaser.
+_LEAD_INS = (*FILLER_OPENERS, "i think", "the thing is", "i mean", "you know", "i would say")
+# Fillers skipped before judging a first sentence's opener ("Um, so..." opens on "so").
+_OPENER_FILLERS = ("um", "uh", "yeah", "okay", "ok", "well", "like", "oh", "anyway")
+_OPENER_FILLERS += ("i mean", "you know")
+_CONTEXT_OPENERS = {"and", "so", "but", "because", "which"}
+_QUOTED_OPENER_RE = re.compile(
+    r"(?:i|he|she|they|we)(?: was| were|'m| am| is| are)? like\b"
+    r"|(?:he|she|they) (?:goes|go|went|said|says)\b"
+)
+_TEMPLATE_QUESTION_RE = re.compile(
+    r"agree or disagree|^thoughts\s*\?|^what do you think\s*\?|^(?:has|have)\b.*\bever\b"
+)
 
 
 class _RawScores(BaseModel):
@@ -295,7 +339,7 @@ class _RawScores(BaseModel):
 class _RawClip(BaseModel):
     start_line: int
     end_line: int
-    cold_open_line: int | None = None
+    cold_open_words: str | None = None
     first_words: str = ""
     last_words: str = ""
     hook_type: HookType | None = None
@@ -376,8 +420,21 @@ def dedupe_overlaps(picks: list[ClipPick], max_overlap: float = 0.5) -> list[Cli
     return kept
 
 
+def diversify(ranked: list[ClipPick]) -> list[ClipPick]:
+    """Keep rank order, but move every pick whose `category` an earlier pick already has
+    (case-insensitive) below all picks of not-yet-seen categories."""
+    seen: set[str] = set()
+    fresh: list[ClipPick] = []
+    repeats: list[ClipPick] = []
+    for p in ranked:
+        key = p.category.strip().lower()
+        (repeats if key and key in seen else fresh).append(p)
+        seen.add(key)
+    return fresh + repeats
+
+
 def polish_pick(transcript: Transcript) -> ClipPick:
-    sentences = split_sentences(transcript.words())
+    sentences = selection_lines(transcript.words())
     first = sentences[0].text if sentences else ""
     hook = " ".join(first.split()[:8])
     return ClipPick(
@@ -515,46 +572,215 @@ def _drop_cold_open(raw: _RawClip, reason: str) -> None:
     logger.warning("dropped cold open for clip %r: %s", raw.title, reason)
 
 
+def _word_norm(text: str) -> str:
+    return text.lower().replace("’", "'").strip(_WORD_PUNCT)
+
+
+def _clip_words(src: _Source, start: float, end: float) -> list[Word]:
+    return [w for w in src.words if w.start >= start - 1e-6 and w.end <= end + 1e-6]
+
+
+def _flat_tokens(words: list[Word]) -> tuple[list[str], list[int]]:
+    """Every normalised token of `words`, with the index of the word it came from."""
+    toks: list[str] = []
+    owner: list[int] = []
+    for i, w in enumerate(words):
+        for t in _tokens(w.text):
+            toks.append(t)
+            owner.append(i)
+    return toks, owner
+
+
+def _locate(want: list[str], words: list[Word]) -> tuple[int, int] | None:
+    """(first, last) word index of the best order-aware fuzzy match of `want` in `words`: a
+    window starting on one of want's first 3 tokens whose in-order matches cover >= 80% of
+    `want`, spanning its first to its last matched token; the earliest best window wins. None
+    when nothing matches well enough."""
+    toks, owner = _flat_tokens(words)
+    best: tuple[float, int, int] | None = None
+    for i, tok in enumerate(toks):
+        if tok not in want[:3]:
+            continue
+        window = toks[i : i + len(want) + 2]
+        blocks = [
+            b
+            for b in SequenceMatcher(None, want, window, autojunk=False).get_matching_blocks()
+            if b.size
+        ]
+        score = sum(b.size for b in blocks) / len(want)
+        if score >= _COLD_OPEN_MIN_MATCH and (best is None or score > best[0]):
+            last_tok = i + blocks[-1].b + blocks[-1].size - 1
+            best = (score, owner[i + blocks[0].b], owner[last_tok])
+    return (best[1], best[2]) if best else None
+
+
+def _phrase_at(words: list[Word], i: int, phrases: tuple[str, ...]) -> int:
+    """Length in words of the longest phrase in `phrases` that `words` spell from index i."""
+    for phrase in sorted(phrases, key=lambda p: -len(p.split())):
+        parts = phrase.split()
+        if [_word_norm(w.text) for w in words[i : i + len(parts)]] == parts:
+            return len(parts)
+    return 0
+
+
 def _cold_open(raw: _RawClip, first: int, last: int, src: _Source) -> tuple[float, float] | None:
-    """The `cold_open_line` sentence's span; a sentence over 5 s is trimmed to the words that
-    end within its first 5 s. None (with a logged reason) when it cannot be used."""
-    line = raw.cold_open_line
-    if line is None:
+    """Where the verbatim `cold_open_words` are spoken inside the clip, without leading fillers
+    and lead-ins ("I think", "the thing is"), ending on the first sentence end at or after the
+    declared words, all within 6 s (else on an earlier sentence end within 6 s). None (with a
+    logged reason) when it cannot be used."""
+    text = (raw.cold_open_words or "").strip()
+    want = _tokens(text)
+    if not want:
         return None
-    if not 0 <= line < len(src.sentences):
-        _drop_cold_open(raw, f"L{line} does not exist")
+    sents = src.sentences
+    words = _clip_words(src, sents[first].start, sents[last].end)
+    loc = _locate(want, words)
+    if loc is None:
+        _drop_cold_open(raw, f"{text!r} not found in the clip (L{first}-L{last})")
         return None
-    if line == first:
-        _drop_cold_open(raw, f"L{line} is the clip's first line")
+    i, j = loc
+    while i < j and (n := _phrase_at(words, i, _LEAD_INS)) and i + n <= j:
+        i += n
+    if words[i].start < sents[first].end - 1e-6:
+        _drop_cold_open(raw, f"{text!r} starts in the clip's first sentence (L{first})")
         return None
-    if not first < line <= last:
-        _drop_cold_open(raw, f"L{line} is outside the clip (L{first}-L{last})")
+    t0 = words[i].start
+    ends = [
+        k
+        for k in range(i, len(words))
+        if ends_sentence(words[k].text) and words[k].end - t0 <= _COLD_OPEN_MAX_S + 1e-6
+    ]
+    after = [k for k in ends if k >= j]
+    if after:
+        k = after[0]
+    elif ends:
+        k = ends[-1]
+        logger.info("clip %r: cold open cut to the sentence ending %r", raw.title, words[k].text)
+    else:
+        _drop_cold_open(raw, f"{text!r} does not finish a sentence within {_COLD_OPEN_MAX_S:.0f}s")
         return None
-    s = src.sentences[line]
-    if s.end - s.start <= _COLD_OPEN_MAX_S:
-        return s.start, s.end
-    inside = [w for w in src.words if w.start >= s.start - 1e-6 and w.end <= s.end + 1e-6]
-    kept = [w for w in inside if w.end - s.start <= _COLD_OPEN_MAX_S]
-    if not kept:
-        _drop_cold_open(raw, f"L{line} has no words within its first {_COLD_OPEN_MAX_S}s")
-        return None
-    return kept[0].start, kept[-1].end
+    return t0, words[k].end
 
 
-def _beats_inside(raw: _RawClip, start: float, end: float) -> list[str]:
-    """Beats whose `@ <t>s` time lies in [start, end]; logs the ones dropped (no readable
-    time, or outside the clip)."""
+def _bad_opener(text: str) -> bool:
+    """A first sentence that leans on context the viewer never saw: it opens (after fillers
+    such as "um" / "yeah") on And/So/But/Because/Which, or on a quoted conversation."""
+    text = text.strip()
+    if text[:1] in _QUOTE_CHARS:
+        return True
+    toks = [t for t in (_word_norm(x) for x in text.split()) if t]
+    i = 0
+    while i < len(toks):
+        if i + 1 < len(toks) and f"{toks[i]} {toks[i + 1]}" in _OPENER_FILLERS:
+            i += 2
+        elif toks[i] in _OPENER_FILLERS:
+            i += 1
+        else:
+            break
+    rest = toks[i:]
+    if not rest:
+        return False
+    return rest[0] in _CONTEXT_OPENERS or bool(_QUOTED_OPENER_RE.match(" ".join(rest)))
+
+
+def _guard_opener(raw: _RawClip, first: int, last: int, src: _Source, min_s: float) -> int:
+    """Move a weak opening sentence forward by 1-2 sentences while the clip keeps its minimum
+    length; otherwise keep it and log."""
+    sents = src.sentences
+    if not _bad_opener(sents[first].text):
+        return first
+    for k in (1, 2):
+        cand = first + k
+        if cand > last or sents[last].end - sents[cand].start < min_s:
+            break
+        if not _bad_opener(sents[cand].text):
+            logger.info(
+                "clip %r: L%d is a weak opener (%r); start moved to L%d",
+                raw.title,
+                first,
+                sents[first].text,
+                cand,
+            )
+            return cand
+    logger.warning(
+        "clip %r: L%d is a weak opener (%r) with no clean start within 2 sentences; keeping it",
+        raw.title,
+        first,
+        sents[first].text,
+    )
+    return first
+
+
+def _contains(toks: list[str], want: list[str]) -> bool:
+    n = len(want)
+    return any(toks[i : i + n] == want for i in range(len(toks) - n + 1))
+
+
+def _check_title(raw: _RawClip, clip_toks: list[str]) -> str:
+    """Keep a quoted span only when it is verbatim (normalised) in the clip; otherwise drop
+    its quote marks, since a quote that was never said is a misquote."""
+
+    def unquote(m: re.Match) -> str:
+        inner = next(g for g in m.groups() if g is not None)
+        want = _tokens(inner)
+        if want and _contains(clip_toks, want):
+            return m.group(0)
+        logger.info(
+            "clip %r: quoted %r is not verbatim in the clip; quotes removed", raw.title, inner
+        )
+        return inner
+
+    return " ".join(_QUOTED_SPAN_RE.sub(unquote, raw.title).split())
+
+
+def _check_caption(raw: _RawClip) -> str:
+    caption = raw.post_caption.strip()
+    questions = [q for q in re.split(r"(?<=[.!?])\s+", caption) if q.endswith("?")]
+    if any(_TEMPLATE_QUESTION_RE.search(q.lower()) for q in questions):
+        logger.warning("clip %r: template caption question in %r; kept", raw.title, caption)
+    return caption
+
+
+def _snap_beats(raw: _RawClip, words: list[Word], start: float, end: float) -> list[str]:
+    """Beats with a readable `@ <t>s`: a quoted-word beat (`zoom: '<word>' @ <t>s`) is snapped
+    to the nearest start of that word in the clip within ±3 s (dropped if there is none);
+    any other beat must have its time in [start, end]. Logs the ones dropped."""
+    toks, owner = _flat_tokens(words)
     kept, dropped = [], []
     for beat in raw.edit_beats:
         m = _BEAT_TIME_RE.search(beat)
-        (kept if m and start <= float(m.group(1)) <= end else dropped).append(beat)
+        if not m:
+            dropped.append(beat)
+            continue
+        t = float(m.group(1))
+        quoted = _BEAT_WORD_RE.match(beat)
+        if quoted:
+            want = _tokens(quoted.group(1))
+            n = len(want)
+            hits = [
+                words[owner[i]].start
+                for i in range(len(toks) - n + 1)
+                if n and toks[i : i + n] == want
+            ]
+            near = [h for h in hits if abs(h - t) <= _BEAT_SNAP_S]
+            if not near:
+                dropped.append(beat)
+                continue
+            snapped = min(near, key=lambda h: abs(h - t))
+            kept.append(f"{beat[: m.start()]}@ {snapped:.1f}s")
+        elif start <= t <= end:
+            kept.append(beat)
+        else:
+            dropped.append(beat)
     if dropped:
         logger.info(
-            "clip %r: dropped %d edit beat(s) without a time inside %.1f-%.1fs: %s",
+            "clip %r: dropped %d edit beat(s) without a time inside %.1f-%.1fs or a matching "
+            "word within %.0fs: %s",
             raw.title,
             len(dropped),
             start,
             end,
+            _BEAT_SNAP_S,
             dropped,
         )
     return kept
@@ -605,6 +831,8 @@ def _to_pick(raw: _RawClip, src: _Source) -> ClipPick | None:
     last = _reanchor(raw, given_last, first, n - 1, src.tokens, forward=False)
     last = _fix_ending(raw, first, last, src)
     min_s, max_s = src.settings.min_clip_s * 0.75, src.settings.max_clip_s * 1.25
+    if raw.hook_type == "reaction_peak":
+        min_s = min(min_s, _REACTION_PEAK_MIN_S)
 
     def fits(a: int, b: int) -> bool:
         return min_s <= src.sentences[b].end - src.sentences[a].start <= max_s
@@ -626,21 +854,23 @@ def _to_pick(raw: _RawClip, src: _Source) -> ClipPick | None:
             given_last,
         )
         last = given_last
+    first = _guard_opener(raw, first, last, src, min_s)
     start = min(max(src.sentences[first].start, 0.0), src.duration)
     end = min(max(src.sentences[last].end, 0.0), src.duration)
+    words = _clip_words(src, start, end)
     pick = ClipPick(
         start=start,
         end=end,
-        title=raw.title,
+        title=_check_title(raw, _flat_tokens(words)[0]),
         hook_text=raw.hook_text,
         reason=raw.reason,
         scores=_clamped_scores(raw.scores),
-        edit_beats=_beats_inside(raw, start, end),
-        first_words=raw.first_words,
-        last_words=raw.last_words,
+        edit_beats=_snap_beats(raw, words, start, end),
+        first_words=src.sentences[first].text,
+        last_words=src.sentences[last].text,
         hook_type=raw.hook_type,
         verdict=raw.verdict,
-        post_caption=raw.post_caption.strip(),
+        post_caption=_check_caption(raw),
         hashtags=_clean_hashtags(raw),
         search_title=_clip_title(raw.search_title),
         category=raw.category.strip(),
@@ -731,7 +961,7 @@ def select_clips(
             if any(m.startswith(("\U0001f50a", "\U0001f525")) for m in ms)
         }
     words = transcript.words()
-    sentences = split_sentences(words)
+    sentences = selection_lines(words)
     src = _Source(
         sentences=sentences,
         tokens=[_tokens(s.text) for s in sentences],
@@ -770,11 +1000,11 @@ def select_clips(
                 excerpt=(chunk[0].start, chunk[-1].end),
             )
             raws.extend(_ask(llm, prompt, settings, label, raw_sink).clips)
-        best = dedupe_overlaps(valid(raws))[: settings.clips]
+        best = diversify(dedupe_overlaps(valid(raws)))[: settings.clips]
     else:
         prompt = build_prompt(compact, settings.clips + 3, transcript.duration, exclude)
         first = _ask(llm, prompt, settings, raw_sink=raw_sink).clips
-        best = dedupe_overlaps(valid(first))[: settings.clips]
+        best = diversify(dedupe_overlaps(valid(first)))[: settings.clips]
         if len(first) < settings.clips:  # too few returned (not: too few kept after skips)
             best = _follow_up(best, compact, llm, settings, src, valid, raw_sink)
 
@@ -808,4 +1038,4 @@ def _follow_up(
     except LLMError as e:
         logger.warning("follow-up clip selection failed; keeping %d clip(s): %s", len(best), e)
         return best
-    return dedupe_overlaps(best + valid(more))[: settings.clips]
+    return diversify(dedupe_overlaps(best + valid(more)))[: settings.clips]

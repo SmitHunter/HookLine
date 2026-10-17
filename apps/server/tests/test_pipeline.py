@@ -58,7 +58,10 @@ def test_run_job_end_to_end_with_fakes(fixture_video, fake_llm, settings_tmp, mo
     rms_calls: list[Path] = []
     real_rms = run_mod.rms_per_second
     monkeypatch.setattr(run_mod, "rms_per_second", lambda w: rms_calls.append(w) or real_rms(w))
-    fake_llm.queue(make_payload_for(150, 2, 21))
+    payload = make_payload_for(150, 2, 21)
+    for c in payload["clips"]:
+        c["post_caption"] = "📰😂 He ran the whole kitchen alone. Could you?"
+    fake_llm.queue(payload)
     s = settings_tmp.model_copy(update={"clips": 2})
     logs: list[str] = []
     t = FakeTranscriber(duration=150)
@@ -67,12 +70,15 @@ def test_run_job_end_to_end_with_fakes(fixture_video, fake_llm, settings_tmp, mo
     assert all(probe_size(c) == (1080, 1920) for c in clips)
     assert all(probe_duration(c) == pytest.approx(21, abs=1.0) for c in clips)
     side = [json.loads(c.with_suffix(".json").read_text(encoding="utf-8")) for c in clips]
-    assert all(d["post_caption"] == "He ran the whole kitchen alone. Could you?" for d in side)
+    assert all(d["post_caption"] == "📰😂 He ran the whole kitchen alone. Could you?" for d in side)
+    # emoji are written as real UTF-8 (not ASCII escapes, not cp1252 mojibake) and read back
+    job = s.workspace_dir / job_id_for(str(fixture_video))
+    for f in [*(c.with_suffix(".json") for c in clips), job / "picks.json"]:
+        assert "📰😂".encode() in f.read_bytes(), f.name
     assert all(d["hashtags"] and d["search_title"] and d["verdict"] == "post" for d in side)
     assert all(d["first_words"] and d["hook_type"] and d["comment_risk"] for d in side)
     assert all(d["layout"] and "keep_ranges" in d and "removed_s" in d for d in side)
     assert any(m.startswith("clip 01: layouts=[") and "removed=" in m for m in logs)
-    job = s.workspace_dir / job_id_for(str(fixture_video))
     signals = json.loads((job / "signals.json").read_text(encoding="utf-8"))
     assert len(signals["loudness"]) >= 149 and signals["chat"] is None
     run_job(str(fixture_video), s, fake_llm, t, logs.append)
@@ -180,7 +186,7 @@ def test_picks_cache_key_mismatch_reselects(fixture_video, fake_llm, settings_tm
     job = s.workspace_dir / job_id_for(str(fixture_video))
     saved = json.loads((job / "picks.json").read_text(encoding="utf-8"))
     assert saved["key"] == {
-        "schema": 2,
+        "schema": 3,
         "clips": 1,
         "select_model": s.select_model,
         "min_clip_s": s.min_clip_s,
@@ -481,3 +487,9 @@ def test_run_job_passes_loud_seconds_to_render(fixture_video, fake_llm, settings
     s = settings_tmp.model_copy(update={"clips": 1, "vertical": False, "captions": False})
     run_job(str(fixture_video), s, fake_llm, FakeTranscriber(duration=150))
     assert seen == [set(range(20, 25))]
+
+
+def test_picks_schema_is_3_for_sentence_lines_and_cold_open_words(settings):
+    from hookline.pipeline.run import PICKS_SCHEMA, _picks_key
+
+    assert PICKS_SCHEMA == 3 and _picks_key(settings, {})["schema"] == 3

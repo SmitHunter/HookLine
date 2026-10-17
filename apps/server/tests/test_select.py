@@ -20,7 +20,7 @@ from hookline.pipeline.select import (
 _SCORE_KEYS = ("hook", "context", "payoff", "emotion", "length_fit", "pacing", "loop", "safety")
 
 
-def raw(start, end, total=50, cold_open_line=None, verdict="post", **kw):
+def raw(start, end, total=50, cold_open_words=None, verdict="post", **kw):
     """One candidate as the LLM returns it (SELECTION_SCHEMA item). `start`/`end` are seconds
     on the fixtures' 3 s sentence grid (sentence n starts at 3n): start_line is the sentence
     starting at `start`, end_line the last sentence starting before `end`."""
@@ -32,7 +32,7 @@ def raw(start, end, total=50, cold_open_line=None, verdict="post", **kw):
     item = {
         "start_line": start_line,
         "end_line": end_line,
-        "cold_open_line": cold_open_line,
+        "cold_open_words": cold_open_words,
         "first_words": f"line{start_line} says something here.",
         "last_words": f"line{end_line} says something here.",
         "hook_type": "bold_claim",
@@ -46,21 +46,26 @@ def raw(start, end, total=50, cold_open_line=None, verdict="post", **kw):
         "search_title": "Running a restaurant kitchen alone at 19",
         "category": "food",
         "comment_risk": "low",
-        "edit_beats": [f"zoom: 'wow' @ {start + 1}s"],
+        "edit_beats": [f"zoom: 'says' @ {start + 1}s"],
     }
     item.update(kw)
     return item
 
 
-def make_payload(n, extra=(), cold_open_line=None):
+def make_payload(n, extra=(), cold_open_words=None):
     """n valid, non-overlapping 30s candidates with descending scores, plus `extra` raw items."""
     clips = [
-        raw(30 + i * 60, 60 + i * 60, total=40 - i, cold_open_line=cold_open_line) for i in range(n)
+        raw(30 + i * 60, 60 + i * 60, total=40 - i, cold_open_words=cold_open_words)
+        for i in range(n)
     ]
     return {"clips": clips + list(extra)}
 
 
 EMPTY = {"clips": []}  # follow-up response with no further candidates
+
+
+def _L(n):  # the verbatim text of long_transcript line n
+    return f"line{n} says something here."
 
 
 def pick(start=30.0, end=55.0, total=0):
@@ -121,7 +126,7 @@ def test_chunking_when_over_budget(long_transcript, fake_llm, settings):
 
 
 def test_bad_cold_open_is_removed(long_transcript, fake_llm, settings):
-    fake_llm.queue(make_payload(8, cold_open_line=0))  # outside every clip
+    fake_llm.queue(make_payload(8, cold_open_words=_L(0)))  # outside every clip
     assert all(p.cold_open is None for p in select_clips(long_transcript, fake_llm, settings))
 
 
@@ -145,7 +150,7 @@ def test_returns_highest_scoring_picks(long_transcript, fake_llm, settings):
 
 
 def test_valid_cold_open_is_kept(long_transcript, fake_llm, settings):
-    fake_llm.queue({"clips": [raw(30, 60, cold_open_line=15)]}, EMPTY)
+    fake_llm.queue({"clips": [raw(30, 60, cold_open_words=_L(15))]}, EMPTY)
     (p,) = select_clips(long_transcript, fake_llm, settings)
     assert p.cold_open == (45.0, 47.3)  # the whole sentence L15
 
@@ -254,7 +259,8 @@ def test_schema_is_strict_and_has_no_numeric_bounds():
     props = item["properties"]
     assert set(props["scores"]["properties"]) == set(_SCORE_KEYS)
     assert props["start_line"] == {"type": "integer"} and props["end_line"] == {"type": "integer"}
-    assert props["cold_open_line"] == {"anyOf": [{"type": "integer"}, {"type": "null"}]}
+    assert props["cold_open_words"] == {"anyOf": [{"type": "string"}, {"type": "null"}]}
+    assert "cold_open_line" not in props
     assert props["hook_type"]["enum"] == [
         "bold_claim",
         "surprising_fact",
@@ -283,8 +289,8 @@ def test_system_prompt_covers_brief():
         "L{n}",
         "`start_line`",
         "`end_line`",
-        "`cold_open_line`",
-        "at most 5 seconds",
+        "`cold_open_words`",
+        "at most 6 seconds",
         # feed editor
         "feed editor, not a documentary editor",
         "stranger mid-scroll",
@@ -307,11 +313,9 @@ def test_system_prompt_covers_brief():
         '"yeah"',
         '"mm-hmm"',
         "backchannel",
-        "within 15 seconds",
         "echo the opening",
         # length
         "20–40 seconds",
-        "60 seconds only if the tension holds",
         # hook_text
         "3–7 words",
         "literally true",
@@ -381,14 +385,14 @@ def test_build_prompt_excerpt():
 
 
 def test_cold_open_teasing_final_line_is_kept(long_transcript, fake_llm, settings):
-    fake_llm.queue({"clips": [raw(30, 60, cold_open_line=19)]}, EMPTY)
+    fake_llm.queue({"clips": [raw(30, 60, cold_open_words=_L(19))]}, EMPTY)
     (p,) = select_clips(long_transcript, fake_llm, settings)
     assert (p.start, p.end) == (30.0, 59.3)
     assert p.cold_open == (57.0, 59.3)
 
 
 def test_cold_open_on_the_first_line_is_dropped(long_transcript, fake_llm, settings):
-    fake_llm.queue({"clips": [raw(30, 60, cold_open_line=10)]}, EMPTY)
+    fake_llm.queue({"clips": [raw(30, 60, cold_open_words=_L(10))]}, EMPTY)
     (p,) = select_clips(long_transcript, fake_llm, settings)
     assert p.cold_open is None
 
@@ -414,22 +418,23 @@ def _long_sentence_transcript():
     return Transcript(language="en", duration=200.0, segments=segments)
 
 
-def test_long_cold_open_line_is_trimmed_to_first_5s_on_word_boundaries(fake_llm, settings):
-    tr = _long_sentence_transcript()
-    item = raw(0, 60, cold_open_line=10, first_words="line0 says something here.")
+def test_cold_open_that_cannot_end_a_sentence_within_6s_is_dropped(fake_llm, settings, caplog):
+    tr = _long_sentence_transcript()  # L10: 30.0-39.5, its only terminal word is "end."
+    item = raw(0, 60, cold_open_words="w0 w1 w2 w3", first_words="line0 says something here.")
     item["last_words"] = "line15 says something here."
     item["end_line"] = 15  # L15 starts at 54.0 and ends at 56.3
     fake_llm.queue({"clips": [item]}, EMPTY)
-    (p,) = select_clips(tr, fake_llm, settings)
-    assert (p.start, p.end) == (0.0, 56.3)
-    assert p.cold_open == (30.0, 34.7)  # words end 30.5, 31.1 ... 34.7 (<= 35.0)
+    with caplog.at_level(logging.WARNING, logger="hookline.pipeline.select"):
+        (p,) = select_clips(tr, fake_llm, settings)
+    assert (p.start, p.end, p.cold_open) == (0.0, 56.3, None)
+    assert "dropped cold open" in caplog.text and "6" in caplog.text
 
 
 def test_cold_open_pushing_over_max_length_is_dropped_pick_kept(
     long_transcript, fake_llm, settings
 ):
     # main clip 30.0-104.3 = 74.3s (<= 75s); with a 2.3s cold open it would be 76.6s
-    fake_llm.queue({"clips": [raw(30, 103, cold_open_line=19)]}, EMPTY)
+    fake_llm.queue({"clips": [raw(30, 103, cold_open_words=_L(19))]}, EMPTY)
     (p,) = select_clips(long_transcript, fake_llm, settings)
     assert (p.start, p.end, p.cold_open) == (30.0, 104.3, None)
 
@@ -476,21 +481,23 @@ def _cold_open_warnings(caplog, llm, transcript, settings, item):
 
 def test_dropped_cold_open_outside_clip_logs_reason(long_transcript, fake_llm, settings, caplog):
     msgs = _cold_open_warnings(
-        caplog, fake_llm, long_transcript, settings, raw(30, 60, cold_open_line=0)
+        caplog, fake_llm, long_transcript, settings, raw(30, 60, cold_open_words=_L(0))
     )
-    assert len(msgs) == 1 and "Clip at 30" in msgs[0] and "outside the clip" in msgs[0]
+    assert len(msgs) == 1 and "Clip at 30" in msgs[0] and "not found in the clip" in msgs[0]
 
 
-def test_dropped_cold_open_out_of_range_logs_reason(long_transcript, fake_llm, settings, caplog):
+def test_dropped_cold_open_not_in_transcript_logs_reason(
+    long_transcript, fake_llm, settings, caplog
+):
     msgs = _cold_open_warnings(
-        caplog, fake_llm, long_transcript, settings, raw(30, 60, cold_open_line=999)
+        caplog, fake_llm, long_transcript, settings, raw(30, 60, cold_open_words="nobody said this")
     )
-    assert len(msgs) == 1 and "does not exist" in msgs[0]
+    assert len(msgs) == 1 and "not found in the clip" in msgs[0]
 
 
 def test_dropped_cold_open_over_max_length_logs_reason(long_transcript, fake_llm, settings, caplog):
     msgs = _cold_open_warnings_keep(
-        caplog, fake_llm, long_transcript, settings, raw(30, 103, cold_open_line=19)
+        caplog, fake_llm, long_transcript, settings, raw(30, 103, cold_open_words=_L(19))
     )
     assert len(msgs) == 1 and "maximum length" in msgs[0]
 
@@ -594,7 +601,7 @@ def _distinct_transcript() -> Transcript:
 def test_first_words_reanchor_start_within_three_lines(fake_llm, settings):
     item = raw(30, 60, first_words="Alpha12, bravo12 charlie12 delta12.")  # start_line 10
     (p,) = _one(_distinct_transcript(), fake_llm, settings, item)
-    assert p.start == 36.0 and p.first_words == "Alpha12, bravo12 charlie12 delta12."
+    assert p.start == 36.0 and p.first_words == "alpha12 bravo12 charlie12 delta12."
 
 
 def test_first_words_may_run_into_the_next_line(fake_llm, settings, caplog):
@@ -678,14 +685,14 @@ def test_every_candidate_skip_after_follow_up_raises(long_transcript, fake_llm, 
 
 def test_edit_beats_outside_clip_are_dropped(long_transcript, fake_llm, settings):
     beats = [
-        "zoom: 'before' @ 12.0s",
-        "zoom: 'inside' @ 31.5s",
+        "zoom: 'line4' @ 12.0s",
+        "zoom: 'line10' @ 31.5s",
         "emoji 😱 @ 59.3s",
-        "zoom: 'after' @ 61.0s",
+        "zoom: 'line20' @ 61.0s",
         "emphasis without a time",
     ]
     (p,) = _one(long_transcript, fake_llm, settings, raw(30, 60, edit_beats=beats))
-    assert p.edit_beats == ["zoom: 'inside' @ 31.5s", "emoji 😱 @ 59.3s"]
+    assert p.edit_beats == ["zoom: 'line10' @ 30.0s", "emoji 😱 @ 59.3s"]
 
 
 def test_post_copy_reaches_the_pick(long_transcript, fake_llm, settings):
@@ -854,34 +861,36 @@ def test_backchannel_still_steps_back_when_marker_is_elsewhere(fake_llm, setting
 
 
 def test_unfinished_last_line_extends_to_a_finished_one(fake_llm, settings, caplog):
-    tr = _lines_transcript({17: "and the news was not going to --", 18: "really tell it."})
-    item = _line_item(10, 17, _FILLER.format(n=10), "and the news was not going to --")
+    tr = _lines_transcript({17: "and the news was not going to...", 18: "really tell it."})
+    item = _line_item(10, 17, _FILLER.format(n=10), "and the news was not going to...")
     (p,) = _one(tr, fake_llm, settings, item, caplog)
     assert p.end == _end_of(tr, 18) and "extended to L18" in caplog.text
 
 
 def test_unfinished_last_line_extends_up_to_two_lines(fake_llm, settings):
-    tr = _lines_transcript({17: "so the thing is", 18: "that we never", 19: "got paid for it."})
-    item = _line_item(10, 17, _FILLER.format(n=10), "so the thing is")
+    tr = _lines_transcript(
+        {17: "so the thing is...", 18: "that we never...", 19: "got paid for it."}
+    )
+    item = _line_item(10, 17, _FILLER.format(n=10), "so the thing is...")
     (p,) = _one(tr, fake_llm, settings, item)
     assert p.end == _end_of(tr, 19)
 
 
 def test_unfinished_ending_without_completion_is_kept_and_logged(fake_llm, settings, caplog):
     # the next line is a backchannel, the one after is unfinished too: no extension
-    tr = _lines_transcript({17: "so the thing is --", 18: "Yeah.", 19: "and then"})
-    item = _line_item(10, 17, _FILLER.format(n=10), "so the thing is --")
+    tr = _lines_transcript({17: "so the thing is...", 18: "Yeah.", 19: "and then..."})
+    item = _line_item(10, 17, _FILLER.format(n=10), "so the thing is...")
     (p,) = _one(tr, fake_llm, settings, item, caplog)
     assert p.end == _end_of(tr, 17) and "could not be completed" in caplog.text
-    tr = _lines_transcript({17: "so the thing is", 18: "that we", 19: "never got"})
+    tr = _lines_transcript({17: "so the thing is...", 18: "that we...", 19: "never got..."})
     (p,) = _one(tr, fake_llm, settings, item, caplog)
     assert p.end == _end_of(tr, 17)
 
 
 def test_unfinished_ending_never_extends_past_max_clip_s(fake_llm, settings):
     s = settings.model_copy(update={"max_clip_s": 30})  # L10-L17 ~ 30 s already
-    tr = _lines_transcript({17: "so the thing is --", 18: "it worked."})
-    item = _line_item(10, 17, _FILLER.format(n=10), "so the thing is --")
+    tr = _lines_transcript({17: "so the thing is...", 18: "it worked."})
+    item = _line_item(10, 17, _FILLER.format(n=10), "so the thing is...")
     (p,) = _one(tr, fake_llm, s, item)
     assert p.end == _end_of(tr, 17)
 
@@ -897,7 +906,229 @@ def test_hashtags_strip_punctuation_ban_more_and_log_when_few(
 
 def test_dropped_edit_beats_are_logged(long_transcript, fake_llm, settings, caplog):
     caplog.set_level(logging.INFO, logger="hookline.pipeline.select")
-    beats = ["zoom: 'x' @ 5.0s", "no time here", "zoom: 'y' @ 31.0s"]
+    beats = ["zoom: 'x' @ 5.0s", "no time here", "zoom: 'says' @ 31.0s"]
     (p,) = _one(long_transcript, fake_llm, settings, raw(30, 60, edit_beats=beats))
-    assert p.edit_beats == ["zoom: 'y' @ 31.0s"]
+    assert p.edit_beats == ["zoom: 'says' @ 30.6s"]
     assert "dropped 2 edit beat(s)" in caplog.text
+
+
+# --- M2.5 wave A: sentence lines, verbatim cold opens, opener guard, packaging checks -------
+
+
+def test_prompt_lines_are_whole_sentences_not_pause_fragments(fake_llm, settings):
+    # "So" ... (1 s pause) ... "the rent doubled in a year." become one selection line
+    tr = _lines_transcript({15: "So", 16: "the rent doubled in a year."})
+    fake_llm.queue({"clips": [_line_item(10, 17, _FILLER.format(n=10), _FILLER.format(n=18))]})
+    fake_llm.queue(EMPTY)
+    select_clips(tr, fake_llm, settings)
+    prompt = fake_llm.calls[0]["prompt"]
+    assert "L15 [01:00.0] So the rent doubled in a year." in prompt
+    assert "L16 [01:08.0] filler17 words keep going here." in prompt
+
+
+_TEASE = "And so I think the thing you can predict is that capitalism"
+
+
+def _tease_transcript(rest="will eat every public good."):
+    # selection lines: L0-L14 fillers, L15 = original lines 15+16 (60.0-...), L16 = line 17 ...
+    return _lines_transcript({15: _TEASE, 16: rest})
+
+
+def test_cold_open_words_strip_lead_ins_and_extend_to_the_sentence_end(fake_llm, settings):
+    tr = _tease_transcript()
+    item = _line_item(10, 18, _FILLER.format(n=10), _FILLER.format(n=19), cold_open_words=_TEASE)
+    (p,) = _one(tr, fake_llm, settings, item)
+    # "And so I think" stripped: starts on "the" (word 4 -> 61.0); ends on "good." of line 16
+    assert p.cold_open == (61.0, _end_of(tr, 16))
+
+
+def test_cold_open_words_match_fuzzily_and_in_order(fake_llm, settings):
+    tr = _tease_transcript()
+    words = "thing you can predict is that capitalism will eat every public good"
+    item = _line_item(10, 18, _FILLER.format(n=10), _FILLER.format(n=19), cold_open_words=words)
+    (p,) = _one(tr, fake_llm, settings, item)
+    assert p.cold_open == (61.25, _end_of(tr, 16))
+
+
+def test_cold_open_dropped_when_no_sentence_end_within_6s(fake_llm, settings, caplog):
+    rest = " ".join(["on"] * 12) + " and forever."  # ends 67.45 s, 6.45 s after 61.0
+    tr = _tease_transcript(rest)
+    item = _line_item(10, 18, _FILLER.format(n=10), _FILLER.format(n=19), cold_open_words=_TEASE)
+    (p,) = _one(tr, fake_llm, settings, item, caplog)
+    assert p.cold_open is None
+    assert "dropped cold open" in caplog.text and "6" in caplog.text
+
+
+def test_cold_open_in_the_clips_first_sentence_is_dropped(fake_llm, settings, caplog):
+    tease = "the thing you can predict is that capitalism"  # a clean opener: no guard move
+    tr = _lines_transcript({15: tease, 16: "will eat every public good."})
+    first = tease + " will eat every public good."
+    item = _line_item(15, 22, first, _FILLER.format(n=23), cold_open_words=tease)
+    (p,) = _one(tr, fake_llm, settings, item, caplog)
+    assert p.cold_open is None and "first sentence" in caplog.text
+
+
+def test_cold_open_never_reaches_past_the_clip_end(fake_llm, settings, caplog):
+    s = settings.model_copy(update={"min_clip_s": 4})
+    tr = _tease_transcript()
+    # clip L10-L14 ends before the teaser sentence (L15): words beyond the clip are not used
+    item = _line_item(10, 14, _FILLER.format(n=10), _FILLER.format(n=14), cold_open_words=_TEASE)
+    (p,) = _one(tr, fake_llm, s, item, caplog)
+    assert p.cold_open is None and "not found in the clip" in caplog.text
+
+
+def _guard_item(tr_overrides, first_words, **kw):
+    tr = _lines_transcript(tr_overrides)
+    return tr, _line_item(10, 18, first_words, _FILLER.format(n=18), **kw)
+
+
+@pytest.mark.parametrize(
+    "opener",
+    [
+        "So the point is this.",
+        "And that changed everything.",
+        "Um, but here is the thing.",
+        "I was like, no way.",
+        "He goes, absolutely not.",
+        "They said we could not do it.",
+        '"Get out of my office," she said.',
+    ],
+)
+def test_bad_opener_moves_start_forward_one_sentence(fake_llm, settings, caplog, opener):
+    tr, item = _guard_item({10: opener}, opener)
+    (p,) = _one(tr, fake_llm, settings, item, caplog)
+    assert p.start == 44.0 and p.first_words == _FILLER.format(n=11)
+    assert "opener" in caplog.text
+
+
+def test_bad_opener_moves_up_to_two_sentences(fake_llm, settings):
+    tr, item = _guard_item({10: "But anyway.", 11: "Because he goes, what?"}, "But anyway.")
+    (p,) = _one(tr, fake_llm, settings, item)
+    assert p.start == 48.0
+
+
+def test_bad_opener_kept_and_logged_when_moving_breaks_min_length(fake_llm, settings, caplog):
+    s = settings.model_copy(update={"min_clip_s": 42})  # min 31.5 s; L10-L18 33.2, L11- 29.2
+    tr, item = _guard_item({10: "So the point is this."}, "So the point is this.")
+    (p,) = _one(tr, fake_llm, s, item, caplog)
+    assert p.start == 40.0 and "opener" in caplog.text and "keeping" in caplog.text
+
+
+def test_three_bad_openers_in_a_row_keep_the_start(fake_llm, settings, caplog):
+    bad = {10: "So yes.", 11: "And no.", 12: "But maybe."}
+    tr, item = _guard_item(bad, "So yes.")
+    (p,) = _one(tr, fake_llm, settings, item, caplog)
+    assert p.start == 40.0 and "keeping" in caplog.text
+
+
+def test_clean_opener_is_not_moved(fake_llm, settings):
+    tr, item = _guard_item({10: _CLAIM}, _CLAIM)
+    (p,) = _one(tr, fake_llm, settings, item)
+    assert p.start == 40.0 and p.first_words == _CLAIM
+
+
+def test_first_and_last_words_are_the_actual_sentences(fake_llm, settings):
+    tr = _lines_transcript({17: "so the thing is...", 18: "it worked."})
+    item = _line_item(10, 17, "something nobody said", "so the thing is...")
+    (p,) = _one(tr, fake_llm, settings, item)
+    assert p.first_words == _FILLER.format(n=10) and p.last_words == "it worked."
+
+
+def test_reaction_peak_may_be_as_short_as_12s(fake_llm, settings):
+    tr = _lines_transcript({})
+    short = _line_item(10, 13, _FILLER.format(n=10), _FILLER.format(n=13))  # ~13.2 s
+    assert _one(tr, fake_llm, settings, short) == []  # 15 s minimum for other hook types
+    short["hook_type"] = "reaction_peak"
+    (p,) = _one(tr, fake_llm, settings, short)
+    assert p.start == 40.0
+
+
+def test_quoted_title_kept_when_verbatim_in_the_clip(fake_llm, settings):
+    tr = _lines_transcript({12: _CLAIM})
+    title = 'Chef: "a three-hundred-cover Saturday on my own"'
+    item = _line_item(10, 18, _FILLER.format(n=10), _FILLER.format(n=18), title=title)
+    (p,) = _one(tr, fake_llm, settings, item)
+    assert p.title == title
+
+
+@pytest.mark.parametrize(
+    ("title", "expected"),
+    [
+        ('Chef: "I ran the whole restaurant alone"', "Chef: I ran the whole restaurant alone"),
+        ("Chef: “I ran it alone”", "Chef: I ran it alone"),
+    ],
+)
+def test_paraphrased_quote_in_title_loses_its_quote_marks(fake_llm, settings, title, expected):
+    tr = _lines_transcript({12: _CLAIM})
+    item = _line_item(10, 18, _FILLER.format(n=10), _FILLER.format(n=18), title=title)
+    (p,) = _one(tr, fake_llm, settings, item)
+    assert p.title == expected
+
+
+@pytest.mark.parametrize(
+    "caption",
+    [
+        "Big call from the chef. Agree or disagree?",
+        "She stood her ground. Thoughts?",
+        "Has a story ever flipped your view?",
+        "What do you think?",
+    ],
+)
+def test_template_caption_question_is_logged_and_kept(
+    long_transcript, fake_llm, settings, caplog, caption
+):
+    (p,) = _one(long_transcript, fake_llm, settings, raw(30, 60, post_caption=caption), caplog)
+    assert p.post_caption == caption and "template caption" in caplog.text
+
+
+def test_specific_caption_question_is_not_flagged(long_transcript, fake_llm, settings, caplog):
+    _one(long_transcript, fake_llm, settings, raw(30, 60), caplog)
+    assert "template caption" not in caplog.text
+
+
+def test_edit_beat_snaps_to_nearest_occurrence_within_3s(long_transcript, fake_llm, settings):
+    beats = [
+        "zoom: 'says' @ 35.0s",  # 'says' at 33.6 and 36.6 -> 33.6 is 1.4 s away, 36.6 is 1.6
+        "zoom: 'line12' @ 40.5s",  # line12 at 36.0: 4.5 s away -> dropped
+        "zoom: 'Line15,' @ 44.0s",  # case and punctuation normalised -> 45.0
+    ]
+    (p,) = _one(long_transcript, fake_llm, settings, raw(30, 60, edit_beats=beats))
+    assert p.edit_beats == ["zoom: 'says' @ 33.6s", "zoom: 'Line15,' @ 45.0s"]
+
+
+def test_same_category_pick_ranks_below_other_categories(long_transcript, fake_llm, settings):
+    s = settings.model_copy(update={"clips": 2})
+    a = raw(30, 60, total=60, category="Politics")
+    b = raw(90, 120, total=55, category="politics ")
+    c = raw(150, 180, total=40, category="media")
+    fake_llm.queue({"clips": [a, b, c]})
+    picks = select_clips(long_transcript, fake_llm, s)
+    assert [round(p.start) for p in picks] == [30, 150]
+
+
+def test_same_category_pick_still_fills_when_nothing_else(long_transcript, fake_llm, settings):
+    s = settings.model_copy(update={"clips": 2})
+    fake_llm.queue({"clips": [raw(30, 60, total=60), raw(90, 120, total=55)]})
+    assert [round(p.start) for p in select_clips(long_transcript, fake_llm, s)] == [30, 90]
+
+
+def test_system_prompt_covers_wave_a():
+    for needle in (
+        "`cold_open_words`",
+        "never mark it skip only because of its opening",
+        "never a topic label",
+        "never promise visuals",
+        "complement",
+        "famous people, brands or institutions",
+        "read the next 20 seconds",
+        "45 seconds",
+        "two plausible answers",
+        '"Agree or disagree?"',
+        '"Thoughts?"',
+        '"What do you think?"',
+        "same theme",
+        "scores 12",
+        "scores 22",
+        "as short as 12 seconds",
+    ):
+        assert needle in SYSTEM_PROMPT, needle

@@ -20,7 +20,7 @@ from hookline.transcribe.base import words_to_transcript
 from hookline.vision.faces import FaceDetector
 
 STAGES = 6
-PICKS_SCHEMA = 2  # bump when picks change shape or meaning, so old picks.json re-select
+PICKS_SCHEMA = 3  # bump when picks change shape or meaning, so old picks.json re-select
 
 
 def transcript_key(transcriber: Transcriber) -> dict:

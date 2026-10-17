@@ -111,3 +111,46 @@ def test_clip_pick_new_fields_default_so_old_caches_validate(sample_pick):
     assert back.first_words == "" and back.hashtags == [] and back.post_caption == ""
     assert back.hook_type is None and back.comment_risk is None and back.verdict == "maybe"
     assert new <= set(back.model_dump())
+
+
+# --- selection lines: terminal punctuation only, pause split only for 25 s runs -------------
+
+
+def test_selection_lines_ignore_pauses_inside_a_sentence():
+    from hookline.transcript_text import selection_lines
+
+    words = [w(0, 0.3, "So"), w(1.5, 1.8, "I"), w(1.9, 2.2, "think"), w(3.5, 3.8, "to")]
+    words += [w(3.9, 4.3, "win."), w(4.5, 4.9, "Next"), w(5.0, 5.4, "one!")]
+    assert [s.text for s in selection_lines(words)] == ["So I think to win.", "Next one!"]
+
+
+def test_selection_lines_split_on_closing_quotes():
+    from hookline.transcript_text import selection_lines
+
+    words = [w(0, 0.4, "He"), w(0.5, 0.9, 'said "stop."'), w(1.0, 1.4, "Next?”")]
+    words += [w(1.5, 1.9, "More")]
+    assert [s.text for s in selection_lines(words)] == ['He said "stop."', "Next?”", "More"]
+
+
+def test_selection_lines_split_a_long_unpunctuated_run_at_its_longest_gap():
+    from hookline.transcript_text import selection_lines
+
+    # 0.5 s words every 0.6 s, except a 2 s gap after word 20 (ends 12.5, next starts 14.5)
+    words = [w(round(i * 0.6, 2), round(i * 0.6 + 0.5, 2), f"w{i}") for i in range(21)]
+    words += [
+        w(round(14.5 + i * 0.6, 2), round(14.5 + i * 0.6 + 0.5, 2), f"v{i}") for i in range(30)
+    ]
+    lines = selection_lines(words)
+    assert lines[0].text.split()[-1] == "w20" and lines[0].end == 12.5
+    assert lines[1].start == 14.5
+    assert all(s.end - s.start <= 25.0 for s in lines)
+    assert sum(len(s.text.split()) for s in lines) == len(words)
+
+
+def test_selection_lines_cap_every_run_at_25s():
+    from hookline.transcript_text import selection_lines
+
+    words = [w(i, i + 0.5, "yap") for i in range(80)]  # uniform gaps
+    lines = selection_lines(words)
+    assert all(s.end - s.start <= 25.0 for s in lines) and len(lines) >= 4
+    assert selection_lines([]) == []
