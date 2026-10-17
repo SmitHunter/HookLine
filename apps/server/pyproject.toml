@@ -11,6 +11,8 @@ dependencies = [
     "av<18",
     "anthropic",
     "rich",
+    "opencv-python-headless>=5.0.0.93",
+    "scenedetect>=0.7.2",
 ]
 
 [project.scripts]
@@ -32,3 +34,8 @@ markers = ["integration: slow tests that load real models (deselect with -m 'not
 
 [tool.ruff]
 line-length = 100
+
+[tool.uv]
+# scenedetect hard-depends on opencv-python (GUI build), which clobbers the cv2 package of
+# opencv-python-headless when both are installed. Exclude it; headless provides cv2.
+override-dependencies = ["opencv-python; sys_platform == 'never'"]

@@ -211,3 +211,21 @@ def tone_wav(tmp_path_factory: pytest.TempPathFactory) -> Path:
         tmp_path_factory.mktemp("audio") / "tone.wav",
         "sine=frequency=440:sample_rate=16000:duration=3",
     )
+
+
+FIXTURES = Path(__file__).parent / "fixtures"
+
+
+@pytest.fixture(scope="session")
+def synthetic_stream(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """3 s 1920x1080 testsrc2 with portrait.jpg (400 px tall) as a top-right facecam."""
+    out = tmp_path_factory.mktemp("stream") / "stream.mp4"
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+         "-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=25:duration=3",
+         "-loop", "1", "-i", str(FIXTURES / "portrait.jpg"),
+         "-filter_complex", "[1:v]scale=-2:400[cam];[0:v][cam]overlay=W-w-40:40:shortest=1[v]",
+         "-map", "[v]", "-t", "3", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(out)],
+        check=True,
+    )  # fmt: skip
+    return out

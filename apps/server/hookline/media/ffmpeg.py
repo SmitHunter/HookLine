@@ -59,6 +59,28 @@ def probe_duration(path: Path) -> float:
     return float(json.loads(res.stdout)["format"]["duration"])
 
 
+def probe_size(path: Path) -> tuple[int, int]:
+    """(width, height) of the first video stream."""
+    res = _run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "json",
+            str(path),
+        ]
+    )
+    streams = json.loads(res.stdout).get("streams") or []
+    if not streams:
+        raise FFmpegError(f"no video stream in {path}")
+    return int(streams[0]["width"]), int(streams[0]["height"])
+
+
 def extract_audio(src: Path, dst: Path) -> Path:
     _run(
         [

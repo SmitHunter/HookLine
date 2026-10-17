@@ -15,6 +15,10 @@ TWITCH_DL_URL = (
     f"{TWITCH_DL_VERSION}/TwitchDownloaderCLI-{TWITCH_DL_VERSION}-Windows-x64.zip"
 )
 TWITCH_DL_EXE = "TwitchDownloaderCLI.exe"
+YUNET_URL = (
+    "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/"
+    "face_detection_yunet_2023mar.onnx"
+)
 _TIMEOUT_S = 60
 _CHUNK = 1024 * 256
 
@@ -76,3 +80,8 @@ def ensure_twitch_downloader() -> Path:
         tmp.unlink(missing_ok=True)
         raise AssetError(f"could not extract {TWITCH_DL_EXE}: {e}") from e
     return exe
+
+
+def ensure_yunet() -> Path:
+    """YuNet face-detection model (MIT, ~230 KB), cached under tools/models/."""
+    return fetch(YUNET_URL, tools_dir() / "models" / Path(YUNET_URL).name)
