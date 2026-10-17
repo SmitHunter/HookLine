@@ -12,10 +12,11 @@ def pick(start, end, **kw):
 
 
 def words_from(text, start, step=0.5, until=None):
-    """Words at `step` spacing from `start`; the last word ends at `until` if given."""
+    """Words at `step` spacing from `start` (gaps of 0.3*step, i.e. a filler-trim pause at the
+    default step); the last word ends at `until` if given."""
     toks = text.split()
     out = [
-        Word(start=start + i * step, end=start + i * step + step * 0.8, text=t)
+        Word(start=start + i * step, end=start + i * step + step * 0.7, text=t)
         for i, t in enumerate(toks)
     ]
     if until is not None:
@@ -33,33 +34,33 @@ def test_filler_list_is_verbatim():
 def test_trims_leading_filler():
     ws = words_from("and so the city never told us", start=10)
     p = refine_boundaries(pick(10, 40), ws, [])
-    assert p.start == ws[2].start
+    assert p.start == pytest.approx(ws[2].start - 0.10)  # lead-in, after the trimmed "so"
 
 
 def test_trims_punctuated_and_two_word_fillers():
     ws = words_from("Okay, I mean, you know the city", start=10)
     p = refine_boundaries(pick(10, 40), ws, [])
-    assert p.start == ws[3].start  # "okay" + "i mean"... capped at 3 words
+    assert p.start == pytest.approx(ws[3].start - 0.10)  # "okay" + "i mean"; capped at 3
 
 
 def test_trims_at_most_three_words():
     ws = words_from("and so but like the city", start=10)
     p = refine_boundaries(pick(10, 40), ws, [])
-    assert p.start == ws[3].start
+    assert p.start == pytest.approx(ws[3].start - 0.10)
 
 
 def test_no_filler_trim_below_15s_floor():
     ws = words_from("and so the city", start=10)
     p = refine_boundaries(pick(10, 25.0), ws, [])  # trimming would leave < 15s
-    assert p.start == 10
+    assert p.start == pytest.approx(9.9)  # untrimmed; only the lead-in
     p = refine_boundaries(pick(10, 40), ws, [])
-    assert p.start == ws[2].start
+    assert p.start == pytest.approx(ws[2].start - 0.10)
 
 
 def test_floor_stops_partway():
     ws = words_from("and so the city", start=10)
     p = refine_boundaries(pick(10, 25.8), ws, [])  # first trim ok (15.3), second not
-    assert p.start == ws[1].start
+    assert p.start == pytest.approx(ws[1].start - 0.10)
 
 
 def test_snaps_start_into_preceding_silence():
@@ -74,9 +75,9 @@ def test_snaps_end_into_following_silence():
     assert p.end == pytest.approx(40.15)
 
 
-def test_no_silence_leaves_bounds():
+def test_no_silence_adds_lead_in_only():
     p = refine_boundaries(pick(10, 40), words_from("the city", start=10), [])
-    assert (p.start, p.end) == (10, 40)
+    assert (p.start, p.end) == (pytest.approx(9.9), 40)
 
 
 def test_start_never_passes_first_word():
@@ -111,9 +112,9 @@ def test_end_snap_does_not_cross_next_word():
 
 
 def test_snap_does_not_reinclude_trimmed_filler():
-    ws = [W(10.0, 10.3, "um"), W(10.7, 10.9, "so"), W(11.0, 11.4, "the"), W(11.5, 11.9, "city")]
+    ws = [W(10.0, 10.3, "um"), W(10.7, 10.85, "so"), W(11.0, 11.4, "the"), W(11.5, 11.9, "city")]
     p = refine_boundaries(pick(10.0, 40), ws, [(10.3, 10.7)])
-    assert p.start >= 10.9  # "um" and "so" stay trimmed even though a silence sits before "so"
+    assert p.start >= 10.85  # "um" and "so" stay trimmed even though a silence sits before "so"
 
 
 def test_nearest_silence_wins():
@@ -128,7 +129,7 @@ def test_curly_quotes_and_dashes_stripped_from_fillers():
     ws = [ws[0], ws[2], ws[3]]
     ws[0] = ws[0].model_copy(update={"text": "“So,”"})
     p = refine_boundaries(pick(10, 40), ws, [])
-    assert p.start == ws[1].start
+    assert p.start == pytest.approx(ws[1].start - 0.10)
 
 
 def test_empty_words_and_silences():
@@ -136,4 +137,35 @@ def test_empty_words_and_silences():
     p = refine_boundaries(pick(10, 40), [], [(9.8, 10.1)])
     assert p.end == 40 and p.start == pytest.approx(10.05)
     p = refine_boundaries(pick(10, 40), words_from("the city", start=10), [])
-    assert (p.start, p.end) == (10, 40)
+    assert (p.start, p.end) == (pytest.approx(9.9), 40)
+
+
+def test_filler_run_into_next_word_is_kept():
+    # "so" flows straight into "the" (0.05 s gap, no silence): it is speech, not an opener
+    ws = [W(10.0, 10.25, "so"), W(10.3, 10.6, "the"), W(10.7, 11.0, "city")]
+    p = refine_boundaries(pick(10.0, 40), ws, [])
+    assert p.start == pytest.approx(9.9)
+
+
+def test_filler_trimmed_when_silence_separates_it():
+    ws = [W(10.0, 10.25, "so"), W(10.3, 10.6, "the"), W(10.7, 11.0, "city")]
+    p = refine_boundaries(pick(10.0, 40), ws, [(10.24, 10.31)])
+    assert p.start >= 10.25 and p.start <= 10.3
+
+
+def test_filler_trimmed_on_word_gap_of_0_12s():
+    ws = [W(10.0, 10.25, "so"), W(10.37, 10.6, "the"), W(10.7, 11.0, "city")]
+    p = refine_boundaries(pick(10.0, 40), ws, [])
+    assert p.start == pytest.approx(10.27)  # lead-in 0.10 s, capped at the filler's end
+
+
+def test_lead_in_capped_at_previous_word_end():
+    ws = [W(9.7, 9.95, "end."), W(10.0, 10.4, "the"), W(10.5, 10.9, "city")]
+    p = refine_boundaries(pick(10.0, 40), ws, [])
+    assert p.start == pytest.approx(9.95)
+
+
+def test_no_lead_in_after_silence_snap():
+    ws = words_from("the city", start=10.2)
+    p = refine_boundaries(pick(10.2, 40), ws, [(9.5, 10.1)])
+    assert p.start == pytest.approx(10.05)

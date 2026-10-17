@@ -21,6 +21,8 @@ FILLER_OPENERS: tuple[str, ...] = (
 _MAX_FILLER_WORDS = 3
 _MIN_MAIN_S = 15.0
 _SNAP_MARGIN_S = 0.05
+_FILLER_PAUSE_S = 0.12  # a filler must be followed by this much gap (or a silence) to go
+_LEAD_IN_S = 0.10  # breath before the first word when no silence snap placed the start
 _PUNCTUATION = ",.!?…\"'-:;–—‘’“”"
 
 
@@ -28,7 +30,16 @@ def _norm(word: Word) -> str:
     return word.text.lower().strip().strip(_PUNCTUATION)
 
 
-def _trim_fillers(start: float, end: float, clip_words: list[Word]) -> float:
+def _paused_after(word: Word, nxt: Word, silences: list[tuple[float, float]]) -> bool:
+    """True when a word gap >= 0.12 s or a silence separates `word` from `nxt`."""
+    if nxt.start - word.end >= _FILLER_PAUSE_S - 1e-6:
+        return True
+    return any(a <= nxt.start and b >= word.end for a, b in silences)
+
+
+def _trim_fillers(
+    start: float, end: float, clip_words: list[Word], silences: list[tuple[float, float]]
+) -> float:
     i = 0
     while i < len(clip_words) and i < _MAX_FILLER_WORDS:
         step = 0
@@ -42,6 +53,8 @@ def _trim_fillers(start: float, end: float, clip_words: list[Word]) -> float:
             step = 1
         if not step or i + step >= len(clip_words):
             break
+        if not _paused_after(clip_words[i + step - 1], clip_words[i + step], silences):
+            break  # the "filler" runs straight into the next word: it is part of the sentence
         new_start = clip_words[i + step].start
         if end - new_start < _MIN_MAIN_S:
             break
@@ -56,13 +69,15 @@ def refine_boundaries(
     silences: list[tuple[float, float]],
     window: float = 0.4,
 ) -> ClipPick:
-    """Trim up to 3 leading filler words, then snap start/end into silences within `window`.
+    """Trim up to 3 leading filler words (only those followed by a pause), then snap
+    start/end into silences within `window`. Without a start snap, the start gets a 0.10 s
+    lead-in before the first word (never before the previous word's end).
 
     Never moves `start` past the first remaining word's start, nor `end` before the last
     word's end. Pure: no I/O."""
     start, end = pick.start, pick.end
     idxs = [i for i, w in enumerate(words) if start - 1e-6 <= w.start < end]
-    start = _trim_fillers(start, end, [words[i] for i in idxs])
+    start = _trim_fillers(start, end, [words[i] for i in idxs], silences)
 
     first_idx = next((i for i in idxs if words[i].start >= start - 1e-6), None)
     last_idx = idxs[-1] if idxs else None
@@ -79,6 +94,8 @@ def refine_boundaries(
     near = _nearest_silence(silences, start, window)
     if near:
         start = near[1] - _SNAP_MARGIN_S
+    elif first_start is not None:
+        start = max(lo, first_start - _LEAD_IN_S)
     near = _nearest_silence(silences, end, window)
     if near:
         end = near[0] + _SNAP_MARGIN_S
