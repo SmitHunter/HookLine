@@ -458,3 +458,14 @@ def test_markers_reach_chunk_prompts(long_transcript, fake_llm, settings):
     select_clips(long_transcript, fake_llm, s, markers={31: ["🔊loud"], 400: ["🔊loud"]})
     assert len(fake_llm.calls) > 1
     assert sum("⟨🔊loud⟩" in c["prompt"] for c in fake_llm.calls) >= 2
+
+
+def test_chunk_prompts_keep_markers_on_their_own_lines(long_transcript, fake_llm, settings):
+    # a marker at the very end belongs to the transcript's last sentence only; a chunk ending
+    # earlier must not pull it onto its own last line
+    s = settings.model_copy(update={"max_prompt_tokens": 500})
+    fake_llm.queue_forever(make_payload(5))
+    select_clips(long_transcript, fake_llm, s, markers={599: ["🔥end"]})
+    prompts = [c["prompt"] for c in fake_llm.calls]
+    assert len(prompts) > 1
+    assert all("🔥end" not in p for p in prompts[:-1]) and "🔥end" in prompts[-1]

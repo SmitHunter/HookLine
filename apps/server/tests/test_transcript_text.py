@@ -84,3 +84,14 @@ def test_compact_marker_window_is_half_open_and_ordered_deduped():
 
 def test_compact_no_markers_unchanged():
     assert compact_transcript([Sentence(start=1, end=2, text="Hi.")], {}) == "[00:01.0] Hi."
+
+
+def test_compact_pause_markers_attach_to_next_sentence():
+    sents = [Sentence(start=10, end=12, text="A."), Sentence(start=15, end=17, text="B.")]
+    out = compact_transcript(sents, {11: ["x"], 13: ["pause"], 20: ["late"]})
+    assert out == "[00:10.0] A. ⟨x⟩\n[00:15.0] B. ⟨pause late⟩"
+
+
+def test_compact_markers_before_first_sentence_attach_to_it():
+    sents = [Sentence(start=10, end=12, text="A.")]
+    assert compact_transcript(sents, {3: ["early"]}) == "[00:10.0] A. ⟨early⟩"

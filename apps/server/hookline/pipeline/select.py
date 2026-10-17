@@ -377,8 +377,10 @@ def _chunks(
     primaries: list[list[Sentence]] = []
     cur: list[Sentence] = []
     size = 0
-    for s in sentences:
-        line_len = len(compact_transcript([s], markers)) + 1
+    # Line lengths from the whole transcript, so markers attach exactly as in the full text.
+    lines = compact_transcript(sentences, markers).split("\n")
+    for s, line in zip(sentences, lines, strict=True):
+        line_len = len(line) + 1
         if cur and size + line_len > max_chars:
             primaries.append(cur)
             cur, size = [], 0
@@ -420,6 +422,9 @@ def select_clips(
 
     if len(compact) / 4 > settings.max_prompt_tokens:
         chunks = _chunks(sentences, settings.max_prompt_tokens * 4, markers)
+        # Chunk lines are cut from the full text: re-rendering a chunk alone would hand its
+        # last sentence every marker after it (it has no "next sentence" in the chunk).
+        line_of = dict(zip(map(id, sentences), compact.split("\n"), strict=True))
         logger.info("transcript over prompt budget; selecting across %d chunks", len(chunks))
         raws = []
         for i, chunk in enumerate(chunks, 1):
@@ -428,7 +433,7 @@ def select_clips(
                 f"{format_timestamp(chunk[0].start)}-{format_timestamp(chunk[-1].end)})"
             )
             prompt = build_prompt(
-                compact_transcript(chunk, markers),
+                "\n".join(line_of[id(s)] for s in chunk),
                 settings.clips,
                 duration,
                 exclude,
