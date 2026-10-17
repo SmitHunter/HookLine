@@ -2,7 +2,6 @@ import json
 import os
 from collections.abc import Callable
 from pathlib import Path
-from statistics import median
 
 from hookline.assets import AssetError, ensure_yunet
 from hookline.config import Settings
@@ -15,7 +14,7 @@ from hookline.pipeline.chat import chat_keywords, chat_rate, try_fetch_chat
 from hookline.pipeline.ingest import find_source, ingest, job_id_for
 from hookline.pipeline.render import render_clip
 from hookline.pipeline.select import NoClipsSelectedError, select_clips
-from hookline.pipeline.signals import Signals, heat_markers
+from hookline.pipeline.signals import Signals, heat_markers, heat_seconds, loud_seconds
 from hookline.transcribe import Transcriber
 from hookline.transcribe.base import words_to_transcript
 from hookline.vision.faces import FaceDetector
@@ -140,11 +139,8 @@ def _signals(
 
 
 def _loud_seconds(signals: Signals) -> set[int]:
-    """Seconds at least 6 dB above the median loudness (shouted words), for filler trimming."""
-    if not signals.loudness:
-        return set()
-    threshold = median(signals.loudness) + _LOUD_FILLER_DB
-    return {i for i, db in enumerate(signals.loudness) if db >= threshold}
+    """Seconds 6 dB above the median (and over the -30 dB floor): shouted words."""
+    return loud_seconds(signals.loudness, _LOUD_FILLER_DB)
 
 
 def _face_detector(settings: Settings, log: Callable[[str], None]) -> FaceDetector | None:
@@ -229,7 +225,12 @@ def run_job(
         raw_payloads: list[dict] = []
         try:
             picks = select_clips(
-                transcript, llm, settings, raw_sink=raw_payloads, markers=heat_markers(signals)
+                transcript,
+                llm,
+                settings,
+                raw_sink=raw_payloads,
+                markers=heat_markers(signals),
+                heat_seconds=heat_seconds(signals),
             )
         finally:  # kept even when selection fails, for debugging what Claude returned
             atomic_write_text(

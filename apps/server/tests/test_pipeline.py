@@ -453,14 +453,14 @@ def test_signals_gain_chat_kinds_and_old_cache_is_recomputed(fixture_video, fake
     fake_llm.queue(make_payload_for(150, 1, 21))
     run_job(str(fixture_video), s, fake_llm, FakeTranscriber(duration=150))
     sig = json.loads((job / "signals.json").read_text(encoding="utf-8"))
-    assert sig["chat_kinds"] == {"5": {"laugh": 2}}
+    assert sig["chat_kinds"] == {"5": {"laugh": 1}}
     # an old cache (chat but no chat_kinds) is recomputed while chat.json exists
     del sig["chat_kinds"]
     (job / "signals.json").write_text(json.dumps(sig), encoding="utf-8")
     fake_llm.queue(make_payload_for(150, 1, 21))
     run_job(str(fixture_video), s, fake_llm, FakeTranscriber(duration=150))
     sig = json.loads((job / "signals.json").read_text(encoding="utf-8"))
-    assert sig["chat_kinds"] == {"5": {"laugh": 2}}
+    assert sig["chat_kinds"] == {"5": {"laugh": 1}}
 
 
 def test_run_job_passes_loud_seconds_to_render(fixture_video, fake_llm, settings_tmp, monkeypatch):

@@ -14,30 +14,24 @@ _EMOTE_WEIGHT = 0.5
 CHAT_TIMEOUT_S = 600
 
 
-# Emote names / single-letter spam are exact, case-sensitive tokens; words and phrases are
-# matched case-insensitively.
+# Single-letter spam stays an exact uppercase token; emote names of 2+ chars match
+# case-insensitively; words and phrases are lowercase.
+_LETTERS = {"W": "hype", "L": "fail", "F": "fail"}
 _EMOTES: dict[str, str] = {}
 for _kind, _names in {
-    "laugh": ("KEKW", "LUL", "LULW", "OMEGALUL", "ICANT"),
-    "hype": ("Pog", "PogChamp", "POGGERS", "W", "LETSGO"),
-    "fail": ("L", "F", "Sadge"),
-    "shock": ("WTF", "monkaS", "D:"),
+    "laugh": ("kekw", "lul", "lulw", "omegalul", "icant"),
+    "hype": ("pog", "pogchamp", "poggers", "letsgo"),
+    "fail": ("sadge",),
+    "shock": ("wtf", "monkas", "d:"),
 }.items():
     _EMOTES.update(dict.fromkeys(_names, _kind))
-_WORDS: dict[str, str] = {
-    "lmao": "laugh",
-    "lol": "laugh",
-    "letsgo": "hype",
-    "wtf": "shock",
-    "!clip": "clip",
-}
-_PHRASES: dict[str, str] = {
-    "lets go": "hype",
-    "clip it": "clip",
-    "clip that": "clip",
-}
-_SUBSTRINGS: dict[str, str] = {"😂": "laugh"}
-_TOKEN_STRIP = ".,!?:;\"'()"
+_STRETCHED: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"lma+o+"), "laugh"),
+    (re.compile(r"lo+l+"), "laugh"),
+)
+_PHRASES: dict[str, str] = {"lets go": "hype", "clip it": "clip", "clip that": "clip"}
+_PUNCT = '.,?:;"()'
+_REPEAT_RE = re.compile(r"(.)\1{2,}")
 
 
 class ChatError(Exception):
@@ -96,32 +90,39 @@ def chat_rate(chat_json: dict, duration: float) -> list[float]:
     return out
 
 
-def _message_kinds(body: str) -> list[str]:
-    """Reaction kind of each keyword hit in one chat message body."""
-    hits: list[str] = []
-    toks = body.split()
-    for tok in toks:
-        exact = _EMOTES.get(tok) or _EMOTES.get(tok.strip(_TOKEN_STRIP))
-        if exact:
-            hits.append(exact)
-            continue
-        word = tok.lower().strip(_TOKEN_STRIP.replace("!", ""))
-        kind = _WORDS.get(word) or _WORDS.get(tok.lower().strip(_TOKEN_STRIP))
-        if kind:
-            hits.append(kind)
-    lowered = [t.lower().strip(_TOKEN_STRIP) for t in toks]
-    for a, b in itertools.pairwise(lowered):
-        kind = _PHRASES.get(f"{a} {b}")
-        if kind:
-            hits.append(kind)
-    for sub, kind in _SUBSTRINGS.items():
-        if sub in body:
-            hits.append(kind)
-    return hits
+def _message_kinds(body: str) -> set[str]:
+    """The reaction kinds present in one chat message (each kind counted once)."""
+    text = body.replace("\u2019", "'")
+    kinds: set[str] = set()
+    cleaned: list[str] = []
+    for tok in text.split():
+        stripped = tok.strip(_PUNCT)
+        core = stripped.strip("!")
+        if core in _LETTERS:
+            kinds.add(_LETTERS[core])
+        low = core.lower()
+        if low == "clip" and "!" in stripped:
+            kinds.add("clip")
+        if tok.lower() == "d:":
+            kinds.add("shock")
+        word = _REPEAT_RE.sub(r"\1\1", low)
+        if low in _EMOTES:
+            kinds.add(_EMOTES[low])
+        for pat, kind in _STRETCHED:
+            if pat.fullmatch(word):
+                kinds.add(kind)
+        cleaned.append(low.replace("'", ""))
+    for a, b in itertools.pairwise(cleaned):
+        if (kind := _PHRASES.get(f"{a} {b}")) is not None:
+            kinds.add(kind)
+    if "\U0001f602" in text:
+        kinds.add("laugh")
+    return kinds
 
 
 def chat_keywords(chat_json: dict, duration: float) -> dict[int, Counter]:
-    """Per-second counts of reaction keywords (laugh / hype / fail / clip / shock) in chat."""
+    """Per-second counts of reaction keywords (laugh / hype / fail / clip / shock) in chat;
+    a kind counts at most once per message so one spammer cannot set a spike's character."""
     out: dict[int, Counter] = {}
     for c in chat_json.get("comments", []):
         if not isinstance(c, dict):
@@ -134,10 +135,15 @@ def chat_keywords(chat_json: dict, duration: float) -> dict[int, Counter]:
             continue
         body = msg.get("body")
         if not isinstance(body, str):
-            continue
-        hits = _message_kinds(body)
-        if hits:
-            out.setdefault(int(t), Counter()).update(hits)
+            frags = msg.get("fragments")
+            if not isinstance(frags, list):
+                continue
+            body = " ".join(
+                f["text"] for f in frags if isinstance(f, dict) and isinstance(f.get("text"), str)
+            )
+        kinds = _message_kinds(body)
+        if kinds:
+            out.setdefault(int(t), Counter()).update(kinds)
     return out
 
 

@@ -13,6 +13,7 @@ _LOUD_FLOOR_DB = -30.0
 _KIND_EMOJI = {"laugh": "😂", "hype": "🏆", "fail": "💀", "shock": "😱"}
 _KIND_SHARE = 0.4
 _CLIP_MIN_REQUESTS = 3
+CLIP_MARKER = "\u2702\ufe0fclip"
 
 
 class Signals(BaseModel):
@@ -50,14 +51,13 @@ def _clip_markers(kinds: dict[int, dict[str, int]], n: int) -> dict[int, str]:
     for i in range(n):
         hot = _window_kinds(kinds, i).get("clip", 0) >= _CLIP_MIN_REQUESTS
         if hot and not prev_hot:
-            out[i] = "✂️clip"
+            out[i] = CLIP_MARKER
         prev_hot = hot
     return out
 
 
-def _chat_markers(
-    chat: list[float], kinds: dict[int, dict[str, int]] | None = None
-) -> dict[int, str]:
+def _chat_hot(chat: list[float]) -> list[float | None]:
+    """Per second: the spike ratio vs the local baseline when that second is hot, else None."""
     n = len(chat)
     prefix = [0.0]
     for v in chat:
@@ -68,30 +68,54 @@ def _chat_markers(
         prefix[min(n, i + _CHAT_WINDOW_S - before)] - prefix[max(0, i - before)] for i in range(n)
     ]
     half = _CHAT_BASELINE_S // 2
-    out: dict[int, str] = {}
-    prev_hot = False
+    out: list[float | None] = []
     for i, s in enumerate(sums):
         baseline = max(median(sums[max(0, i - half) : i + half + 1]), _CHAT_MIN_BASELINE)
-        hot = s >= _CHAT_RATIO * baseline
-        if hot and not prev_hot:
-            emoji = _dominant_emoji(_window_kinds(kinds, i)) if kinds else ""
-            out[i] = f"🔥chat×{round(s / baseline)}{emoji}"
-        prev_hot = hot
+        out.append(s / baseline if s >= _CHAT_RATIO * baseline else None)
     return out
+
+
+def _chat_markers(
+    chat: list[float], kinds: dict[int, dict[str, int]] | None = None
+) -> dict[int, str]:
+    out: dict[int, str] = {}
+    prev_hot = False
+    for i, ratio in enumerate(_chat_hot(chat)):
+        if ratio is not None and not prev_hot:
+            emoji = _dominant_emoji(_window_kinds(kinds, i)) if kinds else ""
+            out[i] = f"\U0001f525chat\u00d7{round(ratio)}{emoji}"
+        prev_hot = ratio is not None
+    return out
+
+
+def _loud_hot(loudness: list[float], over_median_db: float) -> list[bool]:
+    if not loudness:
+        return []
+    threshold = median(loudness) + over_median_db
+    return [db >= threshold and db > _LOUD_FLOOR_DB for db in loudness]
+
+
+def loud_seconds(loudness: list[float], over_median_db: float = _LOUD_OVER_MEDIAN_DB) -> set[int]:
+    """Seconds at least `over_median_db` above the median and above the absolute floor."""
+    return {i for i, hot in enumerate(_loud_hot(loudness, over_median_db)) if hot}
 
 
 def _loud_markers(loudness: list[float]) -> dict[int, str]:
-    if not loudness:
-        return {}
-    threshold = median(loudness) + _LOUD_OVER_MEDIAN_DB
     out: dict[int, str] = {}
     prev_hot = False
-    for i, db in enumerate(loudness):
-        hot = db >= threshold and db > _LOUD_FLOOR_DB
+    for i, hot in enumerate(_loud_hot(loudness, _LOUD_OVER_MEDIAN_DB)):
         if hot and not prev_hot:
-            out[i] = "🔊loud"
+            out[i] = "\U0001f50aloud"
         prev_hot = hot
     return out
+
+
+def heat_seconds(signals: Signals) -> set[int]:
+    """Every second inside a loud run or a chat-spike run (not only each run's first second)."""
+    secs = loud_seconds(signals.loudness)
+    if signals.chat:
+        secs |= {i for i, r in enumerate(_chat_hot(signals.chat)) if r is not None}
+    return secs
 
 
 def heat_markers(signals: Signals) -> dict[int, list[str]]:

@@ -142,7 +142,7 @@ def test_chat_rate_tolerates_malformed():
 def test_chat_keywords_on_fixture():
     k = chat_keywords(load("twitch_chat_sample.json"), duration=10)
     assert k[3] == {"hype": 1}
-    assert k[5] == {"laugh": 3}
+    assert k[5] == {"laugh": 2}  # one per message, not per token
     assert 0 not in k and 4 not in k
 
 
@@ -187,3 +187,43 @@ def test_chat_keywords_tolerates_malformed():
     bad = {"comments": [None, {"content_offset_seconds": "x"}, {"content_offset_seconds": 1}]}
     assert chat_keywords(bad, duration=5) == {}
     assert chat_keywords({}, duration=5) == {}
+
+
+def _kinds_of(body, frags=None):
+    msg = {"fragments": frags or []}
+    if body is not None:
+        msg["body"] = body
+    return chat_keywords({"comments": [{"content_offset_seconds": 1, "message": msg}]}, 5)
+
+
+def test_spam_message_counts_each_kind_once():
+    assert _kinds_of("KEKW KEKW KEKW KEKW")[1] == {"laugh": 1}
+    assert _kinds_of("!clip !clip !clip")[1] == {"clip": 1}
+    assert _kinds_of("!clip it")[1] == {"clip": 1}
+
+
+def test_emote_names_case_insensitive_but_single_letters_exact():
+    assert _kinds_of("kekw")[1] == {"laugh": 1}
+    assert _kinds_of("Lul")[1] == {"laugh": 1}
+    assert _kinds_of("pog")[1] == {"hype": 1}
+    assert _kinds_of("OmegaLUL")[1] == {"laugh": 1}
+    assert 1 not in _kinds_of("w l f")
+
+
+def test_stretched_words_and_apostrophes():
+    assert _kinds_of("lmaooooo")[1] == {"laugh": 1}
+    assert _kinds_of("lolllll")[1] == {"laugh": 1}
+    assert _kinds_of("let's go")[1] == {"hype": 1}
+    assert _kinds_of("let’s go!")[1] == {"hype": 1}
+
+
+def test_clip_with_bangs_and_emote_inside_a_sentence():
+    assert _kinds_of("!clip!")[1] == {"clip": 1}
+    assert _kinds_of("clip!")[1] == {"clip": 1}
+    assert 1 not in _kinds_of("that clip was long")
+    assert _kinds_of("omg that was so KEKW honestly")[1] == {"laugh": 1}
+
+
+def test_body_missing_uses_fragments():
+    k = _kinds_of(None, [{"text": "nice", "emoticon": None}, {"text": "KEKW"}])
+    assert k[1] == {"laugh": 1}

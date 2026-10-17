@@ -7,6 +7,7 @@ in seconds; this module maps lines back to sentence times, re-anchors a start wh
 
 import itertools
 import logging
+import math
 import re
 from collections import Counter
 from collections.abc import Callable
@@ -27,6 +28,7 @@ from hookline.models import (
     Verdict,
     Word,
 )
+from hookline.pipeline.signals import CLIP_MARKER
 from hookline.transcript_text import compact_transcript, format_timestamp, split_sentences
 
 logger = logging.getLogger(__name__)
@@ -60,7 +62,7 @@ Some lines end with markers in angle brackets, such as `⟨🔥chat×4 🔊loud�
 and audio reactions inside that sentence: `🔥chat×N` means chat activity ran about N times the \
 usual rate, and `🔊loud` means the audio got far louder than normal. An emoji after \
 `🔥chat×N` says what chat was reacting with (😂 laughing, 🏆 hype, 💀 a fail, 😱 shock), and \
-`✂️clip` means chat is asking for a clip. Treat them as evidence of \
+`<<CLIP_MARKER>>` means chat is asking for a clip. Treat them as evidence of \
 emotional intensity, not a requirement: a moment without markers can still be great, and a \
 marked one can still be a poor clip.
 
@@ -194,6 +196,7 @@ Return the number of candidates requested, ranked best first, each with its verd
 material is thin, still return them, mark the weak ones `skip` and score them honestly. Never \
 pick a moment that overlaps a range you are told to avoid.
 """
+SYSTEM_PROMPT = SYSTEM_PROMPT.replace("<<CLIP_MARKER>>", CLIP_MARKER)
 
 _SCORE_MAX = {
     "hook": 25,
@@ -323,7 +326,7 @@ class _Source:
     duration: float
     settings: Settings
     exclude: list[tuple[float, float]]
-    markers: dict[int, list[str]] | None = None  # second -> heat markers
+    heat: frozenset[int] | None = None  # every second inside a loud / chat-spike run
 
 
 def build_prompt(
@@ -470,15 +473,13 @@ def _is_finished(text: str) -> bool:
     return not t.endswith(_UNFINISHED_ENDINGS) and t.endswith((".", "!", "?"))
 
 
-def _is_marked(sentence: Sentence, src: _Source) -> bool:
-    """True when a loud or chat-spike marker falls in the sentence's seconds."""
-    if not src.markers:
+def _is_marked(sentence: Sentence, heat: frozenset[int] | set[int] | None) -> bool:
+    """True when a loud or chat-spike second falls in [floor(start), ceil(end))."""
+    if not heat:
         return False
-    return any(
-        m.startswith(("🔊", "🔥"))
-        for sec in range(int(sentence.start), int(sentence.end) + 1)
-        for m in src.markers.get(sec, ())
-    )
+    lo = math.floor(sentence.start)
+    hi = max(math.ceil(sentence.end), lo + 1)
+    return any(sec in heat for sec in range(lo, hi))
 
 
 def _fix_ending(raw: _RawClip, first: int, last: int, src: _Source) -> int:
@@ -491,7 +492,7 @@ def _fix_ending(raw: _RawClip, first: int, last: int, src: _Source) -> int:
         last > first
         and _is_backchannel(toks[last])
         and raw.hook_type != "reaction_peak"
-        and not _is_marked(sents[last], src)
+        and not _is_marked(sents[last], src.heat)
     ):
         logger.info("clip %r: L%d is a backchannel; ending on L%d", raw.title, last, last - 1)
         last -= 1
@@ -714,6 +715,7 @@ def select_clips(
     exclude: list[tuple[float, float]] = [],  # noqa: B006 - never mutated
     raw_sink: list[dict] | None = None,
     markers: dict[int, list[str]] | None = None,
+    heat_seconds: set[int] | None = None,
 ) -> list[ClipPick]:
     """Pick up to `settings.clips` post/maybe clips, sorted by start. If `raw_sink` is given,
     each raw LLM payload is appended to it. `markers` (second -> heat markers) annotate the
@@ -721,6 +723,13 @@ def select_clips(
     if transcript.duration < settings.short_input_s:
         return [polish_pick(transcript)]
 
+    heat = heat_seconds
+    if heat is None and markers:  # fall back to each run's first second
+        heat = {
+            sec
+            for sec, ms in markers.items()
+            if any(m.startswith(("\U0001f50a", "\U0001f525")) for m in ms)
+        }
     words = transcript.words()
     sentences = split_sentences(words)
     src = _Source(
@@ -730,7 +739,7 @@ def select_clips(
         duration=transcript.duration,
         settings=settings,
         exclude=exclude,
-        markers=markers,
+        heat=frozenset(heat) if heat is not None else None,
     )
     compact = compact_transcript(sentences, markers)
     returned: list[_RawClip] = []

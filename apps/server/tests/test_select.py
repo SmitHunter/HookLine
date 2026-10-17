@@ -826,6 +826,26 @@ def test_backchannel_kept_when_last_sentence_is_marked(fake_llm, settings, marke
     assert p.end == _end_of(tr, 18)
 
 
+def test_backchannel_kept_when_loud_run_began_earlier(fake_llm, settings):
+    tr = _lines_transcript({18: "Yeah."})  # L18 starts at 72.0
+    fake_llm.queue({"clips": [_end_item("Yeah.")]}, EMPTY)
+    (p,) = select_clips(tr, fake_llm, settings, heat_seconds={70, 71, 72})
+    assert p.end == _end_of(tr, 18)
+    fake_llm.queue({"clips": [_end_item("Yeah.")]}, EMPTY)
+    (p,) = select_clips(tr, fake_llm, settings, heat_seconds={73})  # next line's second
+    assert p.end == _end_of(tr, 17)
+
+
+def test_is_marked_ignores_the_next_sentences_second():
+    from hookline.models import Sentence
+    from hookline.pipeline.select import _is_marked
+
+    s = Sentence(start=72.0, end=73.0, text="Yeah.")
+    assert not _is_marked(s, {73})
+    assert _is_marked(s, {72})
+    assert _is_marked(Sentence(start=72.4, end=73.2, text="Yeah."), {73})
+
+
 def test_backchannel_still_steps_back_when_marker_is_elsewhere(fake_llm, settings):
     tr = _lines_transcript({18: "Mm-hmm."})
     fake_llm.queue({"clips": [_end_item("Mm-hmm.")]}, EMPTY)

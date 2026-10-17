@@ -1,4 +1,10 @@
-from hookline.pipeline.signals import Signals, heat_markers
+from hookline.pipeline.signals import (
+    CLIP_MARKER,
+    Signals,
+    heat_markers,
+    heat_seconds,
+    loud_seconds,
+)
 
 
 def test_chat_spike_marked_once():
@@ -81,3 +87,36 @@ def test_chat_kinds_round_trip_through_json():
     sig = _spike({"laugh": 5})
     back = Signals.model_validate_json(sig.model_dump_json())
     assert back.chat_kinds == sig.chat_kinds
+
+
+def test_dominant_kind_share_boundary_is_40_percent():
+    at = heat_markers(_spike({"laugh": 4, "hype": 3, "fail": 3}))
+    assert next(x for v in at.values() for x in v).endswith("😂")
+    below = heat_markers(_spike({"laugh": 4, "hype": 3, "fail": 3, "shock": 1}))
+    assert " " not in next(x for v in below.values() for x in v)
+
+
+def test_clip_marker_constant_is_shared_with_prompt():
+    from hookline.pipeline.select import SYSTEM_PROMPT
+
+    assert CLIP_MARKER == "✂️clip"
+    assert CLIP_MARKER in SYSTEM_PROMPT
+
+
+def test_loud_seconds_has_absolute_floor():
+    quiet = [-50.0] * 100
+    quiet[10:13] = [-40.0] * 3  # above median + 6 dB, but below -30 dB
+    assert loud_seconds(quiet, 6.0) == set()
+    ok = [-40.0] * 100
+    ok[10:13] = [-20.0] * 3
+    assert loud_seconds(ok, 6.0) == {10, 11, 12}
+
+
+def test_heat_seconds_cover_whole_runs():
+    loud = [-40.0] * 100
+    loud[20:25] = [-10.0] * 5
+    chat = [1.0] * 600
+    chat[300:310] = [8.0] * 10
+    heat = heat_seconds(Signals(duration=600, loudness=loud + [-40.0] * 500, chat=chat))
+    assert set(range(20, 25)) <= heat
+    assert 305 in heat and 100 not in heat and 450 not in heat
