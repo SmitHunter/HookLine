@@ -107,3 +107,25 @@ def test_render_clip_silence_window_uses_original_segments(
         fixture_video, fixture_wav, pick, fixture_words, tmp_path, tmp_path / "03-x.mp4", s, None
     )
     assert seen == [(29.0, 64.0)]
+
+
+@pytest.mark.parametrize("protect", [True, False])
+def test_render_clip_word_protection_flag(
+    fixture_video, fixture_wav, fixture_words, sample_pick, settings, tmp_path, monkeypatch, protect
+):
+    from hookline.pipeline import render as render_mod
+
+    seen = []
+    real = render_mod.keep_ranges
+
+    def spy(*a, **k):
+        seen.append(k.get("words"))
+        return real(*a, **k)
+
+    monkeypatch.setattr(render_mod, "keep_ranges", spy)
+    s = settings.model_copy(update={"vertical": False, "captions": False})
+    render_clip(
+        fixture_video, fixture_wav, sample_pick, fixture_words, tmp_path, tmp_path / "04-p.mp4",
+        s, None, protect_words=protect,
+    )  # fmt: skip
+    assert (seen[0] is not None and len(seen[0]) > 0) if protect else seen[0] is None

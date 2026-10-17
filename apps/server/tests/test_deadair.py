@@ -54,3 +54,34 @@ def test_snap_ranges_merges_small_gaps_only_forward():
 
 def test_snap_ranges_drops_empty():
     assert snap_ranges([(1.0, 1.01), (2.0, 3.0)], 25) == [(2.0, 3.0)]
+
+
+def test_cut_never_lands_inside_a_word():
+    # silence 2.0-4.0 overlaps "didn't" (1.5-2.6): only the word-free part (padded) is cut
+    words = [w(1.5, 2.6, "didn't")]
+    assert keep_ranges([(0, 10)], [(2.0, 4.0)]) == [(0, 2.08), (3.92, 10)]
+    keep = keep_ranges([(0, 10)], [(2.0, 4.0)], words=words)
+    assert keep == [(0, 2.76), (3.92, 10)]
+
+
+def test_silence_split_by_word_only_cuts_long_pieces():
+    # padded word 4.92-5.28 splits the silence: 4.7-4.92 (0.22 s) stays, 5.28-7.0 is cut
+    words = [w(5.0, 5.2, "uh")]
+    keep = keep_ranges([(0, 10)], [(4.7, 7.0)], words=words)
+    assert keep == [(0, 5.36), (6.92, 10)]
+
+
+def test_remap_keeps_word_clipped_to_a_sliver():
+    out = remap_words([w(1.0, 1.5, "didn't")], [(0.0, 1.013)])
+    assert len(out) == 1 and out[0].end - out[0].start == pytest.approx(0.05)
+    assert out[0].end <= 1.013 + 1e-9
+
+
+def test_remap_sliver_at_range_start_extends_forward_within_range():
+    out = remap_words([w(0.5, 1.007, "x")], [(1.0, 2.0)])
+    assert (out[0].start, out[0].end) == pytest.approx((0.0, 0.05))
+
+
+def test_remap_does_not_stretch_uncut_short_words():
+    out = remap_words([w(1.0, 1.02, "a")], [(0.0, 2.0)])
+    assert out[0].end - out[0].start == pytest.approx(0.02)

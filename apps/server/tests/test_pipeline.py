@@ -230,3 +230,27 @@ def test_all_clips_failing_raises(fixture_video, fake_llm, settings_tmp, monkeyp
     s = settings_tmp.model_copy(update={"clips": 1})
     with pytest.raises(FFmpegError, match="no clips rendered"):
         run_job(str(fixture_video), s, fake_llm, FakeTranscriber(duration=150))
+
+
+@pytest.mark.parametrize(("timing", "protect"), [("segment", False), ("dtw", True)])
+def test_word_protection_follows_transcript_timing(
+    fixture_video, fake_llm, settings_tmp, monkeypatch, timing, protect
+):
+    from hookline.pipeline import run as run_mod
+
+    seen = []
+    real = run_mod.render_clip
+
+    def spy(*a, **k):
+        seen.append(k.get("protect_words"))
+        return real(*a, **k)
+
+    class Timed(FakeTranscriber):
+        def transcribe(self, wav, on_progress=None):
+            return super().transcribe(wav, on_progress).model_copy(update={"timing": timing})
+
+    monkeypatch.setattr(run_mod, "render_clip", spy)
+    fake_llm.queue(make_payload_for(150, 1, 21))
+    s = settings_tmp.model_copy(update={"clips": 1, "vertical": False, "captions": False})
+    run_job(str(fixture_video), s, fake_llm, Timed(duration=150))
+    assert seen == [protect]

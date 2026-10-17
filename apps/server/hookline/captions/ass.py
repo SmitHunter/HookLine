@@ -31,7 +31,7 @@ def _normalise(words: list[Word]) -> list[Word]:
     """Drop slivers and merge adjacent same-text fragments (from remap_words cuts)."""
     out: list[Word] = []
     for word in words:
-        if word.end - word.start < MIN_WORD_S:
+        if word.end - word.start < MIN_WORD_S - 1e-6:  # tolerate 3-dp rounding
             continue
         if out and out[-1].text == word.text and word.start - out[-1].end <= MERGE_GAP_S:
             out[-1] = out[-1].model_copy(update={"end": word.end})

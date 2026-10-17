@@ -42,12 +42,16 @@ def render_clip(
     dst: Path,
     settings: Settings,
     detector: FaceDetector | None,
+    protect_words: bool = True,
 ) -> dict:
     """Write the finished clip to `dst`; returns sidecar extras (layout, keep_ranges, removed_s).
 
     The intermediate cut (`work_dir/NN.mp4`, near-lossless libx264, deleted after success)
     and the ASS file live in `work_dir`. Video is lossily encoded once (the final encode);
-    audio once (the intermediate's AAC, copied into the final file)."""
+    audio once (the intermediate's AAC, copied into the final file).
+
+    `protect_words` keeps dead-air cuts out of word spans; pass False for
+    segment-interpolated word times, which tile the timeline with no gaps."""
     work_dir.mkdir(parents=True, exist_ok=True)
     dst.parent.mkdir(parents=True, exist_ok=True)
     name = dst.stem.split("-", 1)[0]
@@ -60,7 +64,15 @@ def render_clip(
     refined = refine_boundaries(pick, near, silences)
     fps = probe_fps(src)
     # Frame-grid bounds make the cut timeline exact, so remapped caption times stay in sync.
-    keep = snap_ranges(keep_ranges(refined.segments(), silences, settings.max_pause_s), fps)
+    keep = snap_ranges(
+        keep_ranges(
+            refined.segments(),
+            silences,
+            settings.max_pause_s,
+            words=near if protect_words else None,
+        ),
+        fps,
+    )
 
     inter = cut_segments(
         src, keep, work_dir / f"{name}.mp4", "libx264", quality=INTERMEDIATE_QUALITY, fps=fps

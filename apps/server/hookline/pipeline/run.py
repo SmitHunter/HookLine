@@ -185,11 +185,16 @@ def run_job(
     work_dir = job_dir / "render"
     detector = _face_detector(settings, log)
     words = transcript.words()
+    # Segment-interpolated word times are contiguous (no gaps), so protecting them from cuts
+    # would remove no dead air at all; only real word timings (DTW / whisper) are protected.
+    protect = transcript.timing != "segment"
     clips: list[Path] = []
     for i, pick in enumerate(picks, 1):
         dst = out_dir / f"{i:02d}-{slugify(pick.title)}.mp4"
         try:
-            extras = render_clip(src, wav, pick, words, work_dir, dst, settings, detector)
+            extras = render_clip(
+                src, wav, pick, words, work_dir, dst, settings, detector, protect_words=protect
+            )
         except FFmpegError as e:
             reason = str(e).splitlines()[0]
             if e.stderr:
