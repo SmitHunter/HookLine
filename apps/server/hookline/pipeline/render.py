@@ -13,13 +13,14 @@ from hookline.media.ffmpeg import (
     encoder_args,
     pick_encoder,
     probe_duration,
+    probe_fps,
     probe_size,
 )
 from hookline.media.reframe import detect_crop, reframe_graph
 from hookline.media.subtitles import fonts_dir, subtitles_filter
 from hookline.models import ClipPick, Word
 from hookline.pipeline.boundaries import refine_boundaries
-from hookline.pipeline.deadair import keep_ranges, remap_words
+from hookline.pipeline.deadair import keep_ranges, remap_words, snap_ranges
 from hookline.pipeline.layout import SceneLayout, plan_layouts
 from hookline.vision.faces import FaceDetector
 
@@ -44,8 +45,9 @@ def render_clip(
 ) -> dict:
     """Write the finished clip to `dst`; returns sidecar extras (layout, keep_ranges, removed_s).
 
-    The intermediate cut (`work_dir/NN.mp4`, near-lossless libx264) and the ASS file live in
-    `work_dir`; the only lossy encode is the final one."""
+    The intermediate cut (`work_dir/NN.mp4`, near-lossless libx264, deleted after success)
+    and the ASS file live in `work_dir`. Video is lossily encoded once (the final encode);
+    audio once (the intermediate's AAC, copied into the final file)."""
     work_dir.mkdir(parents=True, exist_ok=True)
     dst.parent.mkdir(parents=True, exist_ok=True)
     name = dst.stem.split("-", 1)[0]
@@ -56,10 +58,12 @@ def render_clip(
     silences = detect_silences(wav, lo, hi, settings.silence_db)
     near = [w for w in words if w.end > lo and w.start < hi]
     refined = refine_boundaries(pick, near, silences)
-    keep = keep_ranges(refined.segments(), silences, settings.max_pause_s)
+    fps = probe_fps(src)
+    # Frame-grid bounds make the cut timeline exact, so remapped caption times stay in sync.
+    keep = snap_ranges(keep_ranges(refined.segments(), silences, settings.max_pause_s), fps)
 
     inter = cut_segments(
-        src, keep, work_dir / f"{name}.mp4", "libx264", quality=INTERMEDIATE_QUALITY
+        src, keep, work_dir / f"{name}.mp4", "libx264", quality=INTERMEDIATE_QUALITY, fps=fps
     )
     crop = detect_crop(inter)
     in_w, in_h = (crop[0], crop[1]) if crop else probe_size(inter)
@@ -87,12 +91,13 @@ def render_clip(
             "-filter_complex", graph,
             "-map", out_label, "-map", "0:a?",
             *encoder_args(pick_encoder()), "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "192k",
+            "-c:a", "copy",  # the intermediate's AAC 192k is the one lossy audio encode
             "-movflags", "+faststart",
             str(tmp),
         ]
     )  # fmt: skip
     os.replace(tmp, dst)
+    inter.unlink(missing_ok=True)
 
     kept = sum(e - s for s, e in keep)
     return {

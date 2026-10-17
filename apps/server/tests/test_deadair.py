@@ -1,7 +1,7 @@
 import pytest
 
 from hookline.models import Word
-from hookline.pipeline.deadair import keep_ranges, remap_words
+from hookline.pipeline.deadair import keep_ranges, remap_words, snap_ranges
 
 
 def w(s, e, t):
@@ -41,3 +41,16 @@ def test_remap_shifts_words_after_cut():
 def test_remap_duplicates_words_in_cold_open():
     out = remap_words([w(50.5, 51, "x")], [(50, 52), (30, 55)])
     assert [round(x.start, 2) for x in out] == [0.5, 22.5]
+
+
+def test_snap_ranges_snaps_to_frame_grid():
+    assert snap_ranges([(1.01, 2.03)], 25) == [(1.0, 2.04)]
+
+
+def test_snap_ranges_merges_small_gaps_only_forward():
+    keep = [(1.0, 2.0), (2.1, 3.0), (3.48, 4.0), (0.2, 0.8)]
+    assert snap_ranges(keep, 25) == [(1.0, 3.0), (3.48, 4.0), (0.2, 0.8)]
+
+
+def test_snap_ranges_drops_empty():
+    assert snap_ranges([(1.0, 1.01), (2.0, 3.0)], 25) == [(2.0, 3.0)]

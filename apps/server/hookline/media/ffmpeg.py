@@ -133,24 +133,66 @@ def pick_encoder() -> str:
     return "libx264"
 
 
+def probe_fps(path: Path) -> float:
+    """Frame rate of the first video stream (r_frame_rate, falling back to avg_frame_rate)."""
+    res = _run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=r_frame_rate,avg_frame_rate", "-of", "json", str(path),
+        ]
+    )  # fmt: skip
+    streams = json.loads(res.stdout).get("streams") or []
+    if not streams:
+        raise FFmpegError(f"no video stream in {path}")
+    for key in ("r_frame_rate", "avg_frame_rate"):
+        num, _, den = str(streams[0].get(key, "0/0")).partition("/")
+        try:
+            fps = float(num) / float(den or 1)
+        except (ValueError, ZeroDivisionError):
+            continue
+        if 1 <= fps <= 240:
+            return fps
+    raise FFmpegError(f"unknown frame rate for {path}")
+
+
+_SEEK_PREROLL_S = 1.0
+
+
 def cut_segments(
     src: Path,
     segments: list[tuple[float, float]],
     dst: Path,
     encoder: str,
     quality: list[str] | None = None,
+    fps: float | None = None,
 ) -> Path:
     """Concatenate `segments` of `src` into `dst`. `quality`, when given, replaces the
-    encoder's default rate-control args."""
+    encoder's default rate-control args.
+
+    Each piece is decoded from a seek point ~1 s early and cut with trim/atrim, so the output
+    timeline is exactly the sum of the segments when their bounds lie on the source frame
+    grid: video takes the frames whose timestamps fall in [start, end) (bounds shifted half a
+    frame to absorb rounding), audio is sample-trimmed to the same span."""
+    if fps is None:
+        fps = probe_fps(src)
+    half = 0.5 / fps
     video = encoder_args(encoder) if quality is None else ["-c:v", encoder, *quality]
     cmd = ["ffmpeg", "-hide_banner", "-y"]
-    for start, end in segments:
-        cmd += ["-ss", f"{start:.3f}", "-to", f"{end:.3f}", "-i", str(src)]
+    parts = []
+    for i, (start, end) in enumerate(segments):
+        seek = max(0.0, round((start - _SEEK_PREROLL_S) * fps) / fps)
+        a, b = start - seek, end - seek
+        cmd += ["-ss", f"{seek:.6f}", "-t", f"{b + 1:.6f}", "-i", str(src)]
+        parts.append(
+            f"[{i}:v]trim=start={max(a - half, 0):.6f}:end={b - half:.6f},"
+            f"setpts=PTS-STARTPTS[v{i}];"
+            f"[{i}:a]atrim=start={a:.6f}:end={b:.6f},asetpts=PTS-STARTPTS[a{i}]"
+        )
     n = len(segments)
-    inputs = "".join(f"[{i}:v][{i}:a]" for i in range(n))
+    inputs = "".join(f"[v{i}][a{i}]" for i in range(n))
     cmd += [
         "-filter_complex",
-        f"{inputs}concat=n={n}:v=1:a=1[v][a]",
+        ";".join(parts) + f";{inputs}concat=n={n}:v=1:a=1[v][a]",
         "-map",
         "[v]",
         "-map",

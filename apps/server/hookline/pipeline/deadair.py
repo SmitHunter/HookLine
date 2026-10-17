@@ -31,6 +31,29 @@ def keep_ranges(
     return kept
 
 
+MERGE_GAP_S = 0.15
+
+
+def snap_ranges(
+    keep: list[tuple[float, float]], fps: float, merge_gap: float = MERGE_GAP_S
+) -> list[tuple[float, float]]:
+    """Merge each range into the previous one when it starts less than `merge_gap` after it
+    ends (forward gaps only), then snap every bound to the source frame grid (k / fps) and
+    drop ranges that become empty. The output timeline is then exactly sum(end - start)."""
+    merged: list[tuple[float, float]] = []
+    for start, end in keep:
+        if merged and 0 <= start - merged[-1][1] < merge_gap:
+            merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
+        else:
+            merged.append((start, end))
+    out = []
+    for start, end in merged:
+        a, b = round(start * fps), round(end * fps)
+        if b > a:
+            out.append((a / fps, b / fps))
+    return out
+
+
 def remap_words(words: list[Word], keep: list[tuple[float, float]]) -> list[Word]:
     """Move word timings onto the output timeline of the kept ranges."""
     out: list[Word] = []

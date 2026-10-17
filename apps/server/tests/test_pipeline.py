@@ -194,3 +194,39 @@ def test_old_list_picks_json_reselects(fixture_video, fake_llm, settings_tmp):
     logs: list[str] = []
     run_job(str(fixture_video), s, fake_llm, t, logs.append)
     assert len(fake_llm.calls) == 2 and any("old format" in m for m in logs)
+
+
+def test_failed_clip_is_skipped_and_logged(fixture_video, fake_llm, settings_tmp, monkeypatch):
+    from hookline.media.ffmpeg import FFmpegError
+    from hookline.pipeline import run as run_mod
+
+    real = run_mod.render_clip
+    calls = [0]
+
+    def flaky(*a, **k):
+        calls[0] += 1
+        if calls[0] == 1:
+            raise FFmpegError("ffmpeg exited with code 1", "boom line")
+        return real(*a, **k)
+
+    monkeypatch.setattr(run_mod, "render_clip", flaky)
+    fake_llm.queue(make_payload_for(150, 2, 21))
+    s = settings_tmp.model_copy(update={"clips": 2, "vertical": False, "captions": False})
+    logs: list[str] = []
+    clips = run_job(str(fixture_video), s, fake_llm, FakeTranscriber(duration=150), logs.append)
+    assert [c.name[:2] for c in clips] == ["02"]
+    assert any(m.startswith("warning: clip 01 failed: ffmpeg exited with code 1") for m in logs)
+
+
+def test_all_clips_failing_raises(fixture_video, fake_llm, settings_tmp, monkeypatch):
+    from hookline.media.ffmpeg import FFmpegError
+    from hookline.pipeline import run as run_mod
+
+    def boom(*a, **k):
+        raise FFmpegError("ffmpeg exited with code 1")
+
+    monkeypatch.setattr(run_mod, "render_clip", boom)
+    fake_llm.queue(make_payload_for(150, 1, 21))
+    s = settings_tmp.model_copy(update={"clips": 1})
+    with pytest.raises(FFmpegError, match="no clips rendered"):
+        run_job(str(fixture_video), s, fake_llm, FakeTranscriber(duration=150))

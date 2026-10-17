@@ -8,7 +8,7 @@ from hookline.config import Settings
 from hookline.fsutil import atomic_write_text, slugify
 from hookline.llm import LLMBackend
 from hookline.media.audio import rms_per_second
-from hookline.media.ffmpeg import extract_audio
+from hookline.media.ffmpeg import FFmpegError, extract_audio
 from hookline.models import ClipPick, Transcript
 from hookline.pipeline.chat import chat_rate, try_fetch_chat
 from hookline.pipeline.ingest import find_source, ingest, job_id_for
@@ -188,7 +188,14 @@ def run_job(
     clips: list[Path] = []
     for i, pick in enumerate(picks, 1):
         dst = out_dir / f"{i:02d}-{slugify(pick.title)}.mp4"
-        extras = render_clip(src, wav, pick, words, work_dir, dst, settings, detector)
+        try:
+            extras = render_clip(src, wav, pick, words, work_dir, dst, settings, detector)
+        except FFmpegError as e:
+            reason = str(e).splitlines()[0]
+            if e.stderr:
+                reason += f" ({e.stderr.splitlines()[-1].strip()})"
+            log(f"warning: clip {i:02d} failed: {reason}")
+            continue
         sidecar = {**pick.model_dump(mode="json"), "post_caption": pick.hook_text, **extras}
         atomic_write_text(
             dst.with_suffix(".json"), json.dumps(sidecar, indent=2, ensure_ascii=False)
@@ -196,5 +203,7 @@ def run_job(
         kinds = ",".join(lay["kind"] for lay in extras["layout"]) or "HORIZONTAL"
         log(f"clip {i:02d}: layouts=[{kinds}] removed={extras['removed_s']:.1f}s → {dst.name}")
         clips.append(dst)
-    log(f"[6/6] render: done ({len(clips)} clips)")
+    if not clips:
+        raise FFmpegError(f"no clips rendered ({len(picks)} failed) — see warnings above")
+    log(f"[6/6] render: done ({len(clips)} of {len(picks)} clips)")
     return clips
