@@ -9,6 +9,7 @@ from hookline.assets import AssetError, ensure_twitch_downloader
 
 _VOD_RE = re.compile(r"twitch\.tv/videos/(\d+)")
 _EMOTE_WEIGHT = 0.5
+CHAT_TIMEOUT_S = 600
 
 
 class ChatError(Exception):
@@ -31,6 +32,7 @@ def download_chat(vod_id: str, dst: Path, exe: Path) -> Path:
             text=True,
             encoding="utf-8",
             errors="replace",
+            timeout=CHAT_TIMEOUT_S,
         )
         if proc.returncode != 0:
             msg = (proc.stderr or proc.stdout or "").strip().splitlines()
@@ -39,6 +41,9 @@ def download_chat(vod_id: str, dst: Path, exe: Path) -> Path:
     except ChatError:
         tmp.unlink(missing_ok=True)
         raise
+    except subprocess.TimeoutExpired as e:
+        tmp.unlink(missing_ok=True)
+        raise ChatError(f"chatdownload timed out after {CHAT_TIMEOUT_S}s") from e
     except OSError as e:
         tmp.unlink(missing_ok=True)
         raise ChatError(f"chatdownload failed: {e}") from e
@@ -49,11 +54,16 @@ def chat_rate(chat_json: dict, duration: float) -> list[float]:
     """Per-second chat activity: 1.0 per comment plus 0.5 per emote fragment."""
     out = [0.0] * math.ceil(duration)
     for c in chat_json.get("comments", []):
-        t = c.get("content_offset_seconds")
-        if t is None or not (0 <= t < duration):
+        if not isinstance(c, dict):
             continue
-        frags = (c.get("message") or {}).get("fragments") or []
-        emotes = sum(1 for f in frags if f.get("emoticon") is not None)
+        t = c.get("content_offset_seconds")
+        if isinstance(t, bool) or not isinstance(t, (int, float)) or not (0 <= t < duration):
+            continue
+        msg = c.get("message")
+        frags = msg.get("fragments") if isinstance(msg, dict) else None
+        if not isinstance(frags, list):
+            frags = []
+        emotes = sum(1 for f in frags if isinstance(f, dict) and f.get("emoticon") is not None)
         out[int(t)] += 1.0 + _EMOTE_WEIGHT * emotes
     return out
 

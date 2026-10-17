@@ -96,3 +96,43 @@ def test_download_chat_success_replaces(tmp_path, monkeypatch):
     dst = tmp_path / "chat.json"
     assert download_chat("1", dst, Path("x.exe")) == dst
     assert dst.exists() and not list(tmp_path.glob("*.part*"))
+
+
+def test_try_fetch_chat_timeout_warns(tmp_path, monkeypatch):
+    monkeypatch.setattr(chat, "ensure_twitch_downloader", lambda: Path("x.exe"))
+
+    def boom(cmd, **k):
+        assert k["timeout"] == chat.CHAT_TIMEOUT_S
+        Path(cmd[cmd.index("-o") + 1]).write_text("partial")
+        raise subprocess.TimeoutExpired(cmd, k["timeout"])
+
+    monkeypatch.setattr(chat.subprocess, "run", boom)
+    logs = []
+    assert try_fetch_chat("https://www.twitch.tv/videos/1", tmp_path, logs.append) is None
+    assert len([m for m in logs if "chat unavailable" in m]) == 1
+    assert not list(tmp_path.glob("*.part*"))
+
+
+def test_try_fetch_chat_exit0_no_file_warns(tmp_path, monkeypatch):
+    monkeypatch.setattr(chat, "ensure_twitch_downloader", lambda: Path("x.exe"))
+    monkeypatch.setattr(
+        chat.subprocess, "run", lambda cmd, **k: subprocess.CompletedProcess(cmd, 0, "", "")
+    )
+    logs = []
+    assert try_fetch_chat("https://www.twitch.tv/videos/1", tmp_path, logs.append) is None
+    assert len([m for m in logs if "chat unavailable" in m]) == 1
+
+
+def test_chat_rate_tolerates_malformed():
+    data = {
+        "comments": [
+            "junk",
+            None,
+            {"content_offset_seconds": "3"},
+            {"content_offset_seconds": None},
+            {"content_offset_seconds": 1.0, "message": None},
+            {"content_offset_seconds": 2.0, "message": {"fragments": ["x", {"emoticon": {}}]}},
+            {"content_offset_seconds": 2.5, "message": {"fragments": "bad"}},
+        ]
+    }
+    assert chat_rate(data, 4) == [0.0, 1.0, 2.5, 0.0]

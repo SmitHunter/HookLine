@@ -85,3 +85,41 @@ def test_ensure_twitch_downloader_extracts_exe(tmp_path, monkeypatch):
     exe = assets.ensure_twitch_downloader()
     assert exe == tmp_path / "bin" / "TwitchDownloaderCLI.exe"
     assert exe.read_bytes() == b"MZ"
+
+
+def test_fetch_midstream_failure_removes_part(tmp_path):
+    import socket
+
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+
+    def serve():
+        conn, _ = srv.accept()
+        conn.recv(4096)
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n" + b"x" * 10)
+        conn.close()
+
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    dst = tmp_path / "m.bin"
+    with pytest.raises(AssetError):
+        fetch(f"http://127.0.0.1:{srv.getsockname()[1]}/m.bin", dst)
+    srv.close()
+    assert not dst.exists()
+    assert not list(tmp_path.glob("*.part"))
+
+
+def test_ensure_twitch_downloader_corrupt_zip_is_removed(tmp_path, monkeypatch):
+    monkeypatch.setattr(assets.sys, "platform", "win32")
+    monkeypatch.setattr(assets, "tools_dir", lambda: tmp_path)
+
+    def fake_fetch(url, dst: Path):
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text("<html>not a zip</html>")
+        return dst
+
+    monkeypatch.setattr(assets, "fetch", fake_fetch)
+    with pytest.raises(AssetError):
+        assets.ensure_twitch_downloader()
+    assert not list((tmp_path / "downloads").glob("*.zip"))

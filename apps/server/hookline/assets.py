@@ -1,3 +1,4 @@
+import http.client
 import os
 import shutil
 import sys
@@ -36,8 +37,11 @@ def fetch(url: str, dst: Path) -> Path:
     try:
         with urllib.request.urlopen(url, timeout=_TIMEOUT_S) as resp, open(part, "wb") as f:
             shutil.copyfileobj(resp, f, _CHUNK)
+            expected = resp.headers.get("Content-Length")
+            if expected is not None and f.tell() != int(expected):
+                raise OSError(f"truncated download ({f.tell()} of {expected} bytes)")
         os.replace(part, dst)
-    except (urllib.error.URLError, OSError) as e:
+    except (urllib.error.URLError, http.client.HTTPException, OSError) as e:
         part.unlink(missing_ok=True)
         raise AssetError(f"download failed for {url}: {e}") from e
     return dst
@@ -64,7 +68,11 @@ def ensure_twitch_downloader() -> Path:
             with z.open(member) as src, open(tmp, "wb") as out:
                 shutil.copyfileobj(src, out)
         os.replace(tmp, exe)
-    except (zipfile.BadZipFile, OSError) as e:
+    except zipfile.BadZipFile as e:
+        tmp.unlink(missing_ok=True)
+        zip_path.unlink(missing_ok=True)  # corrupt cache: re-download next run
+        raise AssetError(f"corrupt download {zip_path.name}: {e}") from e
+    except OSError as e:
         tmp.unlink(missing_ok=True)
         raise AssetError(f"could not extract {TWITCH_DL_EXE}: {e}") from e
     return exe
