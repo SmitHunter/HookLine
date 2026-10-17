@@ -1,8 +1,16 @@
 # Hookline
 
-Hookline turns a long video, such as a stream VOD, podcast or interview, into 5 short clips. It downloads the video (or takes a local file), transcribes it with Whisper (GPU-accelerated whisper.cpp where available, faster-whisper otherwise), has Claude pick the 5 best self-contained moments from the transcript, and cuts each one with ffmpeg into an MP4 plus a JSON sidecar (title, hook text, reason, rubric scores).
+Hookline turns a long video, such as a stream VOD, podcast or interview, into 5 short vertical clips. It downloads the video (or takes a local file), transcribes it with Whisper (GPU-accelerated whisper.cpp with word-level DTW timestamps where available, faster-whisper otherwise), has Claude pick the 5 best self-contained moments, and renders each one with ffmpeg into a 1080x1920 MP4 plus a JSON sidecar (title, hook text, reason, rubric scores, layout, keep ranges, removed seconds).
 
-**Status:** M1: CLI pipeline; web UI, reframing, captions and animated edits coming. Today's output is horizontal clips cut from the source with the original framing and no captions.
+**Status:** M2: the CLI pipeline produces captioned vertical clips. There is no web UI yet, and no Remotion/HyperFrames animated edits yet.
+
+Features:
+
+- Vertical 9:16 reframing, chosen per scene: STACKED (facecam over gameplay, including Twitch facecam stacking), FACE_TRACK (follows the speaker), SPLIT (two people side by side), and FIT_BLUR (full frame over a blurred background).
+- Burned-in word-by-word captions and a 3 s hook title at the start of each clip.
+- Dead-air removal: long pauses inside a clip are cut out.
+- Silence-snapped cuts: clip boundaries move to the nearest low-energy point in the audio.
+- Chat- and loudness-aware picks: Claude also sees audio loudness peaks and, for Twitch VODs, chat activity.
 
 ## Quickstart
 
@@ -23,7 +31,14 @@ uv run hookline run <url-or-file>
 
 Without the GPU whisper.cpp build, the first run downloads the Whisper model (~1.6 GB) and transcribes on CPU at about 2x realtime. `workspace/` and `output/` are created in the current directory.
 
-Clips land in `output/<job_id>/NN-<slug>.mp4` with a matching `.json`. Intermediate artifacts (download, audio, transcript, picks) are cached in `workspace/<job_id>/`, so re-running the same source skips finished stages and only re-cuts. Options: `--clips N`, `--backend claude-code|api`, `--model`, `--out DIR`.
+Clips land in `output/<job_id>/NN-<slug>.mp4` with a matching `.json`. Intermediate artifacts (download, audio, transcript, picks) are cached in `workspace/<job_id>/`, so re-running the same source skips finished stages and only re-cuts. Options: `--clips N`, `--backend claude-code|api`, `--model`, `--out DIR`, plus:
+
+- `--horizontal`: keep the source aspect ratio instead of reframing to 9:16.
+- `--no-captions`: do not burn in captions or the hook title.
+- `--no-chat`: skip the Twitch chat download and chat signals.
+- `--facecam X,Y,W,H`: facecam box as 0-1 fractions of the frame, overriding auto-detection.
+
+The first vertical run downloads a small face-detection model, and for Twitch VODs also TwitchDownloaderCLI, into `tools/`.
 
 ## How clips are picked
 
