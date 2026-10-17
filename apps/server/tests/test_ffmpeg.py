@@ -28,13 +28,13 @@ def test_pick_encoder_returns_known():
 
 
 def test_cut_segments_concatenates(fixture_video, tmp_path):
-    out = cut_segments(fixture_video, [(100.0, 102.0), (10.0, 20.0)], tmp_path / "c.mp4", "libx264")
+    out = cut_segments(fixture_video, [(100.0, 102.0), (10.0, 20.0)], tmp_path / "c.mkv", "libx264")
     assert probe_duration(out) == pytest.approx(12.0, abs=0.15)
 
 
 def test_cut_segments_raises_ffmpeg_error_on_bad_input(tmp_path):
     with pytest.raises(FFmpegError):
-        cut_segments(tmp_path / "missing.mp4", [(0, 1)], tmp_path / "x.mp4", "libx264")
+        cut_segments(tmp_path / "missing.mp4", [(0, 1)], tmp_path / "x.mkv", "libx264")
 
 
 def test_encoder_args_table():
@@ -69,17 +69,17 @@ def test_cut_segments_passes_encoder_args(monkeypatch, tmp_path):
 
     def fake_run(cmd):
         seen.append(cmd)
-        (tmp_path / "o.tmp.mp4").write_bytes(b"x")
+        (tmp_path / "o.tmp.mkv").write_bytes(b"x")
 
     monkeypatch.setattr(ffmpeg_mod, "_run", fake_run)
-    cut_segments(tmp_path / "in.mp4", [(0.0, 1.0)], tmp_path / "o.mp4", "h264_amf", fps=25)
+    cut_segments(tmp_path / "in.mp4", [(0.0, 1.0)], tmp_path / "o.mkv", "h264_amf", fps=25)
     cmd = seen[0]
     i = cmd.index("-c:v")
     assert cmd[i : i + len(encoder_args("h264_amf"))] == encoder_args("h264_amf")
 
 
 def test_libx264_cut_has_sane_bitrate(fixture_video, tmp_path):
-    out = cut_segments(fixture_video, [(10.0, 50.0)], tmp_path / "c.mp4", "libx264")
+    out = cut_segments(fixture_video, [(10.0, 50.0)], tmp_path / "c.mkv", "libx264")
     bits = out.stat().st_size * 8 / probe_duration(out)
     assert bits < 2_000_000
 
@@ -87,7 +87,7 @@ def test_libx264_cut_has_sane_bitrate(fixture_video, tmp_path):
 def test_amf_cut_has_sane_bitrate_when_available(fixture_video, tmp_path):
     if pick_encoder() != "h264_amf":
         pytest.skip("h264_amf not usable here")
-    out = cut_segments(fixture_video, [(10.0, 50.0)], tmp_path / "c.mp4", "h264_amf")
+    out = cut_segments(fixture_video, [(10.0, 50.0)], tmp_path / "c.mkv", "h264_amf")
     assert out.stat().st_size * 8 / probe_duration(out) < 2_000_000
 
 
@@ -96,12 +96,12 @@ def test_cut_segments_quality_replaces_rate_control(monkeypatch, tmp_path):
 
     def fake_run(cmd):
         seen.append(cmd)
-        (tmp_path / "o.tmp.mp4").write_bytes(b"x")
+        (tmp_path / "o.tmp.mkv").write_bytes(b"x")
 
     monkeypatch.setattr(ffmpeg_mod, "_run", fake_run)
     q = ["-preset", "veryfast", "-crf", "12"]
     cut_segments(
-        tmp_path / "in.mp4", [(0.0, 1.0)], tmp_path / "o.mp4", "libx264", quality=q, fps=25
+        tmp_path / "in.mp4", [(0.0, 1.0)], tmp_path / "o.mkv", "libx264", quality=q, fps=25
     )
     cmd = seen[0]
     i = cmd.index("-c:v")
@@ -129,7 +129,7 @@ def test_cut_segments_exact_with_many_short_ranges(fixture_video, tmp_path):
     raw = [(10.013 + 1.37 * i, 10.013 + 1.37 * i + 0.41 + 0.07 * i) for i in range(12)]
     keep = snap_ranges(raw, fps)
     assert len(keep) == 12 and all(round(t * fps, 6) == round(t * fps) for r in keep for t in r)
-    out = cut_segments(fixture_video, keep, tmp_path / "c.mp4", "libx264")
+    out = cut_segments(fixture_video, keep, tmp_path / "c.mkv", "libx264")
     expected = sum(e - s for s, e in keep)
     assert probe_duration(out) == pytest.approx(expected, abs=1 / fps)
 

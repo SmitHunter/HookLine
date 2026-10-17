@@ -16,6 +16,7 @@ from hookline.media.ffmpeg import (
     probe_fps,
     probe_size,
 )
+from hookline.media.loudness import loudnorm_filter, measure_loudness
 from hookline.media.reframe import detect_crop, reframe_graph
 from hookline.media.subtitles import fonts_dir, subtitles_filter
 from hookline.models import ClipPick, Word
@@ -47,9 +48,9 @@ def render_clip(
 ) -> dict:
     """Write the finished clip to `dst`; returns sidecar extras (layout, keep_ranges, removed_s).
 
-    The intermediate cut (`work_dir/NN.mp4`, near-lossless libx264, deleted after success)
+    The intermediate cut (`work_dir/NN.mkv`, near-lossless libx264 + PCM audio, deleted after success)
     and the ASS file live in `work_dir`. Video is lossily encoded once (the final encode);
-    audio once (the intermediate's AAC, copied into the final file).
+    audio once (AAC 192k, after compression and two-pass loudnorm to -14 LUFS).
 
     `protect_words` keeps dead-air cuts out of word spans; pass False for
     segment-interpolated word times, which tile the timeline with no gaps. `encoder` is the
@@ -78,8 +79,9 @@ def render_clip(
     )
 
     inter = cut_segments(
-        src, keep, work_dir / f"{name}.mp4", "libx264", quality=INTERMEDIATE_QUALITY, fps=fps
+        src, keep, work_dir / f"{name}.mkv", "libx264", quality=INTERMEDIATE_QUALITY, fps=fps
     )
+    audio_filter = loudnorm_filter(measure_loudness(inter))
     crop = detect_crop(inter)
     in_w, in_h = (crop[0], crop[1]) if crop else probe_size(inter)
 
@@ -112,7 +114,8 @@ def render_clip(
             "-filter_complex", graph,
             "-map", out_label, "-map", "0:a?",
             *encoder_args(encoder or pick_encoder()), "-pix_fmt", "yuv420p",
-            "-c:a", "copy",  # the intermediate's AAC 192k is the one lossy audio encode
+            "-af", audio_filter,
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000",  # the one lossy audio encode
             "-movflags", "+faststart",
             str(tmp),
         ]

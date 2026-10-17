@@ -229,3 +229,43 @@ def synthetic_stream(tmp_path_factory: pytest.TempPathFactory) -> Path:
         check=True,
     )  # fmt: skip
     return out
+
+
+def _speechlike_video(dst: Path, lufs: float, duration: int = 20) -> Path:
+    """320x180 video whose audio is gated pink-noise bursts plus a 200 Hz tone (speech-like loudness range), scaled so its integrated loudness is `lufs`."""
+    from hookline.media.loudness import measure_loudness
+
+    raw = dst.with_suffix(".raw.wav")
+    gate = "if(lt(mod(t,7),4),1,0.15)"  # 4 s loud, 3 s at -16 dB: LRA survives the 3 s window
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+         "-f", "lavfi", "-i", f"anoisesrc=color=pink:amplitude=0.5:sample_rate=48000:duration={duration}",
+         "-f", "lavfi", "-i", f"sine=frequency=200:sample_rate=48000:duration={duration}",
+         "-filter_complex",
+         f"[0:a][1:a]amix=inputs=2:normalize=0,volume='{gate}':eval=frame[a]",
+         "-map", "[a]", "-c:a", "pcm_s16le", str(raw)],
+        check=True,
+    )  # fmt: skip
+    gain = lufs - measure_loudness(raw).i
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+         "-f", "lavfi", "-i", f"testsrc2=size=320x180:rate=25:duration={duration}",
+         "-i", str(raw), "-af", f"volume={gain:.3f}dB",
+         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "256k",
+         "-shortest", str(dst)],
+        check=True,
+    )  # fmt: skip
+    raw.unlink()
+    return dst
+
+
+@pytest.fixture(scope="session")
+def quiet_speech_video(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """20 s clip at about -30 LUFS (what the M2 audit found in real clips)."""
+    return _speechlike_video(tmp_path_factory.mktemp("loud") / "quiet.mp4", -30.0)
+
+
+@pytest.fixture(scope="session")
+def near_silent_video(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """20 s clip at about -60 LUFS (game audio only / room tone)."""
+    return _speechlike_video(tmp_path_factory.mktemp("loud") / "silent.mp4", -60.0)

@@ -166,7 +166,8 @@ def cut_segments(
     quality: list[str] | None = None,
     fps: float | None = None,
 ) -> Path:
-    """Concatenate `segments` of `src` into `dst`. `quality`, when given, replaces the
+    """Concatenate `segments` of `src` into `dst` (an intermediate: use `.mkv`, audio is
+    uncompressed `pcm_s16le` so the final encode is the only lossy audio step). `quality`, when given, replaces the
     encoder's default rate-control args.
 
     Each piece is decoded from a seek point ~1 s early and cut with trim/atrim, so the output
@@ -201,13 +202,9 @@ def cut_segments(
         "-pix_fmt",
         "yuv420p",
         "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
-        "-movflags",
-        "+faststart",
+        "pcm_s16le",
     ]
-    tmp = dst.with_suffix(".tmp.mp4")
+    tmp = dst.with_suffix(f".tmp{dst.suffix}")
     _run([*cmd, str(tmp)])
     os.replace(tmp, dst)
     return dst

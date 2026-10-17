@@ -64,11 +64,12 @@ def test_render_clip_vertical_with_captions(
     assert probe_duration(dst) == pytest.approx(kept, abs=0.2)
     assert extras["removed_s"] >= 0
     assert (tmp_path / "render" / "01.ass").exists()
-    assert not (tmp_path / "render" / "01.mp4").exists()  # intermediate removed after success
+    assert not (tmp_path / "render" / "01.mkv").exists()  # intermediate removed after success
     (final,) = argvs
     assert "subtitles=" in _graph(final)
     i = final.index("-c:a")
-    assert final[i : i + 2] == ["-c:a", "copy"]  # one lossy audio encode (the intermediate)
+    assert final[i : i + 6] == ["-c:a", "aac", "-b:a", "192k", "-ar", "48000"]
+    assert "loudnorm" in final[final.index("-af") + 1] or final[final.index("-af") + 1] == "anull"
     json.dumps(extras)  # sidecar-serialisable
 
 
