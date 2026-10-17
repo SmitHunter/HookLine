@@ -14,6 +14,8 @@ from hookline.media.reframe import (
     OUT_W,
     ZOOM_IN,
     ZOOM_PUNCH,
+    box_hits_bands,
+    box_to_crop,
     combine_crop,
     detect_crop,
     detect_overlay_bands,
@@ -456,6 +458,36 @@ def test_overlay_corner_minimap_is_game_content(tmp_path):
     assert bands is not None and bands[1] / 720 == pytest.approx(0.15, abs=0.02)
 
 
+def test_overlay_fighting_game_health_bars_are_game_content(tmp_path):
+    # Two static bordered health bars with names + a centre timer box, touching the top.
+    parts = [
+        "drawbox=x=40:y=20:w=520:h=40:color=0xc02020:t=fill",
+        "drawbox=x=40:y=20:w=520:h=40:color=white:t=4",
+        "drawbox=x=720:y=20:w=520:h=40:color=0xc02020:t=fill",
+        "drawbox=x=720:y=20:w=520:h=40:color=white:t=4",
+        "drawbox=x=600:y=8:w=80:h=70:color=black:t=fill",
+        "drawbox=x=600:y=8:w=80:h=70:color=white:t=4",
+        "drawtext=fontfile=Anton-Regular.ttf:text='99':x=618:y=14:fontsize=48:fontcolor=white",
+        "drawtext=fontfile=Anton-Regular.ttf:text='RYU':x=52:y=24:fontsize=28:fontcolor=white",
+        "drawtext=fontfile=Anton-Regular.ttf:text='KEN':x=1180:y=24:fontsize=28:fontcolor=white",
+    ]
+    hud = ",".join(parts)
+    bands = detect_overlay_bands(_make_overlay(tmp_path / "fight.mp4", hud, pan=True))
+    assert bands is None or bands[0] == 0
+
+
+def test_overlay_wide_bottom_cam_frame_is_not_cropped(tmp_path):
+    # A wide webcam frame at the bottom: static border, moving picture inside.
+    cam = "drawbox=x=80:y=540:w=1120:h=170:color=white:t=6"
+    assert detect_overlay_bands(_make_overlay(tmp_path / "cam.mp4", cam, pan=True)) is None
+
+
+def test_overlay_unreadable_video_is_none(tmp_path):
+    bad = tmp_path / "bad.mp4"
+    bad.write_bytes(b"not a video")
+    assert detect_overlay_bands(bad) is None
+
+
 def test_overlay_paused_video_is_none(tmp_path):
     paused = _make_overlay(tmp_path / "paused.mp4", _LOWER_THIRD, still=True)
     assert detect_overlay_bands(paused) is None
@@ -482,6 +514,28 @@ def test_combine_crop_shrinks_letterbox_crop_to_exclude_bands():
     assert y >= 13 and y + h <= 720 - 101
 
 
+def test_box_to_crop_maps_full_frame_fractions_into_crop_space():
+    assert box_to_crop((0.7, 0.0, 0.3, 0.25), (320, 180), None) == (0.7, 0.0, 0.3, 0.25)
+    x, y, w, h = box_to_crop((0.7, 0.0, 0.3, 0.25), (320, 180), (320, 140, 0, 0))
+    assert (x, y, w, h) == pytest.approx((0.7, 0.0, 0.3, 45 / 140))
+    # letterbox at y=100 of 920: a box at the top of the picture maps to y=0
+    x, y, w, h = box_to_crop((0.0, 100 / 920, 0.5, 0.2), (1280, 920), (1280, 720, 0, 100))
+    assert (x, y, w, h) == pytest.approx((0.0, 0.0, 0.5, 184 / 720))
+    # a box sticking out of the crop is clipped to it
+    _, y, _, h = box_to_crop((0.0, 0.7, 0.3, 0.3), (320, 180), (320, 140, 0, 0))
+    assert y == pytest.approx(126 / 140) and y + h == pytest.approx(1.0)
+
+
+def test_box_hits_bands():
+    size = (320, 180)
+    assert box_hits_bands((0.0, 0.7, 0.3, 0.3), size, None, (0, 40))  # rows 126..180
+    assert not box_hits_bands((0.7, 0.0, 0.3, 0.25), size, None, (0, 40))
+    assert box_hits_bands((0.7, 0.0, 0.3, 0.25), size, None, (20, 0))
+    # bands are in letterbox-crop space
+    assert not box_hits_bands((0, 0.0, 0.3, 0.09), (320, 220), (320, 180, 0, 20), (10, 0))
+    assert box_hits_bands((0, 0.1, 0.3, 0.1), (320, 220), (320, 180, 0, 20), (10, 0))
+
+
 def test_combine_crop_refuses_to_remove_too_much():
     # > 30% of the height in total: band removal skipped, letterbox crop kept
     assert combine_crop((1920, 1080), None, (200, 200)) is None
@@ -491,9 +545,9 @@ def test_combine_crop_refuses_to_remove_too_much():
 
 
 @pytest.mark.skipif(not _REAL_SRC.exists(), reason="real source not present")
-def test_overlay_real_source_lower_third():
+def test_overlay_real_source_lower_third(tmp_path):
     # The purple lower-third is on screen for the whole VOD (630/630 samples, every 5 s).
-    clip = _REAL_SRC.parent / "_overlay_window.mp4"
+    clip = tmp_path / "window.mp4"
     try:
         subprocess.run(
             ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", "600", "-t", "20",

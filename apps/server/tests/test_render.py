@@ -95,6 +95,95 @@ def test_render_clip_crops_overlay_bands(
     json.dumps(extras)
 
 
+def _render_with(fixture_video, fixture_wav, sample_pick, fixture_words, tmp_path, settings,
+                 detector=None):  # fmt: skip
+    dst = tmp_path / "04-f.mp4"
+    return render_clip(
+        fixture_video, fixture_wav, sample_pick, fixture_words, tmp_path / "r", dst, settings,
+        detector,
+    )  # fmt: skip
+
+
+def _cam_rows(graph: str, pre_y: int = 0) -> tuple[int, int]:
+    """Full-frame rows [y0, y1) of the STACKED cam panel crop in `graph`."""
+    import re
+
+    _, ch, _, cy = (int(v) for v in re.search(r"_a\]crop=(\d+):(\d+):(\d+):(\d+)", graph).groups())
+    return pre_y + cy, pre_y + cy + ch
+
+
+def test_render_clip_overlay_crop_disabled(
+    fixture_video, fixture_wav, fixture_words, sample_pick, settings, tmp_path, monkeypatch,
+):  # fmt: skip
+    from hookline.pipeline import render as render_mod
+
+    def boom(video, crop=None):
+        raise AssertionError("detection must not run")
+
+    monkeypatch.setattr(render_mod, "detect_overlay_bands", boom)
+    s = settings.model_copy(update={"overlay_crop": False})
+    extras = _render_with(fixture_video, fixture_wav, sample_pick, fixture_words, tmp_path, s)
+    assert extras["overlay_bands"] is None
+
+
+def test_render_clip_facecam_override_over_band_skips_band_removal(
+    fixture_video, fixture_wav, fixture_words, sample_pick, settings, tmp_path, monkeypatch,
+    final_argvs,
+):  # fmt: skip
+    from hookline.pipeline import render as render_mod
+
+    monkeypatch.setattr(render_mod, "detect_overlay_bands", lambda video, crop=None: (0, 40))
+    s = settings.model_copy(update={"facecam": (0.0, 0.7, 0.3, 0.3)})  # rows 126..180 of 180
+    extras = _render_with(fixture_video, fixture_wav, sample_pick, fixture_words, tmp_path, s)
+    assert extras["overlay_bands"] is None
+    graph = _graph(final_argvs[0])
+    assert not graph.startswith("[0:v]crop=")
+    y0, y1 = _cam_rows(graph)
+    assert 124 <= y0 and y1 <= 180
+
+
+def test_render_clip_facecam_override_converted_to_band_crop(
+    fixture_video, fixture_wav, fixture_words, sample_pick, settings, tmp_path, monkeypatch,
+    final_argvs,
+):  # fmt: skip
+    from hookline.pipeline import render as render_mod
+
+    monkeypatch.setattr(render_mod, "detect_overlay_bands", lambda video, crop=None: (0, 40))
+    s = settings.model_copy(update={"facecam": (0.7, 0.0, 0.3, 0.25)})  # rows 0..45 of 180
+    extras = _render_with(fixture_video, fixture_wav, sample_pick, fixture_words, tmp_path, s)
+    assert extras["overlay_bands"] == [0, 40]
+    graph = _graph(final_argvs[0])
+    assert graph.startswith("[0:v]crop=320:140:0:0,")
+    y0, y1 = _cam_rows(graph)
+    assert y0 == 0 and 42 <= y1 <= 46  # the original box, not 25% of the shorter crop
+
+
+def test_render_clip_auto_cam_on_band_edge_replans_without_bands(
+    fixture_video, fixture_wav, fixture_words, sample_pick, settings, tmp_path, monkeypatch,
+    final_argvs,
+):  # fmt: skip
+    from hookline.pipeline import render as render_mod
+    from hookline.pipeline.layout import SceneLayout
+
+    monkeypatch.setattr(render_mod, "detect_overlay_bands", lambda video, crop=None: (0, 40))
+    crops = []
+
+    def fake_plan(video, detector, facecam_override=None, crop=None):
+        crops.append(crop)
+        end = probe_duration(video)
+        if crop is not None:  # the cam is cut off by the band crop: it touches the bottom
+            return [SceneLayout(start=0, end=end, kind="STACKED", facecam=(0.7, 0.75, 0.3, 0.25))]
+        return [SceneLayout(start=0, end=end, kind="STACKED", facecam=(0.7, 0.6, 0.3, 0.3))]
+
+    monkeypatch.setattr(render_mod, "plan_layouts", fake_plan)
+    extras = _render_with(
+        fixture_video, fixture_wav, sample_pick, fixture_words, tmp_path, settings, NoFaces()
+    )
+    assert crops == [(320, 140, 0, 0), None]
+    assert extras["overlay_bands"] is None
+    assert not _graph(final_argvs[0]).startswith("[0:v]crop=")
+
+
 def test_render_clip_horizontal_no_captions(
     fixture_video,
     fixture_wav,

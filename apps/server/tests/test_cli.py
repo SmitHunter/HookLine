@@ -24,11 +24,11 @@ def test_cli_flags_reach_settings(monkeypatch):
     monkeypatch.setattr(cli, "run_job", fake_run_job)
     monkeypatch.setattr(cli, "make_llm", lambda s: None)
     monkeypatch.setattr(cli, "get_transcriber", lambda s, log=None: None)
-    args = ["run", "x.mp4", "--horizontal", "--no-captions", "--no-chat"]
+    args = ["run", "x.mp4", "--horizontal", "--no-captions", "--no-chat", "--keep-overlays"]
     res = CliRunner().invoke(cli.app, [*args, "--facecam", "0.7,0,0.3,0.25"])
     assert res.exit_code == 0, res.output
     s = seen["s"]
-    assert (s.vertical, s.captions, s.chat) == (False, False, False)
+    assert (s.vertical, s.captions, s.chat, s.overlay_crop) == (False, False, False, False)
     assert s.facecam == (0.7, 0.0, 0.3, 0.25)
 
 
@@ -43,6 +43,14 @@ def test_facecam_from_env(monkeypatch):
     monkeypatch.setenv("HOOKLINE_VERTICAL", "false")
     s = Settings.from_env()
     assert s.facecam == (0.7, 0.0, 0.3, 0.25) and s.vertical is False
+
+
+def test_overlay_crop_default_and_env(monkeypatch):
+    from hookline.config import Settings
+
+    assert Settings().overlay_crop is True
+    monkeypatch.setenv("HOOKLINE_OVERLAY_CROP", "false")
+    assert Settings.from_env().overlay_crop is False
 
 
 def test_log_survives_non_utf8_stdout(monkeypatch):

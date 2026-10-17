@@ -61,6 +61,12 @@ def run(
     no_chat: Annotated[
         bool, typer.Option("--no-chat", help="Skip Twitch chat download and chat signals")
     ] = False,
+    keep_overlays: Annotated[
+        bool,
+        typer.Option(
+            "--keep-overlays", help="Keep burned-in lower-thirds/edge overlays (no overlay crop)"
+        ),
+    ] = False,
     facecam: Annotated[
         str | None,
         typer.Option("--facecam", help="Facecam box X,Y,W,H as 0-1 fractions of the frame"),
@@ -80,6 +86,8 @@ def run(
         overrides["captions"] = False
     if no_chat:
         overrides["chat"] = False
+    if keep_overlays:
+        overrides["overlay_crop"] = False
     try:
         if clips is not None:
             overrides["clips"] = clips

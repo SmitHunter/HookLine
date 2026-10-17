@@ -57,6 +57,7 @@ class Settings(BaseModel):
     silence_db: float = -32.0
     facecam: Box | None = None
     chat: bool = True
+    overlay_crop: bool = True  # crop burned-in lower-thirds/edge overlays (vertical only)
 
     @field_validator("facecam", mode="before")
     @classmethod

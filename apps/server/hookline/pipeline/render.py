@@ -1,5 +1,6 @@
 """Per-clip render: refine boundaries, drop dead air, reframe to 9:16 and burn captions."""
 
+import logging
 import os
 import re
 from pathlib import Path
@@ -26,6 +27,8 @@ from hookline.media.loudness import (
     measure_loudness,
 )
 from hookline.media.reframe import (
+    box_hits_bands,
+    box_to_crop,
     combine_crop,
     detect_crop,
     detect_overlay_bands,
@@ -37,12 +40,15 @@ from hookline.models import ClipPick, Word
 from hookline.pipeline.boundaries import refine_boundaries
 from hookline.pipeline.deadair import keep_ranges, remap_words, snap_ranges
 from hookline.pipeline.layout import SceneLayout, plan_layouts
-from hookline.vision.faces import FaceDetector
+from hookline.vision.faces import Crop, FaceDetector
 
 INTERMEDIATE_QUALITY = ["-preset", "veryfast", "-crf", "12"]
 MAX_HORIZONTAL_W = 1920
 _ZOOM_BEAT_RE = re.compile(r"^\s*zoom\s*:.*@\s*(\d+(?:\.\d+)?)\s*s?\s*$", re.IGNORECASE)
 _SENTENCE_END = (".", "!", "?")
+CAM_EDGE_LO, CAM_EDGE_HI = 0.02, 0.98  # a cam box this close to a cropped edge was cut by it
+
+log = logging.getLogger(__name__)
 
 
 def cut_times_for(keep: list[tuple[float, float]]) -> list[float]:
@@ -78,6 +84,44 @@ def emphasis_times(beats: list[str], keep: list[tuple[float, float]]) -> list[fl
 def _horizontal_graph(crop: tuple[int, int, int, int] | None) -> str:
     pre = f"crop={crop[0]}:{crop[1]}:{crop[2]}:{crop[3]}," if crop else ""
     return f"[0:v]{pre}scale='trunc(min({MAX_HORIZONTAL_W},iw)/2)*2':-2,setsar=1[vout]"
+
+
+def _plan_vertical(
+    inter: Path,
+    detector: FaceDetector | None,
+    settings: Settings,
+    size: tuple[int, int],
+    letterbox: Crop | None,
+) -> tuple[list[SceneLayout], Crop | None, tuple[int, int] | None]:
+    """(layouts, crop, overlay bands) for the vertical reframe. Burned-in lower-thirds/edge
+    overlays (would show cut mid-word) are cropped away unless disabled, refused by
+    `combine_crop`, or they'd cut into the facecam: an override box overlapping a band, or an
+    auto-detected STACKED cam touching the cropped edge (it continues into the band), keeps
+    the letterbox-only crop. The facecam override (full-frame fractions) is mapped into the
+    crop's space."""
+    bands = detect_overlay_bands(inter, crop=letterbox) if settings.overlay_crop else None
+    crop = combine_crop(size, letterbox, bands)
+    if crop == letterbox:
+        bands = None  # none found, or removal refused (too much of the height)
+    cam = settings.facecam
+    if cam is not None and bands and box_hits_bands(cam, size, letterbox, bands):
+        log.info("facecam %s overlaps overlay bands %s; bands kept", cam, bands)
+        crop, bands = letterbox, None
+    override = box_to_crop(cam, size, crop) if cam is not None else None
+    layouts = plan_layouts(inter, detector, override, crop=crop)
+    if bands and cam is None and any(_cam_on_cut(lay, bands) for lay in layouts):
+        log.info("facecam touches the overlay crop edge; re-planned without bands %s", bands)
+        crop, bands = letterbox, None
+        layouts = plan_layouts(inter, detector, None, crop=crop)
+    return layouts, crop, bands
+
+
+def _cam_on_cut(layout: SceneLayout, bands: tuple[int, int]) -> bool:
+    """A STACKED cam box touching an edge where an overlay band was cropped away."""
+    if layout.kind != "STACKED" or layout.facecam is None:
+        return False
+    _, y, _, h = layout.facecam
+    return (bands[1] > 0 and y + h >= CAM_EDGE_HI) or (bands[0] > 0 and y <= CAM_EDGE_LO)
 
 
 def render_clip(
@@ -136,13 +180,8 @@ def render_clip(
     loudness = measure_loudness(inter, COMPRESSOR)
     audio_args = ["-af", loudnorm_filter(loudness)] if loudness else []
     letterbox = detect_crop(inter)
-    # Vertical only: burned-in lower-thirds/edge overlays would show cropped mid-word.
-    bands = detect_overlay_bands(inter, crop=letterbox) if settings.vertical else None
     size = probe_size(inter)
-    crop = combine_crop(size, letterbox, bands)
-    if crop == letterbox:
-        bands = None  # none found, or removal refused (too much of the height)
-    in_w, in_h = (crop[0], crop[1]) if crop else size
+    crop, bands = letterbox, None
 
     duration = probe_duration(inter)
     out_words = remap_words(near, keep)
@@ -150,7 +189,8 @@ def render_clip(
     layouts: list[SceneLayout] = []
     steps: list[tuple[float, float]] = []
     if settings.vertical:
-        layouts = plan_layouts(inter, detector, settings.facecam, crop=crop)
+        layouts, crop, bands = _plan_vertical(inter, detector, settings, size, letterbox)
+        in_w, in_h = (crop[0], crop[1]) if crop else size
         steps = zoom_schedule(
             duration,
             cuts,

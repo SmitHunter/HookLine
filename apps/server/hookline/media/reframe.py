@@ -10,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 
-from hookline.media.ffmpeg import _run, probe_duration, probe_size
+from hookline.media.ffmpeg import FFmpegError, _run, probe_duration, probe_size
 from hookline.pipeline.layout import SceneLayout
 from hookline.vision.faces import sample_frames
 
@@ -83,7 +83,16 @@ _BAND_SLIT = 0.015  # ... and any rows (descenders, a border) up to 1.5%
 _BAND_MIN = 0.03  # at least 3% of the height in static rows
 _BAND_PAD = 0.01  # cut 1% past the last static row: borders/shadows whose contrast varies
 _BORDER_DENSITY = 0.2  # a row with edges across >= 20% of the width is a box border
-_SPAN_BINS, _SPAN_MIN = 16, 0.5  # a band's static edges reach >= half of 16 column bins
+_BOX_T = 8  # a vertical step this big marks a box's border (faint on dim footage) ...
+_BOX_STEADY = 0.5  # ... when present in >= half the samples (semi-transparent boxes fade)
+_BOX_SPAN = 0.6  # ... along one run (gaps <= 2% of the width bridged) of >= 60% of the width
+_BOX_GAP = 0.02
+_BOX_BORDER = 0.5  # ... of which a visible border covers >= 50% of the width
+_BOX_FILL_SPREAD = 30  # a column inside the box whose brightness spread (p90-p10) stays under this
+_BOX_CLEAN = 0.5  # >= half the rows inside the box carry no live (non-static) edges
+# The two 30% limits have different bases: a band is measured against the sampled frame (the
+# letterbox crop); combine_crop re-checks the total against that crop's height, and also keeps
+# >= 60% of the original (uncropped) frame height.
 _MAX_BAND = 0.30  # never more than 30% of the height, per band and in total
 _MIN_KEPT = 0.6  # letterbox + bands must leave >= 60% of the original height
 _MIN_MOTION = 2.0  # 90th-percentile row motion outside the bands; below it nothing moves
@@ -102,31 +111,61 @@ def _row_flags(gray: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np
     """Per row (n, H, W -> H): `static` -- in >= 90% of samples > 8% of its pixels are edges
     matching the median gradient; `flat` -- the median frame has almost no edges there (the
     plain fill between an overlay's text lines); `strong` -- an edge across >= 20% of the median
-    frame's width (a box border); plus the per-pixel static-edge map (H, W). Gradients, not
-    intensities: a semi-transparent band shifts in brightness with what is behind it, but its
-    text edges stay put."""
+    frame's width (a box border); plus `live` (n, H, W): edges that don't match the median
+    gradient, i.e. moving picture. Gradients, not intensities: a semi-transparent band shifts
+    in brightness with what is behind it, but its text edges stay put."""
     grad = _gradient(gray)
     med = np.median(grad, axis=0)
-    match = (
-        (grad > _EDGE_T)
-        & (med > _EDGE_T)
-        & (np.abs(grad - med) < _EDGE_TOL * np.maximum(grad, med))
-    )
+    edge = grad > _EDGE_T
+    match = edge & (med > _EDGE_T) & (np.abs(grad - med) < _EDGE_TOL * np.maximum(grad, med))
     static = ((match.mean(axis=2) > _EDGE_DENSITY).mean(axis=0)) >= _STATIC_SHARE
     density = (med > _EDGE_T).mean(axis=1)
-    pixels = match.mean(axis=0) >= _STATIC_SHARE
-    return static, density < _EDGE_DENSITY / 2, density >= _BORDER_DENSITY, pixels
+    return static, density < _EDGE_DENSITY / 2, density >= _BORDER_DENSITY, edge & ~match
 
 
-def _wide(pixels: np.ndarray) -> bool:
-    """Whether a band's static edges (rows, W) spread over >= half of 16 column bins: an
-    overlay strip, not a corner HUD element or minimap that happens to touch the edge."""
-    bins = np.array_split(pixels.any(axis=0), _SPAN_BINS)
-    return sum(b.any() for b in bins) >= _SPAN_MIN * _SPAN_BINS
+def _longest_run(mask: np.ndarray, gap: int) -> tuple[int, int]:
+    """[lo, hi) of the longest run of True in `mask`, bridging False gaps up to `gap`."""
+    idx = np.flatnonzero(mask)
+    if not len(idx):
+        return 0, 0
+    runs = np.split(idx, np.flatnonzero(np.diff(idx) > gap + 1) + 1)
+    best = max(runs, key=lambda r: r[-1] - r[0])
+    return int(best[0]), int(best[-1]) + 1
 
 
-def _edge_band(static: np.ndarray, flat: np.ndarray, strong: np.ndarray) -> int:
-    """Height in rows of the band touching index 0 (flags ordered edge first), or 0.
+def _boxed(gray: np.ndarray, live: np.ndarray, band: int, start: int) -> bool:
+    """Whether a band (rows [0, band) of edge-first (n, H, W) arrays; outermost static row
+    `start`) is shaped like a boxed overlay: its inner edge is a border row -- a vertical step
+    present in >= half the samples (its contrast varies with what is behind it), or a column of
+    steady fill below it -- running along >= 60% of the width in one piece, the visible border
+    covering >= 50% of the width, and >= half the rows between `start`
+    and that border carry no live edges within the box's columns (text on a fill, not a
+    picture). Separate HUD bars (two health bars + a timer) and cam frames fail."""
+    _, h, w = gray.shape
+    dy = np.zeros_like(gray)
+    dy[:, 1:] = np.abs(np.diff(gray, axis=1))
+    reach = math.ceil((_BAND_GAP + _BAND_PAD) * h) + 2
+    best = (0, 0, 0)  # (length, lo, row)
+    for r in range(max(band - reach, start + 1), min(band + 1, h - 1)):
+        steady = (dy[:, r - 1 : r + 2].max(axis=1) > _BOX_T).mean(axis=0) >= _BOX_STEADY
+        # Where the border fades into a same-brightness background, the box still shows as
+        # columns whose interior barely changes (a fill), unlike a moving picture between bars.
+        inside = gray[:, start:r]
+        spread = np.percentile(inside, 90, axis=0) - np.percentile(inside, 10, axis=0)
+        boxy = np.median(spread, axis=0) < _BOX_FILL_SPREAD
+        lo, hi = _longest_run(steady | boxy, math.ceil(_BOX_GAP * w))
+        if steady[lo:hi].sum() >= _BOX_BORDER * w and hi - lo > best[0]:
+            best = (hi - lo, lo, r)
+    length, lo, row = best
+    if length < _BOX_SPAN * w:
+        return False
+    rows = np.median(live[:, start:row, lo : lo + length].mean(axis=2), axis=0)
+    return bool(rows.size) and bool((rows < _EDGE_DENSITY / 2).mean() >= _BOX_CLEAN)
+
+
+def _edge_band(static: np.ndarray, flat: np.ndarray, strong: np.ndarray) -> tuple[int, int]:
+    """(height in rows, outermost static row) of the band touching index 0 (flags ordered edge
+    first), or (0, 0).
 
     Candidate runs start at each static row within the margin (live content may sit between
     the band and the frame edge) and extend over static rows; gaps up to _BAND_SLIT are
@@ -136,7 +175,7 @@ def _edge_band(static: np.ndarray, flat: np.ndarray, strong: np.ndarray) -> int:
     _MAX_BAND it is not a band."""
     h = len(static)
     hits = np.flatnonzero(static)
-    best_last, best_count = -1, 0
+    best_last, best_count, best_start = -1, 0, 0
     for start in hits[hits <= _BAND_MARGIN * h]:
         last, count = int(start), 0
         for i in hits[hits >= start]:
@@ -145,14 +184,14 @@ def _edge_band(static: np.ndarray, flat: np.ndarray, strong: np.ndarray) -> int:
                 break
             last, count = int(i), count + 1
         if count > best_count:
-            best_last, best_count = last, count
+            best_last, best_count, best_start = last, count, int(start)
     if best_count < _BAND_MIN * h:
-        return 0
+        return 0, 0
     window = np.flatnonzero(strong[best_last + 1 : best_last + 1 + math.ceil(_BAND_GAP * h)])
     if len(window):
         best_last += int(window[0]) + 1
     band = min(best_last + 1 + math.ceil(_BAND_PAD * h), h)
-    return band if band <= _MAX_BAND * h else 0
+    return (band, best_start) if band <= _MAX_BAND * h else (0, 0)
 
 
 def detect_overlay_bands(
@@ -161,20 +200,26 @@ def detect_overlay_bands(
     """Burned-in overlay bands at the top/bottom edge as `(top_cut_px, bottom_cut_px)` in
     (cropped) source pixels, or None. A band is a run of rows whose edges are static in >= 90%
     of 12 samples while the rest of the frame moves, touching the frame edge, <= 30% of the
-    height, its static edges spread over at least half the width. A paused video (nothing
-    moves), a static frame-sized region, or a corner HUD element/minimap is not a band."""
-    duration = probe_duration(video)
-    times = [duration * (i + 0.5) / _OVERLAY_SAMPLES for i in range(_OVERLAY_SAMPLES)]
-    frames = sample_frames(video, times, width=_OVERLAY_W, crop=crop)
+    height, shaped like a boxed overlay (`_boxed`). A paused video (nothing moves), a static
+    frame-sized region, a corner minimap, separate HUD bars or a cam frame is not a band. An
+    unreadable video gives None (logged)."""
+    try:
+        duration = probe_duration(video)
+        times = [duration * (i + 0.5) / _OVERLAY_SAMPLES for i in range(_OVERLAY_SAMPLES)]
+        frames = sample_frames(video, times, width=_OVERLAY_W, crop=crop)
+        src_h = crop[1] if crop else probe_size(video)[1]
+    except FFmpegError as e:
+        log.warning("overlay detection skipped for %s: %s", video.name, e)
+        return None
     gray = np.stack(
         [f[..., 0] * 0.114 + f[..., 1] * 0.587 + f[..., 2] * 0.299 for f in frames]
     ).astype(np.float32)
     h = gray.shape[1]
-    static, flat, strong, pixels = _row_flags(gray)
-    top = _edge_band(static, flat, strong)
-    bottom = _edge_band(static[::-1], flat[::-1], strong[::-1])
-    top = top if top and _wide(pixels[:top]) else 0
-    bottom = bottom if bottom and _wide(pixels[h - bottom :]) else 0
+    static, flat, strong, live = _row_flags(gray)
+    top, t0 = _edge_band(static, flat, strong)
+    bottom, b0 = _edge_band(static[::-1], flat[::-1], strong[::-1])
+    top = top if top and _boxed(gray, live, top, t0) else 0
+    bottom = bottom if bottom and _boxed(gray[:, ::-1], live[:, ::-1], bottom, b0) else 0
     if not top and not bottom:
         return None
     if top + bottom > _MAX_BAND * h:
@@ -183,7 +228,6 @@ def detect_overlay_bands(
     motion = np.median(np.abs(gray - np.median(gray, axis=0)).mean(axis=2), axis=0)
     if np.percentile(motion[top : h - bottom], 90) < _MIN_MOTION:
         return None  # nothing moves: an overlay can't be told from the picture
-    src_h = crop[1] if crop else probe_size(video)[1]
     return _even_up(top * src_h / h) if top else 0, _even_up(bottom * src_h / h) if bottom else 0
 
 
@@ -210,6 +254,39 @@ def combine_crop(
         )
         return crop
     return w, _even(h - top - bottom), x, y + top
+
+
+def box_to_crop(
+    box: tuple[float, float, float, float],
+    size: tuple[int, int],
+    crop: tuple[int, int, int, int] | None,
+) -> tuple[float, float, float, float]:
+    """A box (x, y, w, h as fractions of the full `size` frame) in `crop` space, clipped to it:
+    x' = (x * W - crop_x) / crop_w, and likewise for y, w, h."""
+    if crop is None:
+        return box
+    cw, ch, cx, cy = crop
+    x0 = min(max((box[0] * size[0] - cx) / cw, 0.0), 1.0)
+    y0 = min(max((box[1] * size[1] - cy) / ch, 0.0), 1.0)
+    x1 = min(max(((box[0] + box[2]) * size[0] - cx) / cw, 0.0), 1.0)
+    y1 = min(max(((box[1] + box[3]) * size[1] - cy) / ch, 0.0), 1.0)
+    return x0, y0, x1 - x0, y1 - y0
+
+
+def box_hits_bands(
+    box: tuple[float, float, float, float],
+    size: tuple[int, int],
+    letterbox: tuple[int, int, int, int] | None,
+    bands: tuple[int, int],
+) -> bool:
+    """Whether a box (fractions of the full `size` frame) overlaps the rows overlay `bands`
+    (top, bottom px in `letterbox` space) would remove."""
+    _, h, _, y = letterbox or (size[0], size[1], 0, 0)
+    y0, y1 = box[1] * size[1], (box[1] + box[3]) * size[1]
+    top, bottom = bands
+    hits_top = top > 0 and y0 < y + top and y1 > y
+    hits_bottom = bottom > 0 and y1 > y + h - bottom and y0 < y + h
+    return hits_top or hits_bottom
 
 
 def _even(v: float) -> int:
