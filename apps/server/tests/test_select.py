@@ -341,6 +341,8 @@ def test_system_prompt_covers_brief():
         "appearance",
         # markers stay explained
         "⟨🔥chat×4 🔊loud⟩",
+        "😂",
+        "✂️clip",
         "not a requirement",
         # review round 1
         "quotes a conversation the viewer never saw",
@@ -797,6 +799,38 @@ def test_backchannel_last_line_steps_back(fake_llm, settings, caplog):
     item = _line_item(10, 18, _FILLER.format(n=10), "Mm-hmm.")
     (p,) = _one(tr, fake_llm, settings, item, caplog)
     assert p.end == _end_of(tr, 17) and "backchannel" in caplog.text
+
+
+def _end_item(last_text, **kw):
+    return _line_item(10, 18, _FILLER.format(n=10), last_text, **kw)
+
+
+@pytest.mark.parametrize("word", ["Wow.", "Exactly."])
+def test_wow_and_exactly_are_not_backchannels(fake_llm, settings, word):
+    tr = _lines_transcript({18: word})
+    (p,) = _one(tr, fake_llm, settings, _end_item(word))
+    assert p.end == _end_of(tr, 18)
+
+
+def test_backchannel_kept_for_reaction_peak(fake_llm, settings):
+    tr = _lines_transcript({18: "Mm-hmm."})
+    (p,) = _one(tr, fake_llm, settings, _end_item("Mm-hmm.", hook_type="reaction_peak"))
+    assert p.end == _end_of(tr, 18)
+
+
+@pytest.mark.parametrize("marker", ["🔊loud", "🔥chat×4 😂"])
+def test_backchannel_kept_when_last_sentence_is_marked(fake_llm, settings, marker):
+    tr = _lines_transcript({18: "Mm-hmm."})  # L18 spans 72.0-72.45
+    fake_llm.queue({"clips": [_end_item("Mm-hmm.")]}, EMPTY)
+    (p,) = select_clips(tr, fake_llm, settings, markers={72: [marker]})
+    assert p.end == _end_of(tr, 18)
+
+
+def test_backchannel_still_steps_back_when_marker_is_elsewhere(fake_llm, settings):
+    tr = _lines_transcript({18: "Mm-hmm."})
+    fake_llm.queue({"clips": [_end_item("Mm-hmm.")]}, EMPTY)
+    (p,) = select_clips(tr, fake_llm, settings, markers={40: ["🔊loud"]})
+    assert p.end == _end_of(tr, 17)
 
 
 def test_unfinished_last_line_extends_to_a_finished_one(fake_llm, settings, caplog):

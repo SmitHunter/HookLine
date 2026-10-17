@@ -51,6 +51,7 @@ def render_clip(
     detector: FaceDetector | None,
     protect_words: bool = True,
     encoder: str | None = None,
+    loud_seconds: set[int] | None = None,
 ) -> dict:
     """Write the finished clip to `dst`; returns sidecar extras (layout, keep_ranges, removed_s).
 
@@ -70,7 +71,7 @@ def render_clip(
     hi = max(e for _, e in segs) + 1
     silences = detect_silences(wav, lo, hi, settings.silence_db)
     near = [w for w in words if w.end > lo and w.start < hi]
-    refined = refine_boundaries(pick, near, silences)
+    refined = refine_boundaries(pick, near, silences, loud_seconds=loud_seconds)
     fps = probe_fps(src)
     # Frame-grid bounds make the cut timeline exact, so remapped caption times stay in sync.
     keep = snap_ranges(

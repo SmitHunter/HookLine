@@ -38,7 +38,11 @@ def _paused_after(word: Word, nxt: Word, silences: list[tuple[float, float]]) ->
 
 
 def _trim_fillers(
-    start: float, end: float, clip_words: list[Word], silences: list[tuple[float, float]]
+    start: float,
+    end: float,
+    clip_words: list[Word],
+    silences: list[tuple[float, float]],
+    loud_seconds: set[int] | None = None,
 ) -> float:
     i = 0
     while i < len(clip_words) and i < _MAX_FILLER_WORDS:
@@ -53,6 +57,8 @@ def _trim_fillers(
             step = 1
         if not step or i + step >= len(clip_words):
             break
+        if loud_seconds and any(int(w.start) in loud_seconds for w in clip_words[i : i + step]):
+            break  # a shouted opener ("YEAH!") is the reaction, not filler
         if not _paused_after(clip_words[i + step - 1], clip_words[i + step], silences):
             break  # the "filler" runs straight into the next word: it is part of the sentence
         new_start = clip_words[i + step].start
@@ -68,16 +74,19 @@ def refine_boundaries(
     words: list[Word],
     silences: list[tuple[float, float]],
     window: float = 0.4,
+    loud_seconds: set[int] | None = None,
 ) -> ClipPick:
     """Trim up to 3 leading filler words (only those followed by a pause), then snap
     start/end into silences within `window`. Without a start snap, the start gets a 0.10 s
     lead-in before the first word (never before the previous word's end).
 
+    A filler word whose second is in `loud_seconds` is never trimmed.
+
     Never moves `start` past the first remaining word's start, nor `end` before the last
     word's end. Pure: no I/O."""
     start, end = pick.start, pick.end
     idxs = [i for i, w in enumerate(words) if start - 1e-6 <= w.start < end]
-    start = _trim_fillers(start, end, [words[i] for i in idxs], silences)
+    start = _trim_fillers(start, end, [words[i] for i in idxs], silences, loud_seconds)
 
     first_idx = next((i for i in idxs if words[i].start >= start - 1e-6), None)
     last_idx = idxs[-1] if idxs else None

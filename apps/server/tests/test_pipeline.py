@@ -433,3 +433,51 @@ def test_all_skip_selection_raises_and_keeps_select_raw(fixture_video, fake_llm,
     job = settings_tmp.workspace_dir / job_id_for(str(fixture_video))
     assert not (job / "picks.json").exists()
     assert json.loads((job / "select_raw.json").read_text(encoding="utf-8")) == [payload]
+
+
+def _job_dir(settings, video):
+    d = settings.workspace_dir / job_id_for(str(video))
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def test_signals_gain_chat_kinds_and_old_cache_is_recomputed(fixture_video, fake_llm, settings_tmp):
+    chat = {
+        "comments": [
+            {"content_offset_seconds": 5.0, "message": {"body": "KEKW lol", "fragments": []}}
+        ]
+    }
+    job = _job_dir(settings_tmp, fixture_video)
+    (job / "chat.json").write_text(json.dumps(chat), encoding="utf-8")
+    s = settings_tmp.model_copy(update={"clips": 1, "chat": True})
+    fake_llm.queue(make_payload_for(150, 1, 21))
+    run_job(str(fixture_video), s, fake_llm, FakeTranscriber(duration=150))
+    sig = json.loads((job / "signals.json").read_text(encoding="utf-8"))
+    assert sig["chat_kinds"] == {"5": {"laugh": 2}}
+    # an old cache (chat but no chat_kinds) is recomputed while chat.json exists
+    del sig["chat_kinds"]
+    (job / "signals.json").write_text(json.dumps(sig), encoding="utf-8")
+    fake_llm.queue(make_payload_for(150, 1, 21))
+    run_job(str(fixture_video), s, fake_llm, FakeTranscriber(duration=150))
+    sig = json.loads((job / "signals.json").read_text(encoding="utf-8"))
+    assert sig["chat_kinds"] == {"5": {"laugh": 2}}
+
+
+def test_run_job_passes_loud_seconds_to_render(fixture_video, fake_llm, settings_tmp, monkeypatch):
+    from hookline.pipeline import run as run_mod
+
+    seen = []
+    real = run_mod.render_clip
+
+    def spy(*a, **k):
+        seen.append(k.get("loud_seconds"))
+        return real(*a, **k)
+
+    monkeypatch.setattr(run_mod, "render_clip", spy)
+    monkeypatch.setattr(
+        run_mod, "rms_per_second", lambda w: [-40.0] * 20 + [-20.0] * 5 + [-40.0] * 125
+    )
+    fake_llm.queue(make_payload_for(150, 1, 21))
+    s = settings_tmp.model_copy(update={"clips": 1, "vertical": False, "captions": False})
+    run_job(str(fixture_video), s, fake_llm, FakeTranscriber(duration=150))
+    assert seen == [set(range(20, 25))]

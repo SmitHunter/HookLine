@@ -8,6 +8,7 @@ from hookline.assets import AssetError
 from hookline.pipeline import chat
 from hookline.pipeline.chat import (
     ChatError,
+    chat_keywords,
     chat_rate,
     download_chat,
     try_fetch_chat,
@@ -136,3 +137,53 @@ def test_chat_rate_tolerates_malformed():
         ]
     }
     assert chat_rate(data, 4) == [0.0, 1.0, 2.5, 0.0]
+
+
+def test_chat_keywords_on_fixture():
+    k = chat_keywords(load("twitch_chat_sample.json"), duration=10)
+    assert k[3] == {"hype": 1}
+    assert k[5] == {"laugh": 3}
+    assert 0 not in k and 4 not in k
+
+
+def _msgs(*items):
+    return {
+        "comments": [
+            {"content_offset_seconds": t, "message": {"body": body, "fragments": []}}
+            for t, body in items
+        ]
+    }
+
+
+def test_chat_keywords_kinds_and_case_rules():
+    k = chat_keywords(
+        _msgs(
+            (0.1, "LMAO that was great"),
+            (0.2, "W"),
+            (0.3, "w in chat"),  # lowercase w is not the emote
+            (1.1, "F"),
+            (1.2, "L"),
+            (1.3, "lets go!!"),
+            (2.1, "clip it"),
+            (2.2, "!clip"),
+            (2.3, "CLIP THAT"),
+            (3.1, "WTF"),
+            (3.2, "monkaS"),
+            (3.3, "D:"),
+            (4.1, "😂😂"),
+            (4.2, "hello there"),
+        ),
+        duration=6,
+    )
+    assert k[0] == {"laugh": 1, "hype": 1}
+    assert k[1] == {"fail": 2, "hype": 1}
+    assert k[2] == {"clip": 3}
+    assert k[3] == {"shock": 3}
+    assert k[4] == {"laugh": 1}
+    assert 5 not in k
+
+
+def test_chat_keywords_tolerates_malformed():
+    bad = {"comments": [None, {"content_offset_seconds": "x"}, {"content_offset_seconds": 1}]}
+    assert chat_keywords(bad, duration=5) == {}
+    assert chat_keywords({}, duration=5) == {}

@@ -34,3 +34,50 @@ def test_chat_ratio_in_label_and_minimum_baseline():
     m = heat_markers(Signals(duration=600, loudness=[], chat=chat))
     labels = [x for v in m.values() for x in v]
     assert len(labels) == 1 and labels[0].startswith("🔥chat×")
+
+
+def _spike(kind_counts, start=300):
+    chat = [1.0] * 600
+    chat[start : start + 10] = [8.0] * 10
+    kinds = {start + 2: dict(kind_counts)}
+    return Signals(duration=600, loudness=[], chat=chat, chat_kinds=kinds)
+
+
+def test_spike_labelled_with_dominant_kind():
+    for kind, emoji in [("laugh", "😂"), ("hype", "🏆"), ("fail", "💀"), ("shock", "😱")]:
+        m = heat_markers(_spike({kind: 6, "hype" if kind != "hype" else "laugh": 1}))
+        labels = [x for v in m.values() for x in v]
+        assert len(labels) == 1 and labels[0].startswith("🔥chat×") and labels[0].endswith(emoji)
+
+
+def test_spike_without_dominant_kind_has_no_emoji():
+    m = heat_markers(_spike({"laugh": 3, "hype": 3, "fail": 3}))
+    (label,) = [x for v in m.values() for x in v]
+    assert label.startswith("🔥chat×") and " " not in label
+
+
+def test_clip_kind_never_labels_a_spike():
+    m = heat_markers(_spike({"clip": 2}))
+    (label,) = [x for v in m.values() for x in v if x.startswith("🔥")]
+    assert " " not in label
+
+
+def test_clip_requests_add_standalone_marker():
+    kinds = {100: {"clip": 1}, 103: {"clip": 1}, 106: {"clip": 1}}
+    sig = Signals(duration=300, loudness=[], chat=[0.0] * 300, chat_kinds=kinds)
+    m = heat_markers(sig)
+    clips = {k: v for k, v in m.items() if "✂️clip" in v}
+    assert len(clips) == 1 and 95 <= next(iter(clips)) <= 106
+    sig = Signals(
+        duration=300,
+        loudness=[],
+        chat=[0.0] * 300,
+        chat_kinds={100: {"clip": 1}, 120: {"clip": 1}, 140: {"clip": 2}},
+    )
+    assert not any("✂️clip" in v for v in heat_markers(sig).values())
+
+
+def test_chat_kinds_round_trip_through_json():
+    sig = _spike({"laugh": 5})
+    back = Signals.model_validate_json(sig.model_dump_json())
+    assert back.chat_kinds == sig.chat_kinds

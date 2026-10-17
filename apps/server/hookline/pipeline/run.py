@@ -2,6 +2,7 @@ import json
 import os
 from collections.abc import Callable
 from pathlib import Path
+from statistics import median
 
 from hookline.assets import AssetError, ensure_yunet
 from hookline.config import Settings
@@ -10,7 +11,7 @@ from hookline.llm import LLMBackend
 from hookline.media.audio import rms_per_second
 from hookline.media.ffmpeg import FFmpegError, extract_audio, pick_encoder
 from hookline.models import ClipPick, Transcript
-from hookline.pipeline.chat import chat_rate, try_fetch_chat
+from hookline.pipeline.chat import chat_keywords, chat_rate, try_fetch_chat
 from hookline.pipeline.ingest import find_source, ingest, job_id_for
 from hookline.pipeline.render import render_clip
 from hookline.pipeline.select import NoClipsSelectedError, select_clips
@@ -29,6 +30,9 @@ def transcript_key(transcriber: Transcriber) -> dict:
     if isinstance(key, dict):
         return {"backend": key.get("backend"), "model": key.get("model"), "dtw": key.get("dtw")}
     return {"backend": type(transcriber).__name__, "model": None, "dtw": None}
+
+
+_LOUD_FILLER_DB = 6.0
 
 
 def _picks_key(settings: Settings, tkey: dict) -> dict:
@@ -112,7 +116,7 @@ def _signals(
     if spath.exists():
         try:
             cached = Signals.model_validate_json(spath.read_text(encoding="utf-8"))
-            if cached.chat is not None or not cpath.exists():
+            if (cached.chat is not None and cached.chat_kinds is not None) or not cpath.exists():
                 log("[4/6] signals: skipped (cached)")
                 return cached
         except ValueError:
@@ -120,16 +124,27 @@ def _signals(
     log("[4/6] signals: started")
     duration = transcript.duration
     chat = None
+    kinds = None
     if cpath.exists():
         try:
             raw = json.loads(cpath.read_text(encoding="utf-8"))
-            chat = chat_rate(raw if isinstance(raw, dict) else {}, duration)
+            raw = raw if isinstance(raw, dict) else {}
+            chat = chat_rate(raw, duration)
+            kinds = {s: dict(c) for s, c in chat_keywords(raw, duration).items()}
         except (ValueError, OSError) as e:
             log(f"warning: chat.json unreadable ({e}); continuing without chat signals")
-    signals = Signals(duration=duration, loudness=rms_per_second(wav), chat=chat)
+    signals = Signals(duration=duration, loudness=rms_per_second(wav), chat=chat, chat_kinds=kinds)
     atomic_write_text(spath, signals.model_dump_json())
     log("[4/6] signals: done")
     return signals
+
+
+def _loud_seconds(signals: Signals) -> set[int]:
+    """Seconds at least 6 dB above the median loudness (shouted words), for filler trimming."""
+    if not signals.loudness:
+        return set()
+    threshold = median(signals.loudness) + _LOUD_FILLER_DB
+    return {i for i, db in enumerate(signals.loudness) if db >= threshold}
 
 
 def _face_detector(settings: Settings, log: Callable[[str], None]) -> FaceDetector | None:
@@ -202,7 +217,7 @@ def run_job(
 
     signals = _signals(job_dir, wav, transcript, log)
     if not settings.chat:
-        signals = signals.model_copy(update={"chat": None})
+        signals = signals.model_copy(update={"chat": None, "chat_kinds": None})
 
     ppath = job_dir / "picks.json"
     key = _picks_key(settings, tkey)
@@ -244,6 +259,7 @@ def run_job(
     # would remove no dead air at all; only real word timings (DTW / whisper) are protected.
     protect = transcript.timing != "segment"
     encoder = pick_encoder()
+    loud = _loud_seconds(signals)
     clips: list[Path] = []
     for i, pick in enumerate(picks, 1):
         dst = out_dir / f"{i:02d}-{slugify(pick.title)}.mp4"
@@ -259,6 +275,7 @@ def run_job(
                 detector,
                 protect_words=protect,
                 encoder=encoder,
+                loud_seconds=loud,
             )
         except (FFmpegError, ValueError, OSError) as e:
             reason = (str(e).splitlines() or [type(e).__name__])[0]

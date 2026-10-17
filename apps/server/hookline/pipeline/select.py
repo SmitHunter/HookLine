@@ -58,7 +58,9 @@ confessions and strong opinions.
 
 Some lines end with markers in angle brackets, such as `⟨🔥chat×4 🔊loud⟩`. They are audience \
 and audio reactions inside that sentence: `🔥chat×N` means chat activity ran about N times the \
-usual rate, and `🔊loud` means the audio got far louder than normal. Treat them as evidence of \
+usual rate, and `🔊loud` means the audio got far louder than normal. An emoji after \
+`🔥chat×N` says what chat was reacting with (😂 laughing, 🏆 hype, 💀 a fail, 😱 shock), and \
+`✂️clip` means chat is asking for a clip. Treat them as evidence of \
 emotional intensity, not a requirement: a moment without markers can still be great, and a \
 marked one can still be a poor clip.
 
@@ -269,7 +271,7 @@ _BANNED_HASHTAGS = {
 }
 # Tokens of a backchannel line ("Yeah.", "Mm-hmm.", "Uh-huh, right."); hyphenated forms split.
 _BACKCHANNEL = {"yeah", "yep", "mm", "hmm", "mm-hmm", "uh", "huh", "uh-huh", "right", "okay"}
-_BACKCHANNEL |= {"exactly", "sure", "wow"}
+_BACKCHANNEL |= {"sure"}  # "wow" / "exactly" are often the payoff, not a nod
 _UNFINISHED_ENDINGS = ("...", "…", "--", "—", "-")
 _TRAILING_QUOTES = "\"'”’)]}»"
 _TOKEN_RE = re.compile(r"[a-z0-9']+")
@@ -321,6 +323,7 @@ class _Source:
     duration: float
     settings: Settings
     exclude: list[tuple[float, float]]
+    markers: dict[int, list[str]] | None = None  # second -> heat markers
 
 
 def build_prompt(
@@ -467,12 +470,29 @@ def _is_finished(text: str) -> bool:
     return not t.endswith(_UNFINISHED_ENDINGS) and t.endswith((".", "!", "?"))
 
 
+def _is_marked(sentence: Sentence, src: _Source) -> bool:
+    """True when a loud or chat-spike marker falls in the sentence's seconds."""
+    if not src.markers:
+        return False
+    return any(
+        m.startswith(("🔊", "🔥"))
+        for sec in range(int(sentence.start), int(sentence.end) + 1)
+        for m in src.markers.get(sec, ())
+    )
+
+
 def _fix_ending(raw: _RawClip, first: int, last: int, src: _Source) -> int:
-    """Never end on a backchannel (step back one line), and finish an unfinished last
+    """Never end on a backchannel (step back one line) unless the clip is a reaction peak or
+    the line carries a loud / chat-spike marker (the nod is the payoff), and finish an unfinished last
     sentence by extending up to 2 lines / 8 s (within max_clip_s) to the first line with
     terminal punctuation. Logs each adjustment."""
     sents, toks = src.sentences, src.tokens
-    if last > first and _is_backchannel(toks[last]):
+    if (
+        last > first
+        and _is_backchannel(toks[last])
+        and raw.hook_type != "reaction_peak"
+        and not _is_marked(sents[last], src)
+    ):
         logger.info("clip %r: L%d is a backchannel; ending on L%d", raw.title, last, last - 1)
         last -= 1
     if _is_finished(sents[last].text):
@@ -710,6 +730,7 @@ def select_clips(
         duration=transcript.duration,
         settings=settings,
         exclude=exclude,
+        markers=markers,
     )
     compact = compact_transcript(sentences, markers)
     returned: list[_RawClip] = []

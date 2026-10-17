@@ -169,3 +169,12 @@ def test_no_lead_in_after_silence_snap():
     ws = words_from("the city", start=10.2)
     p = refine_boundaries(pick(10.2, 40), ws, [(9.5, 10.1)])
     assert p.start == pytest.approx(10.05)
+
+
+def test_loud_opener_is_kept_and_quiet_one_trimmed():
+    ws = [W(10.0, 10.25, "yeah"), W(10.4, 10.7, "the"), W(10.8, 11.1, "city")]
+    quiet = refine_boundaries(pick(10.0, 40), ws, [], loud_seconds=set())
+    assert quiet.start > 10.2
+    loud = refine_boundaries(pick(10.0, 40), ws, [], loud_seconds={10})
+    assert loud.start <= 10.0
+    assert refine_boundaries(pick(10.0, 40), ws, [], loud_seconds=None).start > 10.2
