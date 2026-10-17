@@ -1,13 +1,20 @@
 import pytest
 
 from hookline.media.ffmpeg import _run
-from hookline.media.loudness import Loudness, loudnorm_filter, measure_loudness
+from hookline.media.loudness import (
+    COMPRESSOR,
+    Loudness,
+    loudnorm_filter,
+    loudnorm_mode,
+    measure_loudness,
+    parse_loudnorm_json,
+)
 from hookline.pipeline.render import render_clip
-from tests.test_render import NoFaces, _final_argvs
+from tests.conftest import NoFaces
 
 
-def _m(i: float) -> Loudness:
-    return Loudness(i=i, tp=-3.0, lra=7.0, thresh=i - 10, offset=0.0)
+def _m(i: float, tp: float = -20.0, lra: float = 7.0) -> Loudness:
+    return Loudness(i=i, tp=tp, lra=lra, thresh=i - 10, offset=0.0)
 
 
 def test_measure_loudness_reads_fixture(quiet_speech_video):
@@ -18,9 +25,27 @@ def test_measure_loudness_reads_fixture(quiet_speech_video):
 
 def test_loudnorm_filter_targets_minus_14():
     f = loudnorm_filter(_m(-30.0))
-    assert f.startswith("acompressor=threshold=-21dB:ratio=3:attack=5:release=120:makeup=2,")
+    assert f.startswith(f"{COMPRESSOR},")
+    assert "makeup=1" in COMPRESSOR
     for frag in ("I=-14", "TP=-2", "LRA=11", "measured_I=-30", "linear=true", "print_format=json"):
         assert frag in f
+
+
+def test_loudnorm_mode_rules():
+    assert loudnorm_mode(_m(-30.0, tp=-20.0, lra=7.0)) == "linear"
+    assert loudnorm_mode(_m(-30.0, tp=-5.0, lra=7.0)) == "dynamic"  # -5 + 16 > -2
+    assert loudnorm_mode(_m(-30.0, tp=-20.0, lra=15.0)) == "dynamic"  # LRA above target
+    assert loudnorm_mode(_m(-30.0, tp=-20.0, lra=0.0)) == "dynamic"  # loudnorm rejects LRA 0
+    assert loudnorm_mode(_m(-60.0)) == "skip"
+    f = loudnorm_filter(_m(-30.0, lra=15.0))
+    assert "linear=true" not in f and "measured_I" not in f and "loudnorm=I=-14" in f
+
+
+def test_measure_loudness_no_audio_returns_none(tmp_path):
+    out = tmp_path / "v.mp4"
+    _run(["ffmpeg", "-hide_banner", "-v", "error", "-y", "-f", "lavfi", "-i",
+          "testsrc2=size=64x64:rate=25:duration=1", "-c:v", "libx264", str(out)])  # fmt: skip
+    assert measure_loudness(out) is None
 
 
 def test_loudnorm_filter_caps_gain_at_20db():
@@ -32,7 +57,7 @@ def test_loudnorm_filter_skips_below_minus_50():
     assert loudnorm_filter(_m(-60.0)) == "anull"
 
 
-def _render(video, tmp_path, sample_pick, settings, monkeypatch):
+def _render(video, tmp_path, sample_pick, settings, final_argvs):
     from hookline.media.ffmpeg import extract_audio
     from hookline.models import Word
 
@@ -40,39 +65,41 @@ def _render(video, tmp_path, sample_pick, settings, monkeypatch):
     words = [Word(start=float(t), end=t + 0.5, text="hi") for t in range(20)]
     pick = sample_pick.model_copy(update={"start": 2.0, "end": 16.0})
     s = settings.model_copy(update={"captions": False})
-    argvs = _final_argvs(monkeypatch)
     dst = tmp_path / "out" / "01-x.mp4"
     render_clip(video, wav, pick, words, tmp_path / "r", dst, s, NoFaces())
-    return dst, argvs
+    return dst, final_argvs
 
 
-def test_quiet_clip_renders_to_minus_14(
-    quiet_speech_video, sample_pick, settings, tmp_path, monkeypatch
-):
-    dst, argvs = _render(quiet_speech_video, tmp_path, sample_pick, settings, monkeypatch)
+def _check_render(video, tmp_path, sample_pick, settings, final_argvs, expected_mode):
+    dst, argvs = _render(video, tmp_path, sample_pick, settings, final_argvs)
     m = measure_loudness(dst)
-    print(f"quiet -> I={m.i} TP={m.tp} LRA={m.lra}")
+    print(f"{expected_mode}: I={m.i} TP={m.tp} LRA={m.lra}")
     assert m.i == pytest.approx(-14.0, abs=1.0)
     assert m.tp <= -1.0
     (final,) = argvs
-    assert "-af" in final and "loudnorm=" in final[final.index("-af") + 1]
     i = final.index("-c:a")
     assert final[i : i + 6] == ["-c:a", "aac", "-b:a", "192k", "-ar", "48000"]
-    streams = _run(
-        [
-            "ffprobe",
-            "-v",
-            "error",
-            "-select_streams",
-            "a:0",
-            "-show_entries",
-            "stream=codec_name,sample_rate,bit_rate",
-            "-of",
-            "json",
-            str(dst),
-        ]
-    ).stdout
+    streams = _run(["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries",
+                    "stream=codec_name,sample_rate", "-of", "json", str(dst)]).stdout  # fmt: skip
     assert '"aac"' in streams and '"48000"' in streams
+    # Pass 1 as the pipeline ran it, on the intermediate's audio, decides the mode.
+    af = final[final.index("-af") + 1]
+    assert ("linear=true" in af) == (expected_mode == "linear")
+    reported = parse_loudnorm_json(argvs.stderrs[0])["normalization_type"]
+    print(f"{expected_mode}: loudnorm reported normalization_type={reported}")
+    assert reported == expected_mode
+
+
+def test_low_crest_clip_is_linear_and_minus_14(
+    steady_quiet_video, sample_pick, settings, tmp_path, final_argvs
+):
+    _check_render(steady_quiet_video, tmp_path, sample_pick, settings, final_argvs, "linear")
+
+
+def test_speech_like_clip_is_dynamic_and_minus_14(
+    quiet_speech_video, sample_pick, settings, tmp_path, final_argvs
+):
+    _check_render(quiet_speech_video, tmp_path, sample_pick, settings, final_argvs, "dynamic")
 
 
 def test_near_silent_clip_not_boosted(
@@ -84,7 +111,9 @@ def test_near_silent_clip_not_boosted(
     assert m.i <= -40.0
 
 
-def test_intermediate_is_mkv_pcm(quiet_speech_video, sample_pick, settings, tmp_path, monkeypatch):
+def test_intermediate_is_mkv_pcm(
+    quiet_speech_video, sample_pick, settings, tmp_path, monkeypatch, final_argvs
+):
     from hookline.pipeline import render as render_mod
 
     seen = []
@@ -111,6 +140,6 @@ def test_intermediate_is_mkv_pcm(quiet_speech_video, sample_pick, settings, tmp_
         return out
 
     monkeypatch.setattr(render_mod, "cut_segments", spy)
-    _render(quiet_speech_video, tmp_path, sample_pick, settings, monkeypatch)
+    _render(quiet_speech_video, tmp_path, sample_pick, settings, final_argvs)
     assert seen[0].suffix == ".mkv" and seen[1] == "pcm_s16le"
     assert not seen[0].exists()  # removed after success

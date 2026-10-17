@@ -231,15 +231,18 @@ def synthetic_stream(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return out
 
 
-def _speechlike_video(dst: Path, lufs: float, duration: int = 20) -> Path:
+def _speechlike_video(dst: Path, lufs: float, duration: int = 20, steady: bool = False) -> Path:
     """320x180 video whose audio is gated pink-noise bursts plus a 200 Hz tone (speech-like loudness range), scaled so its integrated loudness is `lufs`."""
     from hookline.media.loudness import measure_loudness
 
     raw = dst.with_suffix(".raw.wav")
-    gate = "if(lt(mod(t,7),4),1,0.15)"  # 4 s loud, 3 s at -16 dB: LRA survives the 3 s window
+    noise_amp = 0.0 if steady else 0.5
+    # Speech-like: 4 s loud, 3 s at -16 dB (LRA survives loudness's 3 s window). Steady: a
+    # slow gentle swell (LRA must be nonzero or loudnorm refuses linear mode).
+    gate = "0.65+0.35*sin(2*PI*t/9)" if steady else "if(lt(mod(t,7),4),1,0.15)"
     subprocess.run(
         ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-         "-f", "lavfi", "-i", f"anoisesrc=color=pink:amplitude=0.5:sample_rate=48000:duration={duration}",
+         "-f", "lavfi", "-i", f"anoisesrc=color=pink:seed=7:amplitude={noise_amp}:sample_rate=48000:duration={duration}",
          "-f", "lavfi", "-i", f"sine=frequency=200:sample_rate=48000:duration={duration}",
          "-filter_complex",
          f"[0:a][1:a]amix=inputs=2:normalize=0,volume='{gate}':eval=frame[a]",
@@ -266,6 +269,43 @@ def quiet_speech_video(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 
 @pytest.fixture(scope="session")
+def steady_quiet_video(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """20 s low-crest clip (steady tone, LRA ~0) at about -30 LUFS: loudnorm can go linear."""
+    return _speechlike_video(tmp_path_factory.mktemp("loud") / "steady.mp4", -30.0, steady=True)
+
+
+@pytest.fixture(scope="session")
 def near_silent_video(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """20 s clip at about -60 LUFS (game audio only / room tone)."""
     return _speechlike_video(tmp_path_factory.mktemp("loud") / "silent.mp4", -60.0)
+
+
+class NoFaces:
+    def detect(self, bgr):
+        return []
+
+
+class FinalEncodeSpy(list):
+    """argv of each render ffmpeg call that has a filter graph (the final encode)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.stderrs: list[str] = []
+
+
+@pytest.fixture
+def final_argvs(monkeypatch) -> FinalEncodeSpy:
+    from hookline.pipeline import render as render_mod
+
+    seen = FinalEncodeSpy()
+    real = render_mod._run
+
+    def spy(cmd):
+        res = real(cmd)
+        if "-filter_complex" in cmd:
+            seen.append(cmd)
+            seen.stderrs.append(res.stderr)
+        return res
+
+    monkeypatch.setattr(render_mod, "_run", spy)
+    return seen

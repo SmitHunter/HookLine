@@ -1,6 +1,7 @@
 """Two-pass EBU R128 loudness normalisation helpers (target -14 LUFS, TP -1 dBTP)."""
 
 import json
+import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,7 +15,10 @@ TARGET_LRA = 11.0
 FINAL_TP = -2.0
 MAX_GAIN_DB = 20.0
 SILENCE_FLOOR_LUFS = -50.0
-COMPRESSOR = "acompressor=threshold=-21dB:ratio=3:attack=5:release=120:makeup=2"
+# makeup is a linear factor (1 = unity). Loudnorm supplies the gain, so no blind boost here.
+COMPRESSOR = "acompressor=threshold=-21dB:ratio=3:attack=5:release=120:makeup=1"
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -26,19 +30,37 @@ class Loudness:
     offset: float
 
 
-def measure_loudness(path: Path) -> Loudness:
-    """Pass 1 of loudnorm over `path`'s audio: integrated loudness, true peak, LRA."""
+def has_audio(path: Path) -> bool:
+    res = _run(
+        ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries",
+         "stream=index", "-of", "csv=p=0", str(path)]
+    )  # fmt: skip
+    return bool(res.stdout.strip())
+
+
+def parse_loudnorm_json(stderr: str) -> dict:
+    """The last JSON object in ffmpeg's stderr (loudnorm prints its stats there)."""
+    blocks = re.findall(r"\{[^{}]*\}", stderr)
+    if not blocks:
+        raise FFmpegError("no loudnorm statistics in ffmpeg output", stderr)
+    return json.loads(blocks[-1])
+
+
+def measure_loudness(path: Path, prefilter: str | None = None) -> Loudness | None:
+    """Pass 1 of loudnorm over `path`'s audio (after `prefilter`, e.g. COMPRESSOR, when given):
+    integrated loudness, true peak, LRA. None when the file has no audio stream."""
+    if not has_audio(path):
+        return None
+    chain = f"{prefilter}," if prefilter else ""
     res = _run(
         [
             "ffmpeg", "-hide_banner", "-v", "info", "-nostats", "-i", str(path), "-vn",
-            "-af", f"loudnorm=I={TARGET_I:g}:TP={TARGET_TP:g}:LRA={TARGET_LRA:g}:print_format=json",
+            "-af",
+            f"{chain}loudnorm=I={TARGET_I:g}:TP={TARGET_TP:g}:LRA={TARGET_LRA:g}:print_format=json",
             "-f", "null", "-",
         ]
     )  # fmt: skip
-    blocks = re.findall(r"\{[^{}]*\}", res.stderr)
-    if not blocks:
-        raise FFmpegError("no loudnorm statistics in ffmpeg output", res.stderr)
-    d = json.loads(blocks[-1])
+    d = parse_loudnorm_json(res.stderr)
     try:
         return Loudness(
             i=_num(d["input_i"]),
@@ -56,17 +78,38 @@ def _num(v: str | float) -> float:
     return -70.0 if x == float("-inf") else x
 
 
+def loudnorm_mode(m: Loudness) -> str:
+    """ "skip" (near-silent), "linear" or "dynamic". `m` is measured AFTER the compressor.
+
+    Mirrors loudnorm's own rule: linear gain only works when the clip's LRA is nonzero and
+    fits the target and the gained true peak stays under the ceiling; otherwise loudnorm would silently fall
+    back to dynamic mode, so we ask for dynamic explicitly."""
+    if m.i < SILENCE_FLOOR_LUFS:
+        return "skip"
+    gain = _target_i(m) - m.i
+    if 0 < m.lra <= TARGET_LRA and m.tp + gain <= FINAL_TP:
+        return "linear"
+    return "dynamic"
+
+
+def _target_i(m: Loudness) -> float:
+    return min(TARGET_I, m.i + MAX_GAIN_DB)
+
+
 def loudnorm_filter(m: Loudness) -> str:
     """Audio filter chain for the final encode: gentle compression, then loudnorm pass 2.
 
     Gain is capped at +20 dB (target I = m.i + 20 when -14 would need more) so noise floors
     are not blown up; near-silent audio (< -50 LUFS) is left untouched."""
-    if m.i < SILENCE_FLOOR_LUFS:
+    mode = loudnorm_mode(m)
+    log.info("audio: loudnorm %s, measured I=%.1f TP=%.1f LRA=%.1f", mode, m.i, m.tp, m.lra)
+    if mode == "skip":
         return "anull"
-    target = min(TARGET_I, m.i + MAX_GAIN_DB)
+    base = f"loudnorm=I={_target_i(m):g}:TP={FINAL_TP:g}:LRA={TARGET_LRA:g}"
+    if mode == "dynamic":
+        return f"{COMPRESSOR},{base}:print_format=json"
     return (
-        f"{COMPRESSOR},"
-        f"loudnorm=I={target:g}:TP={FINAL_TP:g}:LRA={TARGET_LRA:g}"
+        f"{COMPRESSOR},{base}"
         f":measured_I={m.i:g}:measured_TP={m.tp:g}:measured_LRA={m.lra:g}"
         f":measured_thresh={m.thresh:g}:offset={m.offset:g}:linear=true:print_format=json"
     )

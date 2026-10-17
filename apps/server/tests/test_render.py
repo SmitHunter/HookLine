@@ -5,32 +5,12 @@ import pytest
 from hookline.media.ffmpeg import extract_audio, probe_duration, probe_size
 from hookline.models import Word
 from hookline.pipeline.render import render_clip
+from tests.conftest import NoFaces
 from tests.test_pipeline import FakeTranscriber
-
-
-def _final_argvs(monkeypatch) -> list[list[str]]:
-    """Spy on render's ffmpeg calls; returns the list that collects final-encode argv."""
-    from hookline.pipeline import render as render_mod
-
-    seen: list[list[str]] = []
-    real = render_mod._run
-
-    def spy(cmd):
-        if "-filter_complex" in cmd:
-            seen.append(cmd)
-        return real(cmd)
-
-    monkeypatch.setattr(render_mod, "_run", spy)
-    return seen
 
 
 def _graph(cmd: list[str]) -> str:
     return cmd[cmd.index("-filter_complex") + 1]
-
-
-class NoFaces:
-    def detect(self, bgr):
-        return []
 
 
 @pytest.fixture(scope="module")
@@ -44,9 +24,15 @@ def fixture_words(fixture_wav) -> list[Word]:
 
 
 def test_render_clip_vertical_with_captions(
-    fixture_video, fixture_wav, fixture_words, sample_pick, settings, tmp_path, monkeypatch
+    fixture_video,
+    fixture_wav,
+    fixture_words,
+    sample_pick,
+    settings,
+    tmp_path,
+    monkeypatch,
+    final_argvs,
 ):
-    argvs = _final_argvs(monkeypatch)
     dst = tmp_path / "out" / "01-sample-clip.mp4"
     extras = render_clip(
         fixture_video,
@@ -65,18 +51,25 @@ def test_render_clip_vertical_with_captions(
     assert extras["removed_s"] >= 0
     assert (tmp_path / "render" / "01.ass").exists()
     assert not (tmp_path / "render" / "01.mkv").exists()  # intermediate removed after success
-    (final,) = argvs
+    (final,) = final_argvs
     assert "subtitles=" in _graph(final)
     i = final.index("-c:a")
     assert final[i : i + 6] == ["-c:a", "aac", "-b:a", "192k", "-ar", "48000"]
-    assert "loudnorm" in final[final.index("-af") + 1] or final[final.index("-af") + 1] == "anull"
+    af = final[final.index("-af") + 1]
+    assert af.startswith("acompressor=") and ",loudnorm=I=-14:TP=-2:" in af
     json.dumps(extras)  # sidecar-serialisable
 
 
 def test_render_clip_horizontal_no_captions(
-    fixture_video, fixture_wav, fixture_words, sample_pick, settings, tmp_path, monkeypatch
+    fixture_video,
+    fixture_wav,
+    fixture_words,
+    sample_pick,
+    settings,
+    tmp_path,
+    monkeypatch,
+    final_argvs,
 ):
-    argvs = _final_argvs(monkeypatch)
     s = settings.model_copy(update={"vertical": False, "captions": False})
     dst = tmp_path / "02-h.mp4"
     extras = render_clip(
@@ -86,7 +79,7 @@ def test_render_clip_horizontal_no_captions(
     assert w / h == pytest.approx(320 / 180, abs=0.02)
     assert extras["layout"] == []
     assert not (tmp_path / "r" / "02.ass").exists()
-    assert "subtitles=" not in _graph(argvs[0])
+    assert "subtitles=" not in _graph(final_argvs[0])
 
 
 def test_render_clip_silence_window_uses_original_segments(

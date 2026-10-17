@@ -16,7 +16,7 @@ from hookline.media.ffmpeg import (
     probe_fps,
     probe_size,
 )
-from hookline.media.loudness import loudnorm_filter, measure_loudness
+from hookline.media.loudness import COMPRESSOR, loudnorm_filter, measure_loudness
 from hookline.media.reframe import detect_crop, reframe_graph
 from hookline.media.subtitles import fonts_dir, subtitles_filter
 from hookline.models import ClipPick, Word
@@ -81,7 +81,8 @@ def render_clip(
     inter = cut_segments(
         src, keep, work_dir / f"{name}.mkv", "libx264", quality=INTERMEDIATE_QUALITY, fps=fps
     )
-    audio_filter = loudnorm_filter(measure_loudness(inter))
+    loudness = measure_loudness(inter, COMPRESSOR)
+    audio_args = ["-af", loudnorm_filter(loudness)] if loudness else []
     crop = detect_crop(inter)
     in_w, in_h = (crop[0], crop[1]) if crop else probe_size(inter)
 
@@ -114,7 +115,7 @@ def render_clip(
             "-filter_complex", graph,
             "-map", out_label, "-map", "0:a?",
             *encoder_args(encoder or pick_encoder()), "-pix_fmt", "yuv420p",
-            "-af", audio_filter,
+            *audio_args,
             "-c:a", "aac", "-b:a", "192k", "-ar", "48000",  # the one lossy audio encode
             "-movflags", "+faststart",
             str(tmp),
