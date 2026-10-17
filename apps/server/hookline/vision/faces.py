@@ -12,7 +12,7 @@ Point = tuple[float, float]
 
 MIN_EYE_PX = 2.0  # eyes closer than this (px) give no usable yaw
 BATCH_MIN = 4  # sample this many times or more in one decode pass instead of one seek each
-BATCH_MAX = 40  # frames per decode pass: a longer select sum passes ffmpeg's ~100-level parser limit
+BATCH_MAX = 40  # frames per pass: a longer select sum overflows ffmpeg's expression parser
 
 
 def face_yaw(right_eye: Point, left_eye: Point, nose: Point) -> float | None:
