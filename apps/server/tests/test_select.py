@@ -342,6 +342,12 @@ def test_system_prompt_covers_brief():
         # markers stay explained
         "⟨🔥chat×4 🔊loud⟩",
         "not a requirement",
+        # review round 1
+        "quotes a conversation the viewer never saw",
+        "The cause line is then your `first_words`",
+        "must still work cold",
+        "Everything in packaging must be literally true to the clip",
+        "A good pick (37 seconds)",
     ):
         assert needle in SYSTEM_PROMPT, needle
     assert not re.search(r"\b[A-Z]{4,}\b", SYSTEM_PROMPT)  # calm brief, no shouting
@@ -534,7 +540,7 @@ def _one(transcript, llm, settings, item, caplog=None):
     llm.queue({"clips": [item]}, EMPTY)
     if caplog is None:
         return select_clips(transcript, llm, settings)
-    with caplog.at_level(logging.WARNING, logger="hookline.pipeline.select"):
+    with caplog.at_level(logging.INFO, logger="hookline.pipeline.select"):
         return select_clips(transcript, llm, settings)
 
 
@@ -709,3 +715,135 @@ def test_chunk_mode_uses_global_line_numbers(long_transcript, fake_llm, settings
     assert later_first and int(later_first.group(1)) > 0
     assert [(p.start, p.end) for p in picks] == [(300.0, 329.3)]
     assert "line numbers" in prompts[1].lower()
+
+
+# --- review round 1: line-ownership anchoring, length-safe re-anchoring, enforced endings ----
+
+_FILLER = "filler{n} words keep going here."
+_SETUP = "And one night the head chef just doesn't show up."
+_CLAIM = "I ran a three-hundred-cover Saturday on my own when I was nineteen."
+
+
+def _lines_transcript(overrides: dict[int, str], count: int = 40) -> Transcript:
+    """`count` lines on a 4 s grid (line i starts at 4i); words 0.2 s long every 0.25 s, so a
+    gap of >= 1 s always separates lines. Line i is `_FILLER` unless overridden."""
+    segments = []
+    for i in range(count):
+        texts = overrides.get(i, _FILLER.format(n=i)).split()
+        words = [
+            Word(start=round(4.0 * i + j * 0.25, 3), end=round(4.0 * i + j * 0.25 + 0.2, 3), text=t)
+            for j, t in enumerate(texts)
+        ]
+        segments.append(
+            Segment(start=words[0].start, end=words[-1].end, text=" ".join(texts), words=words)
+        )
+    return Transcript(language="en", duration=4.0 * count, segments=segments)
+
+
+def _line_item(start_line, end_line, first_words, last_words, **kw):
+    item = raw(0, 3, first_words=first_words, last_words=last_words, edit_beats=[], **kw)
+    item.update(start_line=start_line, end_line=end_line)
+    return item
+
+
+def _end_of(tr: Transcript, line: int) -> float:
+    return tr.segments[line].words[-1].end
+
+
+def test_start_does_not_anchor_on_a_backchannel_before_first_words(fake_llm, settings):
+    tr = _lines_transcript({10: _SETUP, 11: "Yeah, so.", 12: _CLAIM})
+    item = _line_item(11, 19, _CLAIM, _FILLER.format(n=19))
+    (p,) = _one(tr, fake_llm, settings, item)
+    assert p.start == 48.0  # L12, not the "Yeah, so." line that merely runs into it
+
+
+def test_start_reanchors_to_an_earlier_line(fake_llm, settings):
+    tr = _lines_transcript({12: _CLAIM})
+    item = _line_item(14, 20, _CLAIM, _FILLER.format(n=20))
+    (p,) = _one(tr, fake_llm, settings, item)
+    assert p.start == 48.0
+
+
+def test_start_reanchor_never_crosses_end_line(fake_llm, settings, caplog):
+    s = settings.model_copy(update={"min_clip_s": 4})
+    tr = _lines_transcript({12: _CLAIM})
+    item = _line_item(10, 11, _CLAIM, _FILLER.format(n=11))
+    (p,) = _one(tr, fake_llm, s, item, caplog)
+    assert (p.start, p.end) == (40.0, _end_of(tr, 11))  # kept, not dropped as reversed
+    assert "first_words" in caplog.text and "keeping L10" in caplog.text
+
+
+def test_start_reanchor_breaking_length_falls_back_to_given_line(fake_llm, settings, caplog):
+    s = settings.model_copy(update={"min_clip_s": 32})  # min length 24 s
+    tr = _lines_transcript({13: _CLAIM})
+    item = _line_item(10, 17, _CLAIM, _FILLER.format(n=17))  # L13-L17 would be ~18 s
+    (p,) = _one(tr, fake_llm, s, item, caplog)
+    assert p.start == 40.0 and "back to L10" in caplog.text
+
+
+def test_end_reanchors_from_last_words_both_ways(fake_llm, settings):
+    tr = _lines_transcript({19: "And that is how I got the job."})
+    item = _line_item(10, 17, _FILLER.format(n=10), "And that is how I got the job.")
+    (p,) = _one(tr, fake_llm, settings, item)
+    assert p.end == _end_of(tr, 19)
+    tr = _lines_transcript({17: "And that is how I got the job."})
+    item = _line_item(10, 19, _FILLER.format(n=10), "And that is how I got the job.")
+    (p,) = _one(tr, fake_llm, settings, item)
+    assert p.end == _end_of(tr, 17)
+
+
+def test_backchannel_last_line_steps_back(fake_llm, settings, caplog):
+    tr = _lines_transcript({18: "Mm-hmm."})
+    item = _line_item(10, 18, _FILLER.format(n=10), "Mm-hmm.")
+    (p,) = _one(tr, fake_llm, settings, item, caplog)
+    assert p.end == _end_of(tr, 17) and "backchannel" in caplog.text
+
+
+def test_unfinished_last_line_extends_to_a_finished_one(fake_llm, settings, caplog):
+    tr = _lines_transcript({17: "and the news was not going to --", 18: "really tell it."})
+    item = _line_item(10, 17, _FILLER.format(n=10), "and the news was not going to --")
+    (p,) = _one(tr, fake_llm, settings, item, caplog)
+    assert p.end == _end_of(tr, 18) and "extended to L18" in caplog.text
+
+
+def test_unfinished_last_line_extends_up_to_two_lines(fake_llm, settings):
+    tr = _lines_transcript({17: "so the thing is", 18: "that we never", 19: "got paid for it."})
+    item = _line_item(10, 17, _FILLER.format(n=10), "so the thing is")
+    (p,) = _one(tr, fake_llm, settings, item)
+    assert p.end == _end_of(tr, 19)
+
+
+def test_unfinished_ending_without_completion_is_kept_and_logged(fake_llm, settings, caplog):
+    # the next line is a backchannel, the one after is unfinished too: no extension
+    tr = _lines_transcript({17: "so the thing is --", 18: "Yeah.", 19: "and then"})
+    item = _line_item(10, 17, _FILLER.format(n=10), "so the thing is --")
+    (p,) = _one(tr, fake_llm, settings, item, caplog)
+    assert p.end == _end_of(tr, 17) and "could not be completed" in caplog.text
+    tr = _lines_transcript({17: "so the thing is", 18: "that we", 19: "never got"})
+    (p,) = _one(tr, fake_llm, settings, item, caplog)
+    assert p.end == _end_of(tr, 17)
+
+
+def test_unfinished_ending_never_extends_past_max_clip_s(fake_llm, settings):
+    s = settings.model_copy(update={"max_clip_s": 30})  # L10-L17 ~ 30 s already
+    tr = _lines_transcript({17: "so the thing is --", 18: "it worked."})
+    item = _line_item(10, 17, _FILLER.format(n=10), "so the thing is --")
+    (p,) = _one(tr, fake_llm, s, item)
+    assert p.end == _end_of(tr, 17)
+
+
+def test_hashtags_strip_punctuation_ban_more_and_log_when_few(
+    long_transcript, fake_llm, settings, caplog
+):
+    tags = ["#Line-Cook!", "#ForYourPage", "reels", "tiktok", "explore", "shorts", "fypage"]
+    (p,) = _one(long_transcript, fake_llm, settings, raw(30, 60, hashtags=tags), caplog)
+    assert p.hashtags == ["LineCook"]
+    assert "only 1 usable hashtag" in caplog.text
+
+
+def test_dropped_edit_beats_are_logged(long_transcript, fake_llm, settings, caplog):
+    caplog.set_level(logging.INFO, logger="hookline.pipeline.select")
+    beats = ["zoom: 'x' @ 5.0s", "no time here", "zoom: 'y' @ 31.0s"]
+    (p,) = _one(long_transcript, fake_llm, settings, raw(30, 60, edit_beats=beats))
+    assert p.edit_beats == ["zoom: 'y' @ 31.0s"]
+    assert "dropped 2 edit beat(s)" in caplog.text

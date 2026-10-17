@@ -81,7 +81,8 @@ A slightly smaller moment that anyone can follow beats a big one that needs back
 - Open on the hook. `first_words` is the verbatim first sentence the viewer hears, copied from \
 the `start_line` line. Read it as a stranger mid-scroll would. If it needs earlier context (it \
 begins with "And", "So", "But", "Because" or "Which", answers a question the viewer never \
-heard, or leans on a pronoun from earlier), move the start or use a cold open. Setup lines \
+heard, quotes a conversation the viewer never saw ("I was like…", "he goes…"), or leans on a \
+pronoun from earlier), move the start or use a cold open. Setup lines \
 such as "So I've been thinking about this" or "Okay, so basically" are not hooks.
 - Cold opens. When a clip genuinely needs its setup but its strongest line comes later, set \
 `cold_open_line` to that later line. It plays first as a teaser (at most 5 seconds; a longer \
@@ -102,7 +103,8 @@ slurs, sexual content and gore.
 
 - Chat-reading, sub and raid thank-yous and donation alerts are dead air. Cut around them.
 - A loud reaction is the payoff, not the opening: start 3–8 seconds earlier on the cause, so \
-the viewer sees what the streamer is reacting to.
+the viewer sees what the streamer is reacting to. The cause line is then your `first_words` \
+and must still work cold.
 - When the streamer is answering chat, the viewer never saw the question. Put the question in \
 `hook_text` so the answer lands.
 
@@ -138,6 +140,8 @@ Use `skip` honestly; a source with no strong moments should get mostly skips.
 
 ## Packaging
 
+Everything in packaging must be literally true to the clip.
+
 - `title`: short and specific, under 60 characters.
 - `hook_text`: on-screen text over the first seconds. 3–7 words, built from concrete nouns or \
 numbers in the clip, and literally true: never exaggerate what happens (if someone was "a \
@@ -156,7 +160,7 @@ speaker's appearance, `medium` when that is plausible, otherwise `low`.
 - `reason`: one or two sentences on why this moment works and what the payoff is.
 - `edit_beats`: a few editing cues at moments that matter, written exactly as \
 `zoom: '<word>' @ <t>s` or `emoji <emoji> @ <t>s`, where `<t>` is absolute seconds from the \
-start of the video and lies inside the clip (`14:52.0` is 892.0 seconds).
+start of the video and lies inside the clip (`14:44.0` is 884.0 seconds).
 
 ## A worked example (invented)
 
@@ -165,21 +169,22 @@ L212 [14:03.5] So I'd been a line cook for maybe two years at that point.
 L213 [14:07.9] And one night the head chef just doesn't show up.
 L214 [14:10.2] I ran a three-hundred-cover Saturday on my own when I was nineteen.
 …
-L226 [14:52.0] He walked in at close, looked at the tickets, and handed me his knives.
-L227 [14:56.1] Yeah.
+L226 [14:44.0] He walked in at close, looked at the tickets, and handed me his knives.
+L227 [14:48.3] Yeah.
 
-A good pick: `start_line` 214, `end_line` 226, `cold_open_line` null.
+A good pick (37 seconds): `start_line` 214, `end_line` 226, `cold_open_line` null.
 - `first_words`: "I ran a three-hundred-cover Saturday on my own when I was nineteen." It works \
 cold; L212 and L213 are setup, so the clip starts after them.
 - `last_words`: "He walked in at close, looked at the tickets, and handed me his knives." The \
 payoff; the backchannel "Yeah." on L227 is left out.
 - `hook_type`: `bold_claim`. `verdict`: `post`.
-- `hook_text`: "Nineteen, alone, 300 covers"
+- `hook_text`: "Head chef walked in at close" (it teases the payoff rather than restating \
+the first line)
 - `post_caption`: "Nineteen, no head chef, a full Saturday rush. What's the hardest shift you've \
 ever covered?"
 - `hashtags`: ["linecook", "kitchenlife", "restaurantstories", "cheflife"]
 - `search_title`: "Running a 300-Cover Restaurant Service Alone at 19"
-- `edit_beats`: ["zoom: 'knives' @ 895.4s"]
+- `edit_beats`: ["zoom: 'knives' @ 887.2s"]
 
 ## Ranking
 
@@ -242,10 +247,31 @@ SELECTION_SCHEMA: dict = _object(
 
 _COLD_OPEN_MAX_S = 5.0
 _CHUNK_OVERLAP_S = 120.0
-_FIRST_WORDS_MIN_OVERLAP = 0.6
+_WORDS_MIN_OVERLAP = 0.6
 _REANCHOR_RADIUS = 3
+_EXTEND_MAX_LINES = 2
+_EXTEND_MAX_S = 8.0
 _SEARCH_TITLE_MAX = 70
-_BANNED_HASHTAGS = {"fyp", "foryou", "foryoupage", "fy", "viral", "trending"}
+_BANNED_HASHTAGS = {
+    "fyp",
+    "foryou",
+    "foryoupage",
+    "foryourpage",
+    "fypage",
+    "fy",
+    "viral",
+    "viralvideo",
+    "trending",
+    "explore",
+    "reels",
+    "shorts",
+    "tiktok",
+}
+# Tokens of a backchannel line ("Yeah.", "Mm-hmm.", "Uh-huh, right."); hyphenated forms split.
+_BACKCHANNEL = {"yeah", "yep", "mm", "hmm", "mm-hmm", "uh", "huh", "uh-huh", "right", "okay"}
+_BACKCHANNEL |= {"exactly", "sure", "wow"}
+_UNFINISHED_ENDINGS = ("...", "…", "--", "—", "-")
+_TRAILING_QUOTES = "\"'”’)]}»"
 _TOKEN_RE = re.compile(r"[a-z0-9']+")
 _BEAT_TIME_RE = re.compile(r"@\s*(\d+(?:\.\d+)?)\s*s?\s*$")
 
@@ -369,42 +395,99 @@ def _tokens(text: str) -> list[str]:
     return _TOKEN_RE.findall(text.lower().replace("’", "'"))
 
 
-def _first_words_overlap(want: list[str], tokens: list[list[str]], line: int) -> float:
-    """Share of `want` found (as a multiset) in the transcript's first len(want) tokens from
-    `line` on. Reading on past the line lets `first_words` run into the next sentence."""
+def _window_overlap(want: list[str], tokens: list[list[str]], line: int, *, forward: bool) -> float:
+    """Share of `want` found (as a multiset) in the len(want) transcript tokens that start at
+    `line` (forward) or end at `line` (backward). Reading past the line lets declared words
+    run into the neighbouring sentence."""
     have: list[str] = []
-    for toks in tokens[line:]:
+    span = tokens[line:] if forward else tokens[line::-1]
+    for toks in span:
         if len(have) >= len(want):
             break
-        have.extend(toks)
-    common = Counter(want) & Counter(have[: len(want)])
-    return sum(common.values()) / len(want)
+        have = have + toks if forward else toks + have
+    have = have[: len(want)] if forward else have[-len(want) :]
+    return sum((Counter(want) & Counter(have)).values()) / len(want)
 
 
-def _anchor_start(raw: _RawClip, line: int, tokens: list[list[str]]) -> int:
-    """`line`, or the line within ±3 that `first_words` actually matches. Never drops."""
-    want = _tokens(raw.first_words)
-    if not want or _first_words_overlap(want, tokens, line) >= _FIRST_WORDS_MIN_OVERLAP:
+def _line_belongs(want: list[str], toks: list[str], *, forward: bool) -> bool:
+    """Whether the line itself is part of the declared words, not a short setup or
+    backchannel line that merely runs into them: the declared first (last) word is among the
+    line's first (last) 2 tokens, or >= 60% of the line's own tokens appear in `want`."""
+    if not toks:
+        return False
+    edge = toks[:2] if forward else toks[-2:]
+    if (want[0] if forward else want[-1]) in edge:
+        return True
+    return sum((Counter(toks) & Counter(want)).values()) / len(toks) >= _WORDS_MIN_OVERLAP
+
+
+def _matches(want: list[str], tokens: list[list[str]], line: int, *, forward: bool) -> bool:
+    return _window_overlap(
+        want, tokens, line, forward=forward
+    ) >= _WORDS_MIN_OVERLAP and _line_belongs(want, tokens[line], forward=forward)
+
+
+def _reanchor(
+    raw: _RawClip, line: int, lo: int, hi: int, tokens: list[list[str]], *, forward: bool
+) -> int:
+    """`line`, or the line in [lo, hi] (within ±3 of it) that the declared first_words
+    (forward) or last_words (backward) actually match. Never drops; logs a move or a miss."""
+    field = "first_words" if forward else "last_words"
+    want = _tokens(raw.first_words if forward else raw.last_words)
+    if not want or _matches(want, tokens, line, forward=forward):
         return line
-    lo, hi = max(0, line - _REANCHOR_RADIUS), min(len(tokens) - 1, line + _REANCHOR_RADIUS)
-    # best overlap wins; ties go to the line nearest the one Claude gave
-    best = max(
-        range(lo, hi + 1), key=lambda j: (_first_words_overlap(want, tokens, j), -abs(j - line))
-    )
-    if _first_words_overlap(want, tokens, best) >= _FIRST_WORDS_MIN_OVERLAP:
-        logger.info(
-            "clip %r: first_words found on L%d, not L%d; moved start", raw.title, best, line
-        )
+    lo, hi = max(lo, line - _REANCHOR_RADIUS), min(hi, line + _REANCHOR_RADIUS)
+    found = [
+        (j, _window_overlap(want, tokens, j, forward=forward))
+        for j in range(lo, hi + 1)
+        if _matches(want, tokens, j, forward=forward)
+    ]
+    if found:  # best overlap wins; ties go to the line nearest the one Claude gave
+        best = max(found, key=lambda f: (f[1], -abs(f[0] - line)))[0]
+        logger.info("clip %r: %s found on L%d, not L%d; moved", raw.title, field, best, line)
         return best
     logger.warning(
-        "clip %r: first_words %r match none of L%d-L%d; keeping L%d",
+        "clip %r: %s %r match none of L%d-L%d; keeping L%d",
         raw.title,
-        raw.first_words,
+        field,
+        raw.first_words if forward else raw.last_words,
         lo,
         hi,
         line,
     )
     return line
+
+
+def _is_backchannel(toks: list[str]) -> bool:
+    return 0 < len(toks) <= 2 and all(t in _BACKCHANNEL for t in toks)
+
+
+def _is_finished(text: str) -> bool:
+    t = text.rstrip().rstrip(_TRAILING_QUOTES).rstrip()
+    return not t.endswith(_UNFINISHED_ENDINGS) and t.endswith((".", "!", "?"))
+
+
+def _fix_ending(raw: _RawClip, first: int, last: int, src: _Source) -> int:
+    """Never end on a backchannel (step back one line), and finish an unfinished last
+    sentence by extending up to 2 lines / 8 s (within max_clip_s) to the first line with
+    terminal punctuation. Logs each adjustment."""
+    sents, toks = src.sentences, src.tokens
+    if last > first and _is_backchannel(toks[last]):
+        logger.info("clip %r: L%d is a backchannel; ending on L%d", raw.title, last, last - 1)
+        last -= 1
+    if _is_finished(sents[last].text):
+        return last
+    for j in range(last + 1, min(last + _EXTEND_MAX_LINES, len(sents) - 1) + 1):
+        too_long = sents[j].end - sents[last].end > _EXTEND_MAX_S
+        if too_long or _is_backchannel(toks[j]):
+            break
+        if sents[j].end - sents[first].start > src.settings.max_clip_s:
+            break
+        if _is_finished(sents[j].text):
+            logger.info("clip %r: L%d is unfinished; extended to L%d", raw.title, last, j)
+            return j
+    logger.warning("clip %r: L%d is unfinished and could not be completed", raw.title, last)
+    return last
 
 
 def _drop_cold_open(raw: _RawClip, reason: str) -> None:
@@ -437,22 +520,35 @@ def _cold_open(raw: _RawClip, first: int, last: int, src: _Source) -> tuple[floa
     return kept[0].start, kept[-1].end
 
 
-def _beats_inside(beats: list[str], start: float, end: float) -> list[str]:
-    """Beats whose `@ <t>s` time lies in [start, end]; beats without a time are dropped."""
-    kept = []
-    for beat in beats:
+def _beats_inside(raw: _RawClip, start: float, end: float) -> list[str]:
+    """Beats whose `@ <t>s` time lies in [start, end]; logs the ones dropped (no readable
+    time, or outside the clip)."""
+    kept, dropped = [], []
+    for beat in raw.edit_beats:
         m = _BEAT_TIME_RE.search(beat)
-        if m and start <= float(m.group(1)) <= end:
-            kept.append(beat)
+        (kept if m and start <= float(m.group(1)) <= end else dropped).append(beat)
+    if dropped:
+        logger.info(
+            "clip %r: dropped %d edit beat(s) without a time inside %.1f-%.1fs: %s",
+            raw.title,
+            len(dropped),
+            start,
+            end,
+            dropped,
+        )
     return kept
 
 
-def _clean_hashtags(tags: list[str]) -> list[str]:
+def _clean_hashtags(raw: _RawClip) -> list[str]:
     out: list[str] = []
-    for tag in tags:
-        t = "".join(tag.split()).lstrip("#")
+    for tag in raw.hashtags:
+        t = re.sub(r"[^\w]", "", tag)
         if t and t.lower() not in _BANNED_HASHTAGS and t.lower() not in map(str.lower, out):
             out.append(t)
+    if len(out) < 3:
+        logger.warning(
+            "clip %r: only %d usable hashtag(s) from %r", raw.title, len(out), raw.hashtags
+        )
     return out[:5]
 
 
@@ -477,11 +573,38 @@ def _to_pick(raw: _RawClip, src: _Source) -> ClipPick | None:
             ", ".join(bad),
             n - 1,
         )
-    first = _anchor_start(raw, min(max(raw.start_line, 0), n - 1), src.tokens)
-    last = min(max(raw.end_line, 0), n - 1)
-    if last < first:
-        logger.warning("dropped clip %r: ends (L%d) before it starts (L%d)", raw.title, last, first)
+    given_first = min(max(raw.start_line, 0), n - 1)
+    given_last = min(max(raw.end_line, 0), n - 1)
+    if given_last < given_first:
+        logger.warning(
+            "dropped clip %r: ends (L%d) before it starts (L%d)", raw.title, given_last, given_first
+        )
         return None
+    first = _reanchor(raw, given_first, 0, given_last, src.tokens, forward=True)
+    last = _reanchor(raw, given_last, first, n - 1, src.tokens, forward=False)
+    last = _fix_ending(raw, first, last, src)
+    min_s, max_s = src.settings.min_clip_s * 0.75, src.settings.max_clip_s * 1.25
+
+    def fits(a: int, b: int) -> bool:
+        return min_s <= src.sentences[b].end - src.sentences[a].start <= max_s
+
+    # Moving a boundary to match first_words / last_words must never cost the pick.
+    if not fits(first, last) and first != given_first:
+        logger.warning(
+            "clip %r: start moved to L%d breaks the length bounds; back to L%d",
+            raw.title,
+            first,
+            given_first,
+        )
+        first = given_first
+    if not fits(first, last) and last != given_last and given_last >= first:
+        logger.warning(
+            "clip %r: end moved to L%d breaks the length bounds; back to L%d",
+            raw.title,
+            last,
+            given_last,
+        )
+        last = given_last
     start = min(max(src.sentences[first].start, 0.0), src.duration)
     end = min(max(src.sentences[last].end, 0.0), src.duration)
     pick = ClipPick(
@@ -491,18 +614,17 @@ def _to_pick(raw: _RawClip, src: _Source) -> ClipPick | None:
         hook_text=raw.hook_text,
         reason=raw.reason,
         scores=_clamped_scores(raw.scores),
-        edit_beats=_beats_inside(raw.edit_beats, start, end),
+        edit_beats=_beats_inside(raw, start, end),
         first_words=raw.first_words,
         last_words=raw.last_words,
         hook_type=raw.hook_type,
         verdict=raw.verdict,
         post_caption=raw.post_caption.strip(),
-        hashtags=_clean_hashtags(raw.hashtags),
+        hashtags=_clean_hashtags(raw),
         search_title=_clip_title(raw.search_title),
         category=raw.category.strip(),
         comment_risk=raw.comment_risk,
     )
-    min_s, max_s = src.settings.min_clip_s * 0.75, src.settings.max_clip_s * 1.25
     cold_open = _cold_open(raw, first, last, src)
     if cold_open:
         if pick.duration + (cold_open[1] - cold_open[0]) <= max_s:
