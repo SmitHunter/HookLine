@@ -45,3 +45,10 @@
 - Overlay band detection (lower-thirds, Twitch widgets/alerts), so crops and caption placement avoid them.
 - Collapsed DTW word starts (several words sharing one start) → spread them evenly across the span instead of stacking caption words.
 - Mark the slow ffmpeg tests (`pytest -m slow`): the full suite takes over 6 minutes.
+
+## Left over from the M2 final review
+- SPLIT: the hook title can cover the bottom speaker's face when faces sit near the top of their panel; place it in the seam gap instead.
+- A hand-edited transcript.json with a non-dict `key` raises AttributeError (not treated as corrupt).
+- Chunked selection assumes one line per sentence (strict zip); a newline inside word text would raise.
+- Cache migration: M1/early-M2 transcript.json files are re-transcribed once (old format). Accept old files with `timing == "dtw"` when the backend matches, to skip a long re-run.
+- Hook and caption placement use only the first scene's layout.
