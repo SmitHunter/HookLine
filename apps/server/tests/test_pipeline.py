@@ -67,7 +67,9 @@ def test_run_job_end_to_end_with_fakes(fixture_video, fake_llm, settings_tmp, mo
     assert all(probe_size(c) == (1080, 1920) for c in clips)
     assert all(probe_duration(c) == pytest.approx(21, abs=1.0) for c in clips)
     side = [json.loads(c.with_suffix(".json").read_text(encoding="utf-8")) for c in clips]
-    assert all(d["post_caption"] == d["hook_text"] for d in side)
+    assert all(d["post_caption"] == "He ran the whole kitchen alone. Could you?" for d in side)
+    assert all(d["hashtags"] and d["search_title"] and d["verdict"] == "post" for d in side)
+    assert all(d["first_words"] and d["hook_type"] and d["comment_risk"] for d in side)
     assert all(d["layout"] and "keep_ranges" in d and "removed_s" in d for d in side)
     assert any(m.startswith("clip 01: layouts=[") and "removed=" in m for m in logs)
     job = s.workspace_dir / job_id_for(str(fixture_video))
@@ -80,12 +82,18 @@ def test_run_job_end_to_end_with_fakes(fixture_video, fake_llm, settings_tmp, mo
 def test_run_job_names_and_sidecar(fixture_video, fake_llm, settings_tmp):
     payload = make_payload_for(150, 1, 21)
     payload["clips"][0]["title"] = "Sample clip"
+    payload["clips"][0]["post_caption"] = ""  # empty: the sidecar falls back to hook_text
     fake_llm.queue(payload)
     s = settings_tmp.model_copy(update={"clips": 1, "vertical": False, "captions": False})
     clips = run_job(str(fixture_video), s, fake_llm, FakeTranscriber(duration=150))
     assert [p.name for p in clips] == ["01-sample-clip.mp4"]
     data = json.loads(clips[0].with_suffix(".json").read_text(encoding="utf-8"))
     assert data["title"] == "Sample clip" and data["post_caption"] == data["hook_text"]
+    assert data["category"] == "food" and data["hashtags"] == [
+        "linecook",
+        "kitchenlife",
+        "chefstories",
+    ]
     assert data["layout"] == []
 
 
@@ -172,6 +180,7 @@ def test_picks_cache_key_mismatch_reselects(fixture_video, fake_llm, settings_tm
     job = s.workspace_dir / job_id_for(str(fixture_video))
     saved = json.loads((job / "picks.json").read_text(encoding="utf-8"))
     assert saved["key"] == {
+        "schema": 2,
         "clips": 1,
         "select_model": s.select_model,
         "min_clip_s": s.min_clip_s,
@@ -398,3 +407,29 @@ def test_old_format_segment_transcript_with_dtw_backend_retranscribes(
     logs: list[str] = []
     run_job(str(fixture_video), s, fake_llm, b, logs.append)
     assert b.calls == 1 and any("old format" in m for m in logs)
+
+
+def test_picks_from_before_selection_v2_reselect(fixture_video, fake_llm, settings_tmp):
+    s = settings_tmp.model_copy(update={"clips": 1, "vertical": False, "captions": False})
+    fake_llm.queue(make_payload_for(150, 1, 21), make_payload_for(150, 1, 21))
+    t = FakeTranscriber(duration=150)
+    run_job(str(fixture_video), s, fake_llm, t)
+    job = s.workspace_dir / job_id_for(str(fixture_video))
+    saved = json.loads((job / "picks.json").read_text(encoding="utf-8"))
+    del saved["key"]["schema"]
+    (job / "picks.json").write_text(json.dumps(saved), encoding="utf-8")
+    logs: list[str] = []
+    run_job(str(fixture_video), s, fake_llm, t, logs.append)
+    assert len(fake_llm.calls) == 2 and any("re-select" in m and "schema" in m for m in logs)
+
+
+def test_all_skip_selection_raises_and_keeps_select_raw(fixture_video, fake_llm, settings_tmp):
+    payload = make_payload_for(150, 5, 21)
+    for c in payload["clips"]:
+        c["verdict"] = "skip"
+    fake_llm.queue(payload)
+    with pytest.raises(NoClipsSelectedError, match="rated every candidate as skip"):
+        run_job(str(fixture_video), settings_tmp, fake_llm, FakeTranscriber(duration=150))
+    job = settings_tmp.workspace_dir / job_id_for(str(fixture_video))
+    assert not (job / "picks.json").exists()
+    assert json.loads((job / "select_raw.json").read_text(encoding="utf-8")) == [payload]

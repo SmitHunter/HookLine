@@ -13,17 +13,14 @@ from hookline.models import ClipPick, Transcript
 from hookline.pipeline.chat import chat_rate, try_fetch_chat
 from hookline.pipeline.ingest import find_source, ingest, job_id_for
 from hookline.pipeline.render import render_clip
-from hookline.pipeline.select import select_clips
+from hookline.pipeline.select import NoClipsSelectedError, select_clips
 from hookline.pipeline.signals import Signals, heat_markers
 from hookline.transcribe import Transcriber
 from hookline.transcribe.base import words_to_transcript
 from hookline.vision.faces import FaceDetector
 
 STAGES = 6
-
-
-class NoClipsSelectedError(Exception):
-    """Selection returned zero clips; nothing was cached so a re-run re-selects."""
+PICKS_SCHEMA = 2  # bump when picks change shape or meaning, so old picks.json re-select
 
 
 def transcript_key(transcriber: Transcriber) -> dict:
@@ -36,6 +33,7 @@ def transcript_key(transcriber: Transcriber) -> dict:
 
 def _picks_key(settings: Settings, tkey: dict) -> dict:
     return {
+        "schema": PICKS_SCHEMA,
         "clips": settings.clips,
         "select_model": settings.select_model,
         "min_clip_s": settings.min_clip_s,
@@ -214,12 +212,15 @@ def run_job(
     else:
         log("[5/6] select: started")
         raw_payloads: list[dict] = []
-        picks = select_clips(
-            transcript, llm, settings, raw_sink=raw_payloads, markers=heat_markers(signals)
-        )
-        atomic_write_text(
-            job_dir / "select_raw.json", json.dumps(raw_payloads, indent=2, ensure_ascii=False)
-        )
+        try:
+            picks = select_clips(
+                transcript, llm, settings, raw_sink=raw_payloads, markers=heat_markers(signals)
+            )
+        finally:  # kept even when selection fails, for debugging what Claude returned
+            atomic_write_text(
+                job_dir / "select_raw.json",
+                json.dumps(raw_payloads, indent=2, ensure_ascii=False),
+            )
         if not picks:
             raise NoClipsSelectedError(
                 f"No clips were selected — see workspace/{job_id}/select_raw.json"
@@ -265,7 +266,8 @@ def run_job(
                 reason += f" ({e.stderr.splitlines()[-1].strip()})"
             log(f"warning: clip {i:02d} failed: {reason}")
             continue
-        sidecar = {**pick.model_dump(mode="json"), "post_caption": pick.hook_text, **extras}
+        post_caption = pick.post_caption or pick.hook_text
+        sidecar = {**pick.model_dump(mode="json"), "post_caption": post_caption, **extras}
         atomic_write_text(
             dst.with_suffix(".json"), json.dumps(sidecar, indent=2, ensure_ascii=False)
         )

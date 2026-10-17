@@ -1,48 +1,62 @@
 import itertools
 import logging
+import math
 import re
 
 import pytest
 
 from hookline.llm import LLMError
-from hookline.models import ClipPick, RubricScores
+from hookline.models import ClipPick, RubricScores, Segment, Transcript, Word
 from hookline.pipeline.select import (
     SELECTION_SCHEMA,
     SYSTEM_PROMPT,
+    NoClipsSelectedError,
     build_prompt,
     dedupe_overlaps,
     polish_pick,
     select_clips,
-    snap_to_sentences,
 )
 
 _SCORE_KEYS = ("hook", "context", "payoff", "emotion", "length_fit", "pacing", "loop", "safety")
 
 
-def raw(start, end, total=50, cold_open=None, **kw):
-    """One candidate as the LLM returns it (SELECTION_SCHEMA item)."""
+def raw(start, end, total=50, cold_open_line=None, verdict="post", **kw):
+    """One candidate as the LLM returns it (SELECTION_SCHEMA item). `start`/`end` are seconds
+    on the fixtures' 3 s sentence grid (sentence n starts at 3n): start_line is the sentence
+    starting at `start`, end_line the last sentence starting before `end`."""
     hook = min(total, 25)
     rest = total - hook
     scores = {"hook": hook, "context": min(rest, 15), "payoff": max(0, rest - 15)}
     scores.update({k: 0 for k in _SCORE_KEYS if k not in scores})
+    start_line, end_line = round(start / 3), math.ceil(end / 3) - 1
     item = {
-        "start": start,
-        "end": end,
-        "cold_open_start": cold_open[0] if cold_open else None,
-        "cold_open_end": cold_open[1] if cold_open else None,
+        "start_line": start_line,
+        "end_line": end_line,
+        "cold_open_line": cold_open_line,
+        "first_words": f"line{start_line} says something here.",
+        "last_words": f"line{end_line} says something here.",
+        "hook_type": "bold_claim",
+        "verdict": verdict,
         "title": f"Clip at {start}",
-        "hook_text": "You will not believe this",
+        "hook_text": "Three hundred covers at nineteen",
         "reason": "test",
         "scores": scores,
+        "post_caption": "He ran the whole kitchen alone. Could you?",
+        "hashtags": ["linecook", "kitchenlife", "chefstories"],
+        "search_title": "Running a restaurant kitchen alone at 19",
+        "category": "food",
+        "comment_risk": "low",
         "edit_beats": [f"zoom: 'wow' @ {start + 1}s"],
     }
     item.update(kw)
     return item
 
 
-def make_payload(n, extra=(), cold_open=None):
+def make_payload(n, extra=(), cold_open_line=None):
     """n valid, non-overlapping 30s candidates with descending scores, plus `extra` raw items."""
-    clips = [raw(30 + i * 60, 60 + i * 60, total=40 - i, cold_open=cold_open) for i in range(n)]
+    clips = [
+        raw(30 + i * 60, 60 + i * 60, total=40 - i, cold_open_line=cold_open_line) for i in range(n)
+    ]
     return {"clips": clips + list(extra)}
 
 
@@ -70,11 +84,6 @@ def test_select_returns_top_n_sorted_by_start(long_transcript, fake_llm, setting
     picks = select_clips(long_transcript, fake_llm, settings)
     assert len(picks) == 5 and [p.start for p in picks] == sorted(p.start for p in picks)
     assert fake_llm.calls[0]["model"] == "claude-opus-5-5"
-
-
-def test_snap_moves_to_sentence_bounds(long_sentences):
-    p = snap_to_sentences(pick(start=31.2, end=54.1), long_sentences, duration=600)
-    assert p.start in {s.start for s in long_sentences} and p.end in {s.end for s in long_sentences}
 
 
 def test_impossible_timestamps_are_dropped(long_transcript, fake_llm, settings):
@@ -112,7 +121,7 @@ def test_chunking_when_over_budget(long_transcript, fake_llm, settings):
 
 
 def test_bad_cold_open_is_removed(long_transcript, fake_llm, settings):
-    fake_llm.queue(make_payload(8, cold_open=(0.0, 10.0)))  # outside clip / too long
+    fake_llm.queue(make_payload(8, cold_open_line=0))  # outside every clip
     assert all(p.cold_open is None for p in select_clips(long_transcript, fake_llm, settings))
 
 
@@ -136,15 +145,9 @@ def test_returns_highest_scoring_picks(long_transcript, fake_llm, settings):
 
 
 def test_valid_cold_open_is_kept(long_transcript, fake_llm, settings):
-    fake_llm.queue({"clips": [raw(30, 60, cold_open=(45.0, 48.0))]}, EMPTY)
+    fake_llm.queue({"clips": [raw(30, 60, cold_open_line=15)]}, EMPTY)
     (p,) = select_clips(long_transcript, fake_llm, settings)
-    assert p.cold_open == (45.0, 47.3)  # snapped: line at 45.0 ends at 47.3
-
-
-def test_cold_open_longer_than_limit_is_removed(long_transcript, fake_llm, settings):
-    fake_llm.queue({"clips": [raw(30, 60, cold_open=(39.0, 45.0))]}, EMPTY)
-    (p,) = select_clips(long_transcript, fake_llm, settings)
-    assert p.cold_open is None
+    assert p.cold_open == (45.0, 47.3)  # the whole sentence L15
 
 
 def test_length_out_of_range_dropped(long_transcript, fake_llm, settings):
@@ -210,13 +213,6 @@ def test_exclude_reaches_prompt(long_transcript, fake_llm, settings):
     assert "02:00.0" in fake_llm.calls[0]["prompt"]
 
 
-def test_snap_clamps_and_falls_back(long_sentences):
-    p = snap_to_sentences(pick(start=-5.0, end=700.0), long_sentences, duration=600)
-    assert p.start == long_sentences[0].start and p.end == long_sentences[-1].end
-    p = snap_to_sentences(pick(start=10.0, end=900.0), long_sentences, duration=500)
-    assert p.end == 500
-
-
 def test_dedupe_keeps_small_overlaps():
     a, b = pick(0, 40, total=90), pick(30, 70, total=70)  # 10s / 40s = 25% overlap
     assert dedupe_overlaps([b, a]) == [a, b]
@@ -230,8 +226,6 @@ def test_polish_pick_covers_whole_input(short_transcript):
 
 
 def test_polish_pick_truncates_hook_to_eight_words():
-    from hookline.models import Segment, Transcript, Word
-
     texts = ["one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten."]
     words = [Word(start=i, end=i + 0.5, text=t) for i, t in enumerate(texts)]
     tr = Transcript(
@@ -257,10 +251,26 @@ def test_schema_is_strict_and_has_no_numeric_bounds():
 
     walk(SELECTION_SCHEMA)
     item = SELECTION_SCHEMA["properties"]["clips"]["items"]
-    assert set(item["properties"]["scores"]["properties"]) == set(_SCORE_KEYS)
-    nullable = {"anyOf": [{"type": "number"}, {"type": "null"}]}
-    assert item["properties"]["cold_open_start"] == nullable
-    assert item["properties"]["cold_open_end"] == nullable
+    props = item["properties"]
+    assert set(props["scores"]["properties"]) == set(_SCORE_KEYS)
+    assert props["start_line"] == {"type": "integer"} and props["end_line"] == {"type": "integer"}
+    assert props["cold_open_line"] == {"anyOf": [{"type": "integer"}, {"type": "null"}]}
+    assert props["hook_type"]["enum"] == [
+        "bold_claim",
+        "surprising_fact",
+        "conflict",
+        "confession",
+        "question",
+        "in_progress_action",
+        "reaction_peak",
+        "story_peak",
+    ]
+    assert props["verdict"]["enum"] == ["post", "maybe", "skip"]
+    assert props["comment_risk"]["enum"] == ["low", "medium", "high"]
+    assert props["hashtags"] == {"type": "array", "items": {"type": "string"}}
+    for k in ("first_words", "last_words", "post_caption", "search_title", "category"):
+        assert props[k] == {"type": "string"}
+    assert not {"start", "end", "cold_open_start", "cold_open_end"} & props.keys()
 
 
 def test_system_prompt_covers_brief():
@@ -269,39 +279,72 @@ def test_system_prompt_covers_brief():
             "Hook 25 · Standalone context 15 · Payoff 15 · Emotional intensity 15 · "
             "Length fit 10 · Pacing 10 · Loop potential 5 · Platform safety 5"
         ),
-        "20–45s usually wins; 60s only if tension holds",
-        "first 3 seconds",
-        "cold_open",
-        "8 words",
-        "best first",
-        "timestamp of the line after",
-        "short phrase or sentence",
+        # line-indexed transcript and picks
+        "L{n}",
+        "`start_line`",
+        "`end_line`",
+        "`cold_open_line`",
         "at most 5 seconds",
-        '"And", "So", "But", "Because", "Which"',
-        "introduces the subject",
-        "score `hook` and `context` lower",
+        # feed editor
+        "feed editor, not a documentary editor",
+        "stranger mid-scroll",
+        # first_words
+        "`first_words`",
+        "verbatim",
+        "move the start or use a cold open",
+        # hook archetypes, one idea
+        "bold_claim",
+        "surprising_fact",
+        "conflict",
+        "confession",
+        "question",
+        "in_progress_action",
+        "reaction_peak",
+        "story_peak",
+        "one idea per clip",
+        # ending
+        "payoff line",
+        '"yeah"',
+        '"mm-hmm"',
+        "backchannel",
+        "within 15 seconds",
+        "echo the opening",
+        # length
+        "20–40 seconds",
+        "60 seconds only if the tension holds",
+        # hook_text
+        "3–7 words",
+        "literally true",
+        '"Then this"',
+        '"Wait for it"',
+        '"You won\'t believe"',
+        '"Watch till the end"',
+        # hot takes
+        "hot takes",
+        "slurs, sexual content and gore",
+        # calibration
+        "`hook` 20 or higher only if",
+        "1–4 postable clips",
+        "`skip`",
+        # post copy
+        "`post_caption`",
+        "ends with a question",
+        "#fyp",
+        "`search_title`",
+        "searchable topic",
+        # live streams
+        "dead air",
+        "3–8 seconds earlier",
+        "answering chat",
+        # comment risk
+        "`comment_risk`",
+        "appearance",
+        # markers stay explained
         "⟨🔥chat×4 🔊loud⟩",
-        "audience and audio reactions",
         "not a requirement",
     ):
-        assert needle in SYSTEM_PROMPT
-
-
-def test_snap_end_given_as_next_line_start_adds_no_extra_sentence(long_sentences):
-    # sentences start every 3s and last 2.3s: [30.0-32.3], [33.0-35.3], ...
-    p = snap_to_sentences(pick(start=30.0, end=33.0), long_sentences, duration=600)
-    assert (p.start, p.end) == (30.0, 32.3)
-
-
-def test_snap_end_mid_sentence_extends_to_sentence_end(long_sentences):
-    p = snap_to_sentences(pick(start=30.0, end=31.0), long_sentences, duration=600)
-    assert p.end == 32.3
-
-
-def test_snap_end_before_any_sentence_uses_first_sentence_from_start(long_sentences):
-    late = [s for s in long_sentences if s.start >= 300]
-    p = snap_to_sentences(pick(start=100.0, end=200.0), late, duration=600)
-    assert p.end == late[0].end
+        assert needle in SYSTEM_PROMPT, needle
+    assert not re.search(r"\b[A-Z]{4,}\b", SYSTEM_PROMPT)  # calm brief, no shouting
 
 
 def test_picks_overlapping_exclude_are_dropped(long_transcript, fake_llm, settings):
@@ -329,35 +372,56 @@ def test_build_prompt_excerpt():
     assert "This is an excerpt covering 1:00:00.0 to 1:30:00.0 of a longer video." in p
 
 
-def test_cold_open_teasing_final_line_is_snapped_and_kept(long_transcript, fake_llm, settings):
-    fake_llm.queue({"clips": [raw(30, 60, cold_open=(57.0, 60.0))]}, EMPTY)
+def test_cold_open_teasing_final_line_is_kept(long_transcript, fake_llm, settings):
+    fake_llm.queue({"clips": [raw(30, 60, cold_open_line=19)]}, EMPTY)
     (p,) = select_clips(long_transcript, fake_llm, settings)
     assert (p.start, p.end) == (30.0, 59.3)
-    assert p.cold_open == (57.0, 59.3)  # ends at the final sentence's end, not mid-gap
+    assert p.cold_open == (57.0, 59.3)
 
 
-def test_cold_open_snapped_longer_than_limit_is_removed(long_transcript, fake_llm, settings):
-    # 45.0-51.0 snaps to 45.0-50.3 (5.3s)
-    fake_llm.queue({"clips": [raw(30, 60, cold_open=(45.0, 51.0))]}, EMPTY)
+def test_cold_open_on_the_first_line_is_dropped(long_transcript, fake_llm, settings):
+    fake_llm.queue({"clips": [raw(30, 60, cold_open_line=10)]}, EMPTY)
     (p,) = select_clips(long_transcript, fake_llm, settings)
     assert p.cold_open is None
 
 
-def test_cold_open_snaps_to_words_and_allows_5s(long_transcript, fake_llm, settings):
-    # words: 45.0-45.5, 45.6-46.1, 46.2-46.7, 46.8-47.3, 48.0-48.5 ...
-    fake_llm.queue({"clips": [raw(30, 60, cold_open=(45.5, 48.4))]}, EMPTY)
-    (p,) = select_clips(long_transcript, fake_llm, settings)
-    assert p.cold_open == (45.6, 48.5)  # mid-sentence word boundaries, 2.9s
-    fake_llm.queue({"clips": [raw(30, 60, cold_open=(45.0, 50.0))]}, EMPTY)
-    (p,) = select_clips(long_transcript, fake_llm, settings)
-    assert p.cold_open == (45.0, 49.7)  # 4.7s: more than the old 3.5s cap
+def _long_sentence_transcript():
+    """Sentence 0..9: 4 short words each (3 s grid); sentence 10 at 30 s is 16 words of
+    0.5 s with 0.1 s gaps (30.0-39.5); then short sentences again from 42 s."""
+    segments = []
+    for n in range(40):
+        if n == 10:
+            texts = [f"w{j}" for j in range(15)] + ["end."]
+            t0, step = 30.0, 0.6
+        else:
+            texts = [f"line{n}", "says", "something", "here."]
+            t0, step = (3.0 * n if n < 10 else 42.0 + 3.0 * (n - 11)), 0.6
+        words = [
+            Word(start=round(t0 + j * step, 3), end=round(t0 + j * step + 0.5, 3), text=t)
+            for j, t in enumerate(texts)
+        ]
+        segments.append(
+            Segment(start=words[0].start, end=words[-1].end, text=" ".join(texts), words=words)
+        )
+    return Transcript(language="en", duration=200.0, segments=segments)
+
+
+def test_long_cold_open_line_is_trimmed_to_first_5s_on_word_boundaries(fake_llm, settings):
+    tr = _long_sentence_transcript()
+    item = raw(0, 60, cold_open_line=10, first_words="line0 says something here.")
+    item["last_words"] = "line15 says something here."
+    item["end_line"] = 15  # L15 starts at 54.0 and ends at 56.3
+    fake_llm.queue({"clips": [item]}, EMPTY)
+    (p,) = select_clips(tr, fake_llm, settings)
+    assert (p.start, p.end) == (0.0, 56.3)
+    assert p.cold_open == (30.0, 34.7)  # words end 30.5, 31.1 ... 34.7 (<= 35.0)
 
 
 def test_cold_open_pushing_over_max_length_is_dropped_pick_kept(
     long_transcript, fake_llm, settings
 ):
     # main clip 30.0-104.3 = 74.3s (<= 75s); with a 2.3s cold open it would be 76.6s
-    fake_llm.queue({"clips": [raw(30, 103, cold_open=(57.0, 60.0))]}, EMPTY)
+    fake_llm.queue({"clips": [raw(30, 103, cold_open_line=19)]}, EMPTY)
     (p,) = select_clips(long_transcript, fake_llm, settings)
     assert (p.start, p.end, p.cold_open) == (30.0, 104.3, None)
 
@@ -404,21 +468,21 @@ def _cold_open_warnings(caplog, llm, transcript, settings, item):
 
 def test_dropped_cold_open_outside_clip_logs_reason(long_transcript, fake_llm, settings, caplog):
     msgs = _cold_open_warnings(
-        caplog, fake_llm, long_transcript, settings, raw(30, 60, cold_open=(0.0, 2.0))
+        caplog, fake_llm, long_transcript, settings, raw(30, 60, cold_open_line=0)
     )
     assert len(msgs) == 1 and "Clip at 30" in msgs[0] and "outside the clip" in msgs[0]
 
 
-def test_dropped_cold_open_too_long_logs_reason(long_transcript, fake_llm, settings, caplog):
+def test_dropped_cold_open_out_of_range_logs_reason(long_transcript, fake_llm, settings, caplog):
     msgs = _cold_open_warnings(
-        caplog, fake_llm, long_transcript, settings, raw(30, 60, cold_open=(45.0, 51.0))
+        caplog, fake_llm, long_transcript, settings, raw(30, 60, cold_open_line=999)
     )
-    assert len(msgs) == 1 and "Clip at 30" in msgs[0] and "exceeds the 5.0s cap" in msgs[0]
+    assert len(msgs) == 1 and "does not exist" in msgs[0]
 
 
 def test_dropped_cold_open_over_max_length_logs_reason(long_transcript, fake_llm, settings, caplog):
     msgs = _cold_open_warnings_keep(
-        caplog, fake_llm, long_transcript, settings, raw(30, 103, cold_open=(57.0, 60.0))
+        caplog, fake_llm, long_transcript, settings, raw(30, 103, cold_open_line=19)
     )
     assert len(msgs) == 1 and "maximum length" in msgs[0]
 
@@ -436,14 +500,6 @@ def test_raw_sink_receives_every_payload(long_transcript, fake_llm, settings):
     sink: list[dict] = []
     select_clips(long_transcript, fake_llm, settings, raw_sink=sink)
     assert sink == [first, EMPTY]
-
-
-def test_cold_open_without_whole_words_logs_reason(long_transcript, fake_llm, settings, caplog):
-    # 46.75-46.78 falls between words: snapped start (46.8) is after snapped end (46.7)
-    msgs = _cold_open_warnings(
-        caplog, fake_llm, long_transcript, settings, raw(30, 60, cold_open=(46.75, 46.78))
-    )
-    assert len(msgs) == 1 and "no whole words fit" in msgs[0]
 
 
 def test_markers_reach_the_prompt(long_transcript, fake_llm, settings):
@@ -469,3 +525,187 @@ def test_chunk_prompts_keep_markers_on_their_own_lines(long_transcript, fake_llm
     prompts = [c["prompt"] for c in fake_llm.calls]
     assert len(prompts) > 1
     assert all("🔥end" not in p for p in prompts[:-1]) and "🔥end" in prompts[-1]
+
+
+# --- selection v2: line-indexed picks, verdicts, post copy ----------------------------------
+
+
+def _one(transcript, llm, settings, item, caplog=None):
+    llm.queue({"clips": [item]}, EMPTY)
+    if caplog is None:
+        return select_clips(transcript, llm, settings)
+    with caplog.at_level(logging.WARNING, logger="hookline.pipeline.select"):
+        return select_clips(transcript, llm, settings)
+
+
+def test_lines_map_to_sentence_times(long_transcript, fake_llm, settings):
+    item = raw(0, 0, start_line=10, end_line=19, first_words="line10 says something here.")
+    (p,) = _one(long_transcript, fake_llm, settings, item)
+    assert (p.start, p.end) == (30.0, 59.3)  # L10 starts at 30.0, L19 ends at 59.3
+
+
+def test_prompt_lines_are_numbered(long_transcript, fake_llm, settings):
+    fake_llm.queue(make_payload(8))
+    select_clips(long_transcript, fake_llm, settings)
+    prompt = fake_llm.calls[0]["prompt"]
+    assert "L0 [00:00.0] line0 says something here." in prompt
+    assert "L199 [09:57.0] line199 says something here." in prompt
+
+
+def test_out_of_range_lines_fall_back_to_nearest_and_log_once(
+    long_transcript, fake_llm, settings, caplog
+):
+    item = raw(0, 0, start_line=-3, end_line=9, first_words="line0 says something here.")
+    (p,) = _one(long_transcript, fake_llm, settings, item, caplog)
+    assert (p.start, p.end) == (0.0, 29.3)
+    msgs = [r.getMessage() for r in caplog.records if "out of range" in r.getMessage()]
+    assert len(msgs) == 1
+    caplog.clear()
+    item = raw(0, 0, start_line=190, end_line=4000, first_words="line190 says something here.")
+    (p,) = _one(long_transcript, fake_llm, settings, item, caplog)
+    assert (p.start, p.end) == (570.0, 599.3)  # clamped to the last line (L199)
+    assert sum("out of range" in r.getMessage() for r in caplog.records) == 1
+
+
+def _distinct_transcript() -> Transcript:
+    """Like long_transcript (sentence n at 3n s, 2.3 s long) but every word is unique:
+    "alphaN bravoN charlieN deltaN."."""
+    segments = []
+    for n in range(200):
+        texts = [f"alpha{n}", f"bravo{n}", f"charlie{n}", f"delta{n}."]
+        words = [
+            Word(start=round(3.0 * n + j * 0.6, 3), end=round(3.0 * n + j * 0.6 + 0.5, 3), text=t)
+            for j, t in enumerate(texts)
+        ]
+        segments.append(
+            Segment(start=words[0].start, end=words[-1].end, text=" ".join(texts), words=words)
+        )
+    return Transcript(language="en", duration=600.0, segments=segments)
+
+
+def test_first_words_reanchor_start_within_three_lines(fake_llm, settings):
+    item = raw(30, 60, first_words="Alpha12, bravo12 charlie12 delta12.")  # start_line 10
+    (p,) = _one(_distinct_transcript(), fake_llm, settings, item)
+    assert p.start == 36.0 and p.first_words == "Alpha12, bravo12 charlie12 delta12."
+
+
+def test_first_words_may_run_into_the_next_line(fake_llm, settings, caplog):
+    item = raw(30, 60, first_words="alpha10 bravo10 charlie10 delta10. alpha11 bravo11")
+    (p,) = _one(_distinct_transcript(), fake_llm, settings, item, caplog)
+    assert p.start == 30.0 and "first_words" not in caplog.text
+
+
+def test_first_words_fuzzy_match_keeps_line(fake_llm, settings, caplog):
+    item = raw(30, 60, first_words="alpha10 bravo10 charlie1O")  # 2 of 3 tokens (an OCR-ish O)
+    (p,) = _one(_distinct_transcript(), fake_llm, settings, item, caplog)
+    assert p.start == 30.0 and "first_words" not in caplog.text
+
+
+def test_first_words_without_match_keeps_line_and_logs(fake_llm, settings, caplog):
+    item = raw(30, 60, first_words="Nobody expected the raccoon.")
+    (p,) = _one(_distinct_transcript(), fake_llm, settings, item, caplog)
+    assert p.start == 30.0
+    assert sum("first_words" in r.getMessage() for r in caplog.records) == 1
+
+
+def test_first_words_match_beyond_three_lines_is_ignored(fake_llm, settings):
+    item = raw(30, 60, first_words="alpha14 bravo14 charlie14 delta14.")  # 4 lines away
+    (p,) = _one(_distinct_transcript(), fake_llm, settings, item)
+    assert p.start == 30.0
+
+
+def test_reversed_lines_are_dropped(long_transcript, fake_llm, settings):
+    item = raw(0, 0, start_line=20, end_line=10, first_words="line20 says something here.")
+    assert _one(long_transcript, fake_llm, settings, item) == []
+
+
+def test_skip_verdicts_are_dropped(long_transcript, fake_llm, settings):
+    payload = make_payload(8)
+    for c in payload["clips"][:3]:
+        c["verdict"] = "skip"
+    payload["clips"][3]["verdict"] = "maybe"
+    fake_llm.queue(payload)
+    picks = select_clips(long_transcript, fake_llm, settings)
+    # 8 returned (>= 5 wanted) -> no follow-up even though only 5 survive the skips
+    assert len(fake_llm.calls) == 1
+    assert [round(p.start) for p in picks] == [210, 270, 330, 390, 450]
+    assert all(p.verdict in {"post", "maybe"} for p in picks)
+
+
+def test_fewer_kept_after_skips_makes_no_follow_up(long_transcript, fake_llm, settings):
+    payload = make_payload(6)
+    for c in payload["clips"][2:]:
+        c["verdict"] = "skip"
+    fake_llm.queue(payload)
+    picks = select_clips(long_transcript, fake_llm, settings)
+    assert len(picks) == 2 and len(fake_llm.calls) == 1
+
+
+def test_post_ranks_above_maybe(long_transcript, fake_llm, settings):
+    s = settings.model_copy(update={"clips": 1})
+    hi = raw(30, 60, total=90, verdict="maybe")
+    lo = raw(300, 330, total=40, verdict="post")
+    fake_llm.queue({"clips": [hi, lo]})
+    (p,) = select_clips(long_transcript, fake_llm, s)
+    assert round(p.start) == 300
+
+
+def test_every_candidate_skip_raises_clear_error(long_transcript, fake_llm, settings):
+    payload = make_payload(8)
+    for c in payload["clips"]:
+        c["verdict"] = "skip"
+    fake_llm.queue(payload)
+    with pytest.raises(NoClipsSelectedError, match="rated every candidate as skip"):
+        select_clips(long_transcript, fake_llm, settings)
+
+
+def test_every_candidate_skip_after_follow_up_raises(long_transcript, fake_llm, settings):
+    first = {"clips": [raw(30, 60, verdict="skip")]}
+    more = {"clips": [raw(300, 330, verdict="skip")]}
+    fake_llm.queue(first, more)
+    with pytest.raises(NoClipsSelectedError, match="may not have strong moments"):
+        select_clips(long_transcript, fake_llm, settings)
+    assert len(fake_llm.calls) == 2
+
+
+def test_edit_beats_outside_clip_are_dropped(long_transcript, fake_llm, settings):
+    beats = [
+        "zoom: 'before' @ 12.0s",
+        "zoom: 'inside' @ 31.5s",
+        "emoji 😱 @ 59.3s",
+        "zoom: 'after' @ 61.0s",
+        "emphasis without a time",
+    ]
+    (p,) = _one(long_transcript, fake_llm, settings, raw(30, 60, edit_beats=beats))
+    assert p.edit_beats == ["zoom: 'inside' @ 31.5s", "emoji 😱 @ 59.3s"]
+
+
+def test_post_copy_reaches_the_pick(long_transcript, fake_llm, settings):
+    item = raw(
+        30,
+        60,
+        hook_type="confession",
+        hashtags=["#LineCook", "fyp", " kitchenlife ", "", "chefstories"],
+        search_title="Running a restaurant kitchen alone at nineteen when the head chef vanished",
+        comment_risk="high",
+    )
+    (p,) = _one(long_transcript, fake_llm, settings, item)
+    assert p.hook_type == "confession" and p.verdict == "post" and p.comment_risk == "high"
+    assert p.post_caption == "He ran the whole kitchen alone. Could you?"
+    assert p.hashtags == ["LineCook", "kitchenlife", "chefstories"]
+    assert len(p.search_title) <= 70 and p.search_title.startswith("Running a restaurant")
+    assert p.category == "food" and p.last_words == "line19 says something here."
+
+
+def test_chunk_mode_uses_global_line_numbers(long_transcript, fake_llm, settings):
+    s = settings.model_copy(update={"max_prompt_tokens": 500})
+    item = raw(300, 330)  # L100-L109
+    fake_llm.queue_forever({"clips": [item]})
+    picks = select_clips(long_transcript, fake_llm, s)
+    prompts = [c["prompt"] for c in fake_llm.calls]
+    assert len(prompts) > 1
+    assert "L199 [09:57.0] line199" in prompts[-1] and "L0 [" not in prompts[-1]
+    later_first = re.search(r"^L(\d+) \[", prompts[1], re.MULTILINE)
+    assert later_first and int(later_first.group(1)) > 0
+    assert [(p.start, p.end) for p in picks] == [(300.0, 329.3)]
+    assert "line numbers" in prompts[1].lower()

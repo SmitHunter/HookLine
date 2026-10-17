@@ -60,6 +60,20 @@ class RubricScores(BaseModel):
         )
 
 
+HookType = Literal[
+    "bold_claim",
+    "surprising_fact",
+    "conflict",
+    "confession",
+    "question",
+    "in_progress_action",
+    "reaction_peak",
+    "story_peak",
+]
+Verdict = Literal["post", "maybe", "skip"]
+CommentRisk = Literal["low", "medium", "high"]
+
+
 class ClipPick(BaseModel):
     start: float
     end: float
@@ -69,6 +83,16 @@ class ClipPick(BaseModel):
     scores: RubricScores
     cold_open: tuple[float, float] | None = None
     edit_beats: list[str] = []
+    # Selection v2. Defaults keep picks cached before these fields existed valid.
+    first_words: str = ""
+    last_words: str = ""
+    hook_type: HookType | None = None
+    verdict: Verdict = "maybe"
+    post_caption: str = ""
+    hashtags: list[str] = []
+    search_title: str = ""
+    category: str = ""
+    comment_risk: CommentRisk | None = None
 
     @property
     def duration(self) -> float:
