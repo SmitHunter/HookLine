@@ -20,12 +20,14 @@ WHITE = "{\\c&HFFFFFF&}"  # back to the style colour; `{\r}` would also drop \fs
 SENTENCE_END = (".", "!", "?", "…", '."', '!"', '?"', '…"', ".”", "!”", "?”", "…”")
 HOLD_GAP_S = 1.0  # a group stays up until the next one if the silence is at most this
 TAIL_S = 0.3  # otherwise it ends this long after its last word
+PAGE_LEAD_S = 2 / 30  # a page appears 2 frames before its first word is spoken
 WORD_JOINER = "⁠"  # invisible; stops a literal "\" escaping the next character
 
 # Anton's OS/2 metrics (2048 upm): usWinAscent 2876, usWinDescent 674, sCapHeight 1760.
 # libass sizes a font so that winAscent + winDescent = Fontsize px, so Anton's cap height is
 # only 1760 / 3550 = 0.496 x Fontsize (Fontsize 96 rendered 48 px caps). 136 -> 67-69 px.
-FONT_SIZE = 136
+FONT_SIZE = 136  # the hook title and EARLIER tag
+CAP_FONT_SIZE = 152  # captions, ~12% larger: 75-76 px caps, still one line inside Q4
 _EM = 2876 + 674
 _CAP_FRAC = 1760 / _EM
 HOOK_MIN_FS = math.ceil(60 / _CAP_FRAC)  # 122: hook caps stay >= 60 px (Q5)
@@ -57,25 +59,26 @@ TEXT_X = 474  # centre of [60, 888]
 MAX_TEXT_W = 828
 SAFE_TOP = 290
 SAFE_BOTTOM = 1250
-# Visible caption extent around its \pos y at Fontsize 136, outline and shadow included
-# (measured over grey: y-36 .. y+56; the glyphs sit low in Anton's tall line box).
-CAPTION_ABOVE = 36
-CAPTION_BELOW = 56
+# Visible caption extent around its \pos y at CAP_FONT_SIZE, outline and shadow included
+# (measured over grey: y-39 .. y+61, a Q tail or comma to y+70 -- still inside Q4 at the
+# lowest line, 1180; the glyphs sit low in Anton's tall line box).
+CAPTION_ABOVE = 39
+CAPTION_BELOW = 61
 HOOK_HALF = FONT_SIZE + HOOK_PAD  # half-height of a two-line hook box (2 x 136 / 2 + pad)
 HOOK_TOP_Y = SAFE_TOP + HOOK_HALF  # 446: a two-line hook clamped to the top of Q4
 TAG_HALF = FONT_SIZE // 2 + HOOK_PAD  # half-height of the one-line EARLIER tag box
 TEXT_SEPARATION = 48  # visible px between a hook/tag box and the caption below it
 # Highest caption line while the hook is up: visible top clears a two-line top hook box (602).
-CAPTION_MIN_Y = HOOK_TOP_Y + HOOK_HALF + TEXT_SEPARATION + CAPTION_ABOVE  # 686
+CAPTION_MIN_Y = HOOK_TOP_Y + HOOK_HALF + TEXT_SEPARATION + CAPTION_ABOVE  # 689
 # Highest line once hook and tag are gone: clears the space a top one-line tag box uses (466).
-CAPTION_LATE_MIN_Y = SAFE_TOP + 2 * TAG_HALF + TEXT_SEPARATION + CAPTION_ABOVE  # 550
+CAPTION_LATE_MIN_Y = SAFE_TOP + 2 * TAG_HALF + TEXT_SEPARATION + CAPTION_ABOVE  # 553
 CAPTION_MAX_Y = 1180
 CAPTION_Y = CAPTION_MAX_Y
 CAPTION_FACE_GAP = 40  # clearance (px) kept between a face and the caption's visible extent
 CAPTION_STEP = 4  # caption / hook line candidates, px apart
 FACE_ZOOM_BUDGET = 1.2  # ZOOM_PUNCH: a punch-in grows the face about its centre this much
 STACKED_CAPTION_Y = 700  # just below the cam/game seam (640), inside the safe band
-# a two-line hook box TEXT_SEPARATION below the 700 captions (visible to 756): 960
+# a two-line hook box TEXT_SEPARATION below the 700 captions (visible to 761): 965
 STACKED_HOOK_Y = STACKED_CAPTION_Y + CAPTION_BELOW + TEXT_SEPARATION + HOOK_HALF
 HOOK_Y = 360  # requested centre; clamped so the box stays in Q4 (1 line: 378, 2 lines: 446)
 
@@ -88,7 +91,7 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Cap,Anton,{FONT_SIZE},&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,{CAP_OUTLINE},{CAP_SHADOW},5,40,40,40,1
+Style: Cap,Anton,{CAP_FONT_SIZE},&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,{CAP_OUTLINE},{CAP_SHADOW},5,40,40,40,1
 Style: Hook,Anton,{FONT_SIZE},&H00FFFFFF,&H00FFFFFF,&H26000000,&H00000000,0,0,0,0,100,100,0,0,3,{HOOK_PAD},0,5,40,40,40,1
 
 [Events]
@@ -196,11 +199,13 @@ def _line_w(text: str, fs: int) -> float:
     return sum(_ADV.get(c, _ADV_DEFAULT) for c in text) / _EM * fs
 
 
-def _fit(lines: list[str], side: int, min_fs: int) -> tuple[int, int] | None:
-    """Largest (Fontsize, \\fscx percent) with fscx >= MIN_SCALE_X and fs >= min_fs that keeps
-    every line plus `side` px each side within MAX_TEXT_W; None if none does."""
+def _fit(
+    lines: list[str], side: int, min_fs: int, max_fs: int = FONT_SIZE
+) -> tuple[int, int] | None:
+    """Largest (Fontsize <= max_fs, \\fscx percent) with fscx >= MIN_SCALE_X and fs >= min_fs
+    that keeps every line plus `side` px each side within MAX_TEXT_W; None if none does."""
     avail = MAX_TEXT_W - 2 * side
-    for fs in range(FONT_SIZE, min_fs - 1, -1):
+    for fs in range(max_fs, min_fs - 1, -1):
         w = max(_line_w(line, fs) for line in lines)
         scale = 100 if w <= avail else math.floor(100 * avail / w)
         if scale >= MIN_SCALE_X:
@@ -208,8 +213,8 @@ def _fit(lines: list[str], side: int, min_fs: int) -> tuple[int, int] | None:
     return None
 
 
-def _size_tags(fs: int, scale: int) -> str:
-    return (f"\\fs{fs}" if fs != FONT_SIZE else "") + (f"\\fscx{scale}" if scale < 100 else "")
+def _size_tags(fs: int, scale: int, style_fs: int = FONT_SIZE) -> str:
+    return (f"\\fs{fs}" if fs != style_fs else "") + (f"\\fscx{scale}" if scale < 100 else "")
 
 
 def _hook_lines(words: list[str]) -> list[str]:
@@ -262,20 +267,35 @@ def _breaks(breaks: Sequence[float], seam: float | None) -> list[float]:
     return sorted({*breaks, *([seam] if seam is not None else [])})
 
 
+def _page_starts(groups: list[list[Word]], cuts: Sequence[float]) -> list[float]:
+    """When each page appears: PAGE_LEAD_S before its first word, but never before 0, the
+    break (cut or seam) it follows, or MIN_WORD_S after the previous page's last word starts
+    (that word keeps its highlight)."""
+    starts = []
+    for i, group in enumerate(groups):
+        first = group[0].start
+        lo = groups[i - 1][-1].start + MIN_WORD_S if i else 0.0
+        lo = max([lo, *(x for x in cuts if x <= first + BREAK_SLACK_S)])
+        starts.append(min(max(first - PAGE_LEAD_S, lo), first))
+    return starts
+
+
 def _hold_ends(
     groups: list[list[Word]],
     duration: float,
     seam: float | None = None,
     breaks: Sequence[float] = (),
 ) -> list[float]:
-    """When each group leaves the screen (see HOLD_GAP_S/TAIL_S). No group holds past the
-    next break (a cut, or the cold-open `seam`) after its last word starts."""
+    """When each group leaves the screen (see HOLD_GAP_S/TAIL_S): never after the next page
+    appears (`_page_starts`), nor past the next break (a cut, or the cold-open `seam`) after
+    its last word starts."""
     cuts = _breaks(breaks, seam)
+    starts = _page_starts(groups, cuts)
     ends = []
     for i, group in enumerate(groups):
         last = group[-1].end
         if i + 1 < len(groups):
-            nxt = groups[i + 1][0].start
+            nxt = starts[i + 1]
             end = nxt if nxt - last <= HOLD_GAP_S else min(last + TAIL_S, nxt)
         else:
             end = min(last + TAIL_S, max(duration, last))
@@ -361,18 +381,23 @@ def build_ass(
     cuts = _breaks(breaks, seam)
     groups = group_words(_at_breaks(_normalise(words), cuts), breaks=cuts)
     holds = _hold_ends(groups, duration, seam, breaks)
-    for group, hold_end, early in zip(groups, holds, _early(groups, holds, windows), strict=True):
+    shown = _page_starts(groups, cuts)
+    pages = zip(groups, shown, holds, _early(groups, holds, windows), strict=True)
+    for group, page_start, hold_end, early in pages:
         texts = [word.text.upper() for word in group]
         # A single over-long word that cannot fit even at the minimum size keeps that size.
-        fs, scale = _fit([" ".join(texts)], CAP_SIDE, CAP_MIN_FS) or (CAP_MIN_FS, MIN_SCALE_X)
-        tags = f"\\pos({TEXT_X},{cy if early else cy_late})" + _size_tags(fs, scale)
+        fit = _fit([" ".join(texts)], CAP_SIDE, CAP_MIN_FS, CAP_FONT_SIZE)
+        fs, scale = fit or (CAP_MIN_FS, MIN_SCALE_X)
+        y = cy if early else cy_late
+        tags = f"\\pos({TEXT_X},{y})" + _size_tags(fs, scale, CAP_FONT_SIZE)
         for i, active in enumerate(group):
+            start = page_start if i == 0 else active.start  # the page leads its first word
             end = group[i + 1].start if i + 1 < len(group) else hold_end
             end = min(end, _next_break(active.start, cuts))  # a word straddling a cut
             parts = [
                 f"{YELLOW}{_esc(t)}{WHITE}" if j == i else _esc(t) for j, t in enumerate(texts)
             ]
-            lines.append(_dialogue(0, active.start, end, "Cap", f"{{{tags}}}" + " ".join(parts)))
+            lines.append(_dialogue(0, start, end, "Cap", f"{{{tags}}}" + " ".join(parts)))
     return "\n".join(lines) + "\n"
 
 
@@ -386,8 +411,9 @@ def face_rects(layout: SceneLayout, zoom: float = 1.0) -> list[tuple[float, floa
     hairline/upper forehead, where text is acceptable short-form practice; the core (eyes,
     nose, mouth, chin) is what captions and hooks must stay off. Placement here and the Q4b
     audit both use the core, so they agree. The layout stores only the face's (y, h); tracking
-    and split crops centre the face horizontally, and a detector box is about FACE_W_PER_H as
-    wide as tall, so x is estimated from that."""
+    and split crops centre the face horizontally (a FACE_TRACK crop's gaze `lead` moves the
+    face the other way by that share of the width), and a detector box is about FACE_W_PER_H
+    as wide as tall, so x is estimated from that."""
     face = _face_px(layout)
     if face is None:
         return []
@@ -396,7 +422,8 @@ def face_rects(layout: SceneLayout, zoom: float = 1.0) -> list[tuple[float, floa
     half_w = (bottom - top) / 2 * FACE_W_PER_H
     core_top = top + FACE_CORE_TOP * (bottom - top)
     panels = (0, SPLIT_PANEL_H) if layout.kind == "SPLIT" else (0,)
-    return [(OUT_W / 2 - half_w, core_top + p, OUT_W / 2 + half_w, bottom + p) for p in panels]
+    cx = OUT_W / 2 - (layout.lead * OUT_W if layout.kind == "FACE_TRACK" else 0.0)
+    return [(cx - half_w, core_top + p, cx + half_w, bottom + p) for p in panels]
 
 
 def _face_px(layout: SceneLayout) -> tuple[float, float] | None:

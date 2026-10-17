@@ -304,8 +304,12 @@ def test_render_clip_zoom_cadence(zoom_render):
     times = [t for t, _ in steps] + [kept]
     assert steps[0] == [0.0, 1.0] and max(b - a for a, b in pairwise(times)) <= 4.5 + 1e-6
     assert all(t < kept for t, _ in steps)
-    assert any(s == 1.2 for _, s in steps)  # the emphasis punch
-    assert max(s for _, s in steps) <= 1.2
+    levels = extras["zoom_levels"]  # the schedule; zoom_steps are the rendered zooms
+    assert [t for t, _ in levels] == [t for t, _ in steps]
+    assert any(s == 1.2 for _, s in levels)  # the emphasis punch
+    # 320 px fixture: a soft (> 2x) source, every rendered level capped at 1.12
+    assert max(s for _, s in steps) <= 1.12 + 1e-9 and steps[0] == [0.0, 1.0]
+    assert len({s for _, s in steps}) == 3  # still three distinct rendered levels
     assert probe_size(dst) == (1080, 1920)
     json.dumps(extras)
 
@@ -421,3 +425,59 @@ def test_render_clip_sidecar_caption_words_and_no_seam(
 
     assert extras["ass"] == "03.ass"
     assert extras["ass_sha1"] == hashlib.sha1(ass.read_bytes()).hexdigest()
+
+
+# --- wave D: audio fades, end tail ---------------------------------------------------------
+
+
+def _pcm_tail_rms(path, seconds: float) -> tuple[float, float]:
+    """(RMS of the middle second, RMS of the last `seconds`) of the decoded audio."""
+    import numpy as np
+
+    raw = subprocess.run(
+        ["ffmpeg", "-loglevel", "error", "-i", str(path), "-ac", "1", "-ar", "48000",
+         "-f", "s16le", "-"],
+        check=True, capture_output=True,
+    ).stdout  # fmt: skip
+    a = np.frombuffer(raw, np.int16).astype(float)
+    mid = a[len(a) // 2 : len(a) // 2 + 48000]
+    tail = a[-int(seconds * 48000) :]
+    return float(np.sqrt((mid**2).mean())), float(np.sqrt((tail**2).mean()))
+
+
+def test_render_clip_fades_audio_in_and_out(
+    fixture_video, fixture_wav, fixture_words, sample_pick, settings, tmp_path, final_argvs
+):
+    dst = tmp_path / "out" / "06-fade.mp4"
+    s = settings.model_copy(update={"vertical": False, "captions": False})
+    extras = render_clip(
+        fixture_video, fixture_wav, sample_pick, fixture_words, tmp_path / "r", dst, s, None
+    )
+    af = final_argvs[0][final_argvs[0].index("-af") + 1]
+    kept = sum(e - st for st, e in extras["keep_ranges"])
+    assert "afade=t=in:st=0:d=0.02" in af
+    assert f"afade=t=out:st={kept - 0.12:.3f}:d=0.12" in af
+    mid, tail = _pcm_tail_rms(dst, 0.03)
+    assert tail < 0.3 * mid  # the steady sine is faded out at the end (no click)
+
+
+def test_render_clip_extends_the_last_range_by_the_tail(
+    fixture_video, fixture_wav, fixture_words, sample_pick, settings, tmp_path, monkeypatch
+):
+    from hookline.pipeline import render as render_mod
+
+    seen = []
+
+    def fake_tail(last_end, end, next_start, env, threshold_db):
+        seen.append((last_end, end, next_start))
+        return end + 0.3
+
+    monkeypatch.setattr(render_mod, "tail_end", fake_tail)
+    s = settings.model_copy(update={"vertical": False, "captions": False})
+    extras = render_clip(
+        fixture_video, fixture_wav, sample_pick, fixture_words, tmp_path, tmp_path / "07-t.mp4",
+        s, None,
+    )  # fmt: skip
+    (last_end, end, next_start) = seen[0]
+    assert last_end <= end <= next_start  # the fixture's sine is voiced up to the next word
+    assert extras["keep_ranges"][-1][1] == pytest.approx(end + 0.3, abs=1 / 25)

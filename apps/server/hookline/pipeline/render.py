@@ -9,7 +9,7 @@ from pathlib import Path
 from hookline.captions.ass import build_ass, caption_y_for, early_until, hook_y_for
 from hookline.config import Settings
 from hookline.fsutil import atomic_write_text
-from hookline.media.audio import detect_silences
+from hookline.media.audio import Envelope, detect_silences, energy_envelope
 from hookline.media.ffmpeg import (
     _run,
     cut_segments,
@@ -35,6 +35,7 @@ from hookline.media.reframe import (
     detect_overlay_bands,
     plan_zoom,
     reframe_graph,
+    rendered_zoom_steps,
     zoom_schedule,
 )
 from hookline.media.subtitles import fonts_dir, subtitles_filter
@@ -42,6 +43,7 @@ from hookline.models import ClipPick, Word
 from hookline.pipeline.boundaries import refine_boundaries
 from hookline.pipeline.deadair import keep_ranges, remap_words, snap_ranges
 from hookline.pipeline.layout import SceneLayout, plan_layouts
+from hookline.pipeline.timing import VOICE_MARGIN_DB, refine_word_ends, snap_onsets, tail_end
 from hookline.vision.faces import Crop, FaceDetector
 
 INTERMEDIATE_QUALITY = ["-preset", "veryfast", "-crf", "12"]
@@ -51,6 +53,7 @@ _SENTENCE_END = (".", "!", "?")
 CAM_EDGE_LO, CAM_EDGE_HI = 0.02, 0.98  # a cam box this close to a cropped edge was cut by it
 SEAM_FLASH = (0.35, 0.6, 0.35)  # white opacity of the 3 frames around the cold-open seam
 SEAM_SLACK_S = 0.1  # frame snapping may move a cold-open range bound by up to a frame
+FADE_IN_S, FADE_OUT_S = 0.02, 0.12  # audio fades at the clip's start and end (no clicks)
 
 log = logging.getLogger(__name__)
 
@@ -115,6 +118,32 @@ def emphasis_times(beats: list[str], keep: list[tuple[float, float]]) -> list[fl
     return out
 
 
+def audio_fades(duration: float) -> str:
+    """FADE_IN_S fade-in at the start and FADE_OUT_S fade-out ending at `duration`."""
+    return (
+        f"afade=t=in:st=0:d={FADE_IN_S:g},"
+        f"afade=t=out:st={max(duration - FADE_OUT_S, 0.0):.3f}:d={FADE_OUT_S:g}"
+    )
+
+
+def _with_tail(
+    keep: list[tuple[float, float]], words: list[Word], env: Envelope, voice_db: float
+) -> list[tuple[float, float]]:
+    """`keep` with its last range ending a beat after the last word (`timing.tail_end`):
+    into the silence after it, at most MAX_TAIL_S past it, never into the next word. The clip
+    may then run up to MAX_TAIL_S over max_clip_s."""
+    if not keep or not words:
+        return keep
+    start, end = keep[-1]
+    spoken = [w for w in words if w.start < end and w.end > start]
+    if not spoken:
+        return keep
+    last = max(w.end for w in spoken)
+    later = [w.start for w in words if w.start >= end]
+    new_end = tail_end(last, end, min(later, default=float("inf")), env, voice_db)
+    return [*keep[:-1], (start, round(new_end, 3))]
+
+
 def _horizontal_graph(crop: tuple[int, int, int, int] | None) -> str:
     pre = f"crop={crop[0]}:{crop[1]}:{crop[2]}:{crop[3]}," if crop else ""
     return f"[0:v]{pre}scale='trunc(min({MAX_HORIZONTAL_W},iw)/2)*2':-2,setsar=1[vout]"
@@ -172,10 +201,17 @@ def render_clip(
     loud_seconds: set[int] | None = None,
 ) -> dict:
     """Write the finished clip to `dst`; returns sidecar extras (segments, layout, keep_ranges,
-    removed_s, cut_times, zoom_steps, overlay_bands, seam, ass, ass_sha1, caption_words). Cut
-    and zoom times are on the output timeline; zooms are applied before captions, so captions
-    never zoom (vertical only; empty when horizontal). Each `layout` scene carries its zoom
-    plan (`base_zoom`, `zoom_cap`, `zoom_anchor`; see `reframe.plan_zoom`).
+    removed_s, cut_times, zoom_steps, zoom_levels, overlay_bands, seam, ass, ass_sha1,
+    caption_words). Cut and zoom times are on the output timeline; `zoom_steps` are the zooms
+    as rendered (each scene's plan applied), `zoom_levels` the schedule they come from. Zooms
+    are applied before captions, so captions never zoom (vertical only; empty when
+    horizontal). Each `layout` scene carries its zoom plan (`base_zoom`, `zoom_cap`,
+    `zoom_anchor`; see `reframe.plan_zoom`).
+
+    Word ends and post-pause onsets are refined against the audio envelope first
+    (`pipeline.timing`); the clip ends a beat after its last word (`_with_tail`, up to 0.35 s,
+    so a clip may run that much over max_clip_s) and its audio fades in over 0.02 s and out
+    over 0.12 s.
     `overlay_bands` is the [top, bottom] px of burned-in overlay cropped away (vertical only),
     or None. `seam` is the output time where a cold open ends (None without one); it gets a
     3-frame 60% white flash and the "EARLIER…" tag. `ass`/`ass_sha1` name the burned caption file
@@ -197,17 +233,26 @@ def render_clip(
     lo = max(0.0, min(s for s, _ in segs) - 1)
     hi = max(e for _, e in segs) + 1
     silences = detect_silences(wav, lo, hi, settings.silence_db)
+    # word ends/onsets from the audio (DTW gives single-token words a synthetic 0.15 s end)
+    env = energy_envelope(wav, lo, hi + 1)
+    voice_db = settings.silence_db - VOICE_MARGIN_DB
     near = [w for w in words if w.end > lo and w.start < hi]
+    near = snap_onsets(refine_word_ends(near, env, voice_db), env, voice_db)
     refined = refine_boundaries(pick, near, silences, loud_seconds=loud_seconds)
     fps = probe_fps(src)
     # Frame-grid bounds make the cut timeline exact, so remapped caption times stay in sync.
     keep = snap_ranges(
-        keep_ranges(
-            refined.segments(),
-            silences,
-            settings.max_pause_s,
-            settings.dead_air_pad_s,
-            words=near if protect_words else None,
+        _with_tail(
+            keep_ranges(
+                refined.segments(),
+                silences,
+                settings.max_pause_s,
+                settings.dead_air_pad_s,
+                words=near if protect_words else None,
+            ),
+            near,
+            env,
+            voice_db,
         ),
         fps,
     )
@@ -216,7 +261,8 @@ def render_clip(
         src, keep, work_dir / f"{name}.mkv", "libx264", quality=INTERMEDIATE_QUALITY, fps=fps
     )
     loudness = measure_loudness(inter, COMPRESSOR)
-    audio_args = ["-af", loudnorm_filter(loudness)] if loudness else []
+    kept_s = sum(e - s for s, e in keep)
+    audio_args = ["-af", f"{loudnorm_filter(loudness)},{audio_fades(kept_s)}"] if loudness else []
     letterbox = detect_crop(inter)
     size = probe_size(inter)
     crop, bands = letterbox, None
@@ -237,8 +283,9 @@ def render_clip(
             cuts,
             emphasis_times(pick.edit_beats, keep),
             boundaries=[w.end for w in out_words if w.text.rstrip().endswith(_SENTENCE_END)],
+            changes=[lay.start for lay in layouts[1:]],  # no beat step next to a camera change
         )
-        graph = reframe_graph(layouts, in_w, in_h, crop=crop, zoom_steps=steps)
+        graph = reframe_graph(layouts, in_w, in_h, crop=crop, zoom_steps=steps, cut_times=cuts)
     else:
         graph = _horizontal_graph(crop)
 
@@ -293,7 +340,9 @@ def render_clip(
         "keep_ranges": [list(k) for k in keep],
         "removed_s": round(max(refined.duration - kept, 0.0), 3),
         "cut_times": cuts,
-        "zoom_steps": [list(st) for st in steps],
+        # as rendered (each scene's zoom plan applied); `zoom_levels` keeps the schedule
+        "zoom_steps": [list(st) for st in rendered_zoom_steps(layouts, steps)] if layouts else [],
+        "zoom_levels": [list(st) for st in steps],
         "overlay_bands": list(bands) if bands else None,
         "seam": seam,
         **ass_ref,

@@ -316,6 +316,13 @@ def zoom_at(steps: list, t: float) -> float:
     return scale
 
 
+def zoom_levels(sidecar: dict) -> list:
+    """The clip's zoom schedule levels, which Q4b maps through each scene's plan: the sidecar's
+    `zoom_levels`, else `zoom_steps` (sidecars before wave D recorded the levels there; newer
+    ones record the rendered zooms)."""
+    return sidecar.get("zoom_levels") or sidecar.get("zoom_steps") or []
+
+
 def _probe(mp4: Path) -> dict:
     res = subprocess.run(
         ["ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", str(mp4)],
@@ -527,7 +534,7 @@ def audit_clip(
         words = [Word(start=s, end=e, text=t) for s, e, t in sidecar["caption_words"]]
     duration = probe_duration(mp4)
     layouts = sidecar.get("layout") or []
-    steps = sidecar.get("zoom_steps") or []
+    steps = zoom_levels(sidecar)
     caps: list[_Event] = []
     hooks: list[_Event] = []
     cap_black: list[tuple[list[int], Box | None]] = []

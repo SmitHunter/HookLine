@@ -216,7 +216,7 @@ def test_plan_layouts_without_cuts_is_one_scene(tmp_path):
     assert len(layouts) == 1
     assert layouts[0].start == 0 and layouts[0].end == pytest.approx(4.0, abs=0.1)
     assert layouts[0].kind == "FIT_BLUR"
-    assert len(det.frames) == 8  # two samples per second
+    assert len(det.frames) == 16  # four samples per second (the edge guard needs >= 4 fps)
     assert det.frames[0].shape == (360, 640, 3)
 
 
@@ -358,3 +358,34 @@ def test_zoom_level_maps_steps_through_base_and_cap():
     assert based.zoom_level(1.0) == pytest.approx(1.25) and based.zoom_level(1.2) == pytest.approx(
         1.4
     )
+
+
+# --- wave D: per-sample face widths, gaze lead ------------------------------------------
+
+
+def test_track_records_face_width_per_keyframe():
+    samples = [
+        (t * 0.25, [Face(x=0.4, y=0.2, w=0.1 + 0.01 * t, h=0.4, score=0.9)]) for t in range(6)
+    ]
+    samples.insert(3, (0.6, []))  # a gap holds the last width too
+    s = classify_scene(samples, 0, 2)
+    assert len(s.track_w) == len(s.track_x)
+    assert s.track_w == pytest.approx([0.1, 0.11, 0.12, 0.12, 0.13, 0.14, 0.15])
+
+
+@pytest.mark.parametrize(
+    ("yaws", "lead"),
+    [
+        ([-0.4] * 10, -0.08),  # looking frame-left: room on the left
+        ([0.4] * 10, 0.08),
+        ([0.03] * 10, 0.0),  # facing the camera: centred
+        ([None] * 10, 0.0),  # no landmarks
+        ([-0.4] * 9 + [0.9], -0.08),  # one stray estimate does not flip it
+    ],
+)
+def test_face_track_gaze_lead_from_median_yaw(yaws, lead):
+    samples = [
+        (t * 0.25, [Face(x=0.4, y=0.2, w=0.2, h=0.4, score=0.9, yaw=y)]) for t, y in enumerate(yaws)
+    ]
+    s = classify_scene(samples, 0, 3)
+    assert s.lead == pytest.approx(lead)

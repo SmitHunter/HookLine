@@ -54,8 +54,8 @@ def test_ass_header_and_styles():
     ass = build_ass([w(0, 0.3, "no")], hook_text="Hi", duration=5, caption_y=600)
     for s in ("PlayResX: 1080", "PlayResY: 1920", "WrapStyle: 2", "ScaledBorderAndShadow: yes"):
         assert s in ass
-    assert "Style: Cap,Anton,136," in ass and "Style: Hook,Anton,136," in ass
-    assert "{\\pos(474,686)}" in ass  # 600 clamped to 686 (48 px below a two-line hook)
+    assert "Style: Cap,Anton,152," in ass and "Style: Hook,Anton,136," in ass
+    assert "{\\pos(474,689)}" in ass  # 600 clamped to 689 (48 px below a two-line hook)
     assert "{\\pos(474,378)\\fad" in ass  # 360 clamped: one-line box top at 290
     hook = next(e for e in _events(ass) if ",Hook," in e)
     assert hook.startswith("Dialogue: 1,0:00:00.00,0:00:03.00,")
@@ -163,7 +163,7 @@ def test_hook_and_caption_placement_per_layout():
     assert (hook_y_for([]), caption_y_for([])) == (360, 1180)
     assert (hook_y_for([_lay("FIT_BLUR")]), caption_y_for([_lay("FIT_BLUR")])) == (360, 1180)
     stacked = [_lay("STACKED"), _lay("FIT_BLUR")]
-    assert (hook_y_for(stacked), caption_y_for(stacked)) == (960, 700)  # below the seam
+    assert (hook_y_for(stacked), caption_y_for(stacked)) == (965, 700)  # below the seam
     assert hook_y_for([_lay("FACE_TRACK")]) == 360  # no face box: default
 
 
@@ -218,7 +218,7 @@ def test_close_up_captions_go_above_the_head_clear_of_the_hook(tmp_path):
     assert y == CAPTION_MIN_Y and y + CAPTION_BELOW <= core_top
     hook, cap = _hook_box(tmp_path, close), _cap_box(tmp_path, close)
     assert hook is not None and cap is not None and cap[1] - hook[3] >= 48
-    # after the hook: the same rule from 550 up; the lowest clear line is still above the core
+    # after the hook: the same rule from 553 up; the lowest clear line is still above the core
     late = caption_y_for(close, late=True)
     assert CAPTION_LATE_MIN_Y <= late and late + CAPTION_BELOW + 40 <= core_top
     from hookline.quality import text_bbox
@@ -237,10 +237,10 @@ def test_late_caption_line_used_only_after_hook_and_tag():
     ys = [int(e.split("\\pos(474,")[1].split(")")[0]) for e in caps]
     assert ys == [900, 600, 900, 600]  # hook up; free; EARLIER tag 4.8-6.0 up; free
     # ONE ends 0.6 then TWO at 3.2 (> 1 s): tail; TWO. ends 3.6, held until the seam (4.8)
-    assert caps[1].startswith("Dialogue: 0,0:00:03.20,0:00:03.90,")
+    assert caps[1].startswith("Dialogue: 0,0:00:03.13,0:00:03.90,")  # 2 frames early
     ass = build_ass([w(4.0, 4.4, "BEFORE"), w(5.0, 5.4, "AFTER")], "", 9, seam=4.6)
     caps = [e for e in _events(ass) if ",Cap," in e]
-    assert caps[0].startswith("Dialogue: 0,0:00:04.00,0:00:04.60,")  # not bleeding past seam
+    assert caps[0].startswith("Dialogue: 0,0:00:03.93,0:00:04.60,")  # not bleeding past seam
 
 
 def test_caption_line_weighs_every_face_scene_by_duration():
@@ -334,7 +334,7 @@ def test_rendered_caption_cap_height(tmp_path):
     frame = _render(tmp_path, build_ass([w(0, 1, "test")], "", 2), 0.5)
     box = text_bbox(frame, "yellow")  # the active word
     assert box is not None
-    assert 64 <= box[3] - box[1] + 1 <= 72
+    assert 72 <= box[3] - box[1] + 1 <= 80  # wave D: ~12% larger (75-76 px)
 
 
 def test_rendered_hook_cap_height(tmp_path):
@@ -377,13 +377,14 @@ def test_coverage_long_gap_ends_shortly_after_last_word():
     assert iv[1][1] == pytest.approx(1.2)  # "two." ends 0.9 + 0.3; the 1.6 s gap is not held
     assert iv[-1][1] == pytest.approx(3.2)  # last group: word end + 0.3
     held = _cap_intervals(build_ass([w(0, 0.4, "a."), w(1.3, 1.6, "b")], "", 10))
-    assert held[0][1] == pytest.approx(1.3)  # 0.9 s gap: held until the next group
+    # 0.9 s gap: held until the next group appears (2 frames before its word at 1.3)
+    assert held[0][1] == pytest.approx(1.3 - 2 / 30, abs=0.006)
 
 
 def test_held_last_word_stays_highlighted():
     ass = build_ass([w(0, 0.4, "one"), w(0.5, 0.9, "two."), w(1.5, 2, "three")], "", 5)
     cap = [e for e in _events(ass) if ",Cap," in e]
-    assert "0:00:01.50" in cap[1].split(",")[2]
+    assert "0:00:01.43" in cap[1].split(",")[2]  # until THREE's page appears
     assert "{\\c&H00FFFF&}TWO." in cap[1]
 
 
@@ -415,9 +416,9 @@ def test_caption_style_outline_and_shadow():
 
 def test_caption_y_clamped_to_safe_band():
     assert "{\\pos(474,1180)}" in build_ass([w(0, 1, "x")], "", 2, caption_y=1600)
-    assert "{\\pos(474,686)}" in build_ass([w(0, 1, "x")], "", 2, caption_y=400)
+    assert "{\\pos(474,689)}" in build_ass([w(0, 1, "x")], "", 2, caption_y=400)
     late = build_ass([w(0, 1, "x")], "", 2, caption_y=400, caption_y_late=300)
-    assert "{\\pos(474,550)}" in late  # the late line may rise to 550, no further
+    assert "{\\pos(474,553)}" in late  # the late line may rise to 553, no further
 
 
 def test_rendered_boxes_inside_q4_at_band_extremes(tmp_path):
@@ -526,9 +527,10 @@ def test_early_until_covers_hook_tag_and_groups_shown_with_them():
 
     assert early_until([], "Hook", 20) == 3.0
     assert early_until([], "Hook", 20, seam=5.0) == pytest.approx(6.2)  # 1.2 s EARLIER tag
-    # a group starting under the hook (2.8 s) holds until the next one (3.6 s, gap <= 1 s)
+    # a group starting under the hook (2.8 s) holds until the next one appears (3.6 s less
+    # 2 frames, gap <= 1 s)
     ws = [w(2.6, 2.8, "SO."), w(2.8, 3.4, "LONG."), w(3.6, 4.0, "NEXT.")]
-    assert early_until(ws, "Hook", 20) == pytest.approx(3.6)
+    assert early_until(ws, "Hook", 20) == pytest.approx(3.6 - 2 / 30)
 
 
 # --- M2.5 wave B: caption pages break at cuts and the seam; face rects follow the zoom plan --
@@ -602,4 +604,50 @@ def test_word_running_past_a_cut_opens_the_next_page():
     assert not any("BEFORE" in t and "STRADDLES" in t for _, _, t in spans)
     # a short overrun (<= 0.15 s) stays on its page, clipped at the cut
     short = _cap_spans(build_ass([w(1.5, 2.1, "brief"), w(2.4, 2.8, "next")], "", 5, breaks=[2.0]))
-    assert short[0][0] == pytest.approx(1.5) and short[0][1] == pytest.approx(2.0)
+    assert short[0][0] == pytest.approx(1.5 - 2 / 30, abs=0.006)
+    assert short[0][1] == pytest.approx(2.0)
+
+
+# --- wave D: pages lead speech by 2 frames; larger captions ------------------------------
+
+
+def test_pages_appear_two_frames_before_their_first_word():
+    ws = [w(1.0, 1.4, "one"), w(1.4, 1.8, "two."), w(3.0, 3.4, "three"), w(3.4, 3.9, "four.")]
+    spans = _cap_spans(build_ass(ws, "", 6))
+    assert spans[0][0] == pytest.approx(0.93, abs=0.006)  # 1.0 - 2/30, centisecond grid
+    page2 = next(sp for sp in spans if "THREE" in sp[2])
+    assert page2[0] == pytest.approx(2.93, abs=0.006)
+    # the first word lights up with its page; the next word still at its own start
+    assert "{\\c&H00FFFF&}ONE" in spans[0][2]
+    assert next(sp for sp in spans if "{\\c&H00FFFF&}TWO" in sp[2])[0] == pytest.approx(1.4)
+    for (_, e0, _), (s1, _, _) in pairwise(spans):
+        assert e0 <= s1 + 1e-9  # never two captions at once
+
+
+def test_page_lead_never_crosses_a_cut_the_start_or_the_previous_word():
+    at_cut = _cap_spans(build_ass([w(0.5, 0.9, "a."), w(2.03, 2.4, "b")], "", 4, breaks=[2.0]))
+    assert at_cut[-1][0] == pytest.approx(2.0)  # not before the cut
+    first = _cap_spans(build_ass([w(0.03, 0.4, "go")], "", 2))
+    assert first[0][0] == 0.0
+    tight = _cap_spans(build_ass([w(0.0, 0.5, "end."), w(0.52, 0.9, "next")], "", 2))
+    assert tight[0][1] > tight[0][0] and tight[1][0] >= 0.0 + 0.05  # previous word keeps a beat
+
+
+def test_caption_font_is_larger_than_the_hook_and_stays_inside_q4(tmp_path):
+    from hookline.captions.ass import CAP_FONT_SIZE, FONT_SIZE
+
+    ass = build_ass([w(0, 0.3, "no")], hook_text="Hi", duration=5)
+    assert f"Style: Cap,Anton,{CAP_FONT_SIZE}," in ass and f"Style: Hook,Anton,{FONT_SIZE}," in ass
+    assert 1.10 * 136 <= CAP_FONT_SIZE <= 1.15 * 136
+    for words in (
+        [w(0, 1, "WWWWWW"), w(1, 2, "MMMMM"), w(2, 3, "WWWWW")],
+        [w(0, 1, "INCREDIBLE"), w(1, 2, "TEST")],
+        [w(0, 1, "abcdefghij"), w(1, 2, "klmnopq")],
+    ):
+        for cy in (1180, 689, 553):
+            text = build_ass(words, "", 4, caption_y=cy, caption_y_late=cy)
+            box = _grey(tmp_path, text)
+            assert box is not None and _inside_q4(box), (cy, box)
+            from hookline.quality import line_heights
+
+            assert len(line_heights(_render(tmp_path, text, 0.5), dense=0.4)) == 1  # one line
