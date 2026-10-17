@@ -275,8 +275,8 @@ def test_system_prompt_covers_brief():
         "8 words",
         "best first",
         "timestamp of the line after",
-        "ONE WHOLE SENTENCE",
-        "at most 3 seconds",
+        "short phrase or sentence",
+        "at most 5 seconds",
         '"And", "So", "But", "Because", "Which"',
         "introduces the subject",
         "score `hook` and `context` lower",
@@ -334,10 +334,20 @@ def test_cold_open_teasing_final_line_is_snapped_and_kept(long_transcript, fake_
 
 
 def test_cold_open_snapped_longer_than_limit_is_removed(long_transcript, fake_llm, settings):
-    # 45.0-48.5 snaps to 45.0-50.3 (two sentences, 5.3s)
-    fake_llm.queue({"clips": [raw(30, 60, cold_open=(45.0, 48.5))]}, EMPTY)
+    # 45.0-51.0 snaps to 45.0-50.3 (5.3s)
+    fake_llm.queue({"clips": [raw(30, 60, cold_open=(45.0, 51.0))]}, EMPTY)
     (p,) = select_clips(long_transcript, fake_llm, settings)
     assert p.cold_open is None
+
+
+def test_cold_open_snaps_to_words_and_allows_5s(long_transcript, fake_llm, settings):
+    # words: 45.0-45.5, 45.6-46.1, 46.2-46.7, 46.8-47.3, 48.0-48.5 ...
+    fake_llm.queue({"clips": [raw(30, 60, cold_open=(45.5, 48.4))]}, EMPTY)
+    (p,) = select_clips(long_transcript, fake_llm, settings)
+    assert p.cold_open == (45.6, 48.5)  # mid-sentence word boundaries, 2.9s
+    fake_llm.queue({"clips": [raw(30, 60, cold_open=(45.0, 50.0))]}, EMPTY)
+    (p,) = select_clips(long_transcript, fake_llm, settings)
+    assert p.cold_open == (45.0, 49.7)  # 4.7s: more than the old 3.5s cap
 
 
 def test_cold_open_pushing_over_max_length_is_dropped_pick_kept(
@@ -398,9 +408,9 @@ def test_dropped_cold_open_outside_clip_logs_reason(long_transcript, fake_llm, s
 
 def test_dropped_cold_open_too_long_logs_reason(long_transcript, fake_llm, settings, caplog):
     msgs = _cold_open_warnings(
-        caplog, fake_llm, long_transcript, settings, raw(30, 60, cold_open=(45.0, 48.5))
+        caplog, fake_llm, long_transcript, settings, raw(30, 60, cold_open=(45.0, 51.0))
     )
-    assert len(msgs) == 1 and "Clip at 30" in msgs[0] and "exceeds the 3.5s cap" in msgs[0]
+    assert len(msgs) == 1 and "Clip at 30" in msgs[0] and "exceeds the 5.0s cap" in msgs[0]
 
 
 def test_dropped_cold_open_over_max_length_logs_reason(long_transcript, fake_llm, settings, caplog):
