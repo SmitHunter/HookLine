@@ -71,6 +71,7 @@ def render_clip(
             refined.segments(),
             silences,
             settings.max_pause_s,
+            settings.dead_air_pad_s,
             words=near if protect_words else None,
         ),
         fps,

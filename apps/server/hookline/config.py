@@ -52,7 +52,8 @@ class Settings(BaseModel):
     cookies_from_browser: str | None = None
     vertical: bool = True
     captions: bool = True
-    max_pause_s: float = 0.4
+    max_pause_s: float = 0.6
+    dead_air_pad_s: float = 0.12
     silence_db: float = -32.0
     facecam: Box | None = None
     chat: bool = True

@@ -1,6 +1,7 @@
 from hookline.models import Word
 
 MIN_RANGE = 0.05
+MIN_PIECE_S = 1.5  # a cut may not leave a kept piece shorter than this (choppy jump cuts)
 MIN_WORD_S = 0.05  # captions drop shorter words; edge-clipped words are stretched to this
 
 
@@ -24,12 +25,17 @@ def _word_free(
 def keep_ranges(
     segments: list[tuple[float, float]],
     silences: list[tuple[float, float]],
-    max_pause: float = 0.4,
-    pad: float = 0.08,
+    max_pause: float = 0.6,
+    pad: float = 0.12,
     min_keep_ratio: float = 0.5,
     words: list[Word] | None = None,
+    min_piece_s: float = MIN_PIECE_S,
 ) -> list[tuple[float, float]]:
     """Cut long silences out of each segment, keeping `pad` on each side.
+
+    When a cut would leave a kept piece shorter than `min_piece_s`, the cut with the smaller
+    removal next to that piece is dropped, repeated until every piece is long enough (or has
+    no cuts left to drop).
 
     With `words`, each word's span (widened by `pad`) is first removed from the silences, so
     a cut never lands inside a transcribed word; only word-free pieces longer than
@@ -39,14 +45,13 @@ def keep_ranges(
         silences = [p for sil in silences for p in _word_free(sil, spans)]
     kept: list[tuple[float, float]] = []
     for seg_start, seg_end in segments:
-        cursor = seg_start
         inside = sorted(
             (s, e) for s, e in silences if s >= seg_start and e <= seg_end and e - s > max_pause
         )
-        for s, e in inside:
-            cut_start, cut_end = s + pad, e - pad
-            if cut_end <= cut_start:
-                continue
+        cuts = [(s + pad, e - pad) for s, e in inside if e - pad > s + pad]
+        cuts = _drop_short_pieces(seg_start, seg_end, cuts, min_piece_s)
+        cursor = seg_start
+        for cut_start, cut_end in cuts:
             kept.append((cursor, cut_start))
             cursor = cut_end
         kept.append((cursor, seg_end))
@@ -55,6 +60,23 @@ def keep_ranges(
     if sum(e - s for s, e in kept) < min_keep_ratio * original:
         return list(segments)
     return kept
+
+
+def _drop_short_pieces(
+    seg_start: float, seg_end: float, cuts: list[tuple[float, float]], min_piece: float
+) -> list[tuple[float, float]]:
+    """Drop cuts until no kept piece between them is shorter than `min_piece`."""
+    cuts = list(cuts)
+    while cuts:
+        bounds = [seg_start, *(x for c in cuts for x in c), seg_end]
+        pieces = list(zip(bounds[::2], bounds[1::2], strict=True))
+        short = next((i for i, (a, b) in enumerate(pieces) if b - a < min_piece - 1e-9), None)
+        if short is None:
+            break
+        # piece i lies between cut i-1 (before) and cut i (after)
+        around = [j for j in (short - 1, short) if 0 <= j < len(cuts)]
+        del cuts[min(around, key=lambda j: cuts[j][1] - cuts[j][0])]
+    return cuts
 
 
 MERGE_GAP_S = 0.15
