@@ -591,3 +591,15 @@ def test_face_rects_follow_the_planned_zoom():
     a = 0.1 * 1920
     assert p1 == pytest.approx(a + 1.1 * (0.5 * 1920 - a))  # chin mapped about the anchor
     assert p1 - p0 == pytest.approx(1.1 * 0.2 * 1920 * 0.8)  # core = bottom 80%, base zoom
+
+
+def test_word_running_past_a_cut_opens_the_next_page():
+    ws = [w(1.0, 1.4, "before"), w(1.5, 2.3, "straddles"), w(2.4, 2.8, "after")]
+    spans = _cap_spans(build_ass(ws, "", 5, breaks=[2.0]))
+    page = min(sp for sp in spans if "STRADDLES" in sp[2])
+    assert page[0] == pytest.approx(2.0) and page[1] == pytest.approx(2.4)  # still captioned
+    assert all(not (st < 1.99 and en > 2.01) for st, en, _ in spans)
+    assert not any("BEFORE" in t and "STRADDLES" in t for _, _, t in spans)
+    # a short overrun (<= 0.15 s) stays on its page, clipped at the cut
+    short = _cap_spans(build_ass([w(1.5, 2.1, "brief"), w(2.4, 2.8, "next")], "", 5, breaks=[2.0]))
+    assert short[0][0] == pytest.approx(1.5) and short[0][1] == pytest.approx(2.0)

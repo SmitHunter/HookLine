@@ -51,6 +51,7 @@ class SceneLayout(BaseModel):
     base_zoom: float = 1.0
     zoom_cap: float | None = None
     zoom_anchor: float | None = None
+    step_shift: float = 0.0  # flat-zoom scene: share of the crop width its steps shift by
 
     def zoom_level(self, s: float) -> float:
         """Rendered zoom for schedule level `s` (1.0 / ZOOM_IN / ZOOM_TOP): base_zoom times

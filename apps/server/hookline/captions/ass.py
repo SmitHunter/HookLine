@@ -116,6 +116,7 @@ def _normalise(words: list[Word]) -> list[Word]:
 
 
 BREAK_SLACK_S = 0.01  # a word starting this little before a break still starts after it
+BREAK_CARRY_S = 0.15  # a word running further past a break moves to the page after it
 
 
 def _crosses(a: float, b: float, breaks: Sequence[float]) -> bool:
@@ -125,6 +126,19 @@ def _crosses(a: float, b: float, breaks: Sequence[float]) -> bool:
 
 def _next_break(t: float, breaks: Sequence[float]) -> float:
     return min((x for x in breaks if x > t + BREAK_SLACK_S), default=math.inf)
+
+
+def _at_breaks(words: list[Word], breaks: Sequence[float]) -> list[Word]:
+    """A word running more than BREAK_CARRY_S past a break it straddles starts at the break,
+    so it opens the new page there (still captioned) instead of being clipped off the old
+    one. A shorter overrun stays on the old page, clipped at the break."""
+    out = []
+    for word in words:
+        nb = _next_break(word.start, breaks)
+        if word.end - nb > BREAK_CARRY_S:
+            word = word.model_copy(update={"start": nb})
+        out.append(word)
+    return out
 
 
 def group_words(
@@ -302,7 +316,8 @@ def early_until(
     under the hook may hold into a later scene). Pass it as `until` to caption_y_for and
     hook_y_for so they consider every scene on screen until then. `breaks` as for build_ass."""
     windows = _windows(bool(_layout_hook(hook_text)[0]), duration, seam)
-    groups = group_words(_normalise(words), breaks=_breaks(breaks, seam))
+    cuts = _breaks(breaks, seam)
+    groups = group_words(_at_breaks(_normalise(words), cuts), breaks=cuts)
     holds = _hold_ends(groups, duration, seam, breaks)
     shown = [h for h, early in zip(holds, _early(groups, holds, windows), strict=True) if early]
     return max([HOOK_S, windows[2], *shown])
@@ -344,7 +359,7 @@ def build_ass(
     if caption_y_late is not None:
         cy_late = min(max(caption_y_late, CAPTION_LATE_MIN_Y), CAPTION_MAX_Y)
     cuts = _breaks(breaks, seam)
-    groups = group_words(_normalise(words), breaks=cuts)
+    groups = group_words(_at_breaks(_normalise(words), cuts), breaks=cuts)
     holds = _hold_ends(groups, duration, seam, breaks)
     for group, hold_end, early in zip(groups, holds, _early(groups, holds, windows), strict=True):
         texts = [word.text.upper() for word in group]

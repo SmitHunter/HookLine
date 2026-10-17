@@ -48,7 +48,12 @@ SMALL_FACE = 0.20
 FACE_TARGET = 0.22
 MAX_UPSCALE = 2.5
 MAX_ZOOM = 1.4
+MAX_BASE = 1.25
 HEADROOM = 0.04  # the head top (face top - half a face height) stays this share below the top
+# A scene whose zoom levels the headroom flattens (top <= base + FLAT_ZOOM) shifts its crop
+# sideways by STEP_SHIFT of the crop width at each step instead (FACE_TRACK).
+FLAT_ZOOM = 0.03
+STEP_SHIFT = 0.04
 _CAP_STEP = 0.005
 
 _CROP_RE = re.compile(r"crop=(\d+):(\d+):(\d+):(\d+)")
@@ -324,13 +329,17 @@ def _fill(w: int, h: int, flags: str = "") -> str:
 def _smooth(
     keyframes: list[tuple[float, float]], allow: float | None = None
 ) -> list[tuple[float, float]]:
-    """EMA (alpha 0.3) chasing a deadbanded target: the target jumps to the raw value only
-    when it differs by more than 0.05; the output eases toward the target every step. With
-    `allow`, the output never lags more than that behind the raw value (the face stays in the
-    crop when it moves fast, e.g. a lean)."""
+    """EMA (alpha 0.3) chasing a deadbanded target over the median-of-3 of consecutive raw
+    values (a single stray detection, e.g. another face for one sample, is ignored): the
+    target jumps to that value only when it differs by more than 0.05; the output eases toward
+    the target every step. With `allow`, the output never lags more than that behind it (the
+    face stays in the crop when it moves fast, e.g. a lean)."""
+    pts = sorted(keyframes)
+    xs = [x for _, x in pts]
+    med = [sorted((xs[max(i - 1, 0)], x, xs[min(i + 1, len(xs) - 1)]))[1] for i, x in enumerate(xs)]
     out: list[tuple[float, float]] = []
     target = smoothed = 0.0
-    for i, (t, x) in enumerate(sorted(keyframes)):
+    for i, ((t, _), x) in enumerate(zip(pts, med, strict=True)):
         if i == 0:
             target = smoothed = x
         else:
@@ -368,11 +377,13 @@ def track_x_expr(
 ) -> str:
     """ffmpeg expression (in `t`) for the crop's left edge: piecewise-linear over smoothed,
     clamped keyframes (normalized centre x). The smoothing never lets the face (`face_w`,
-    normalized; 0 when unknown) of a keyframe come closer than TRACK_MARGIN of the crop width
-    to the crop's edge. Commas are NOT escaped."""
+    normalized; 0 when unknown) come closer than TRACK_MARGIN of the crop width to the crop's
+    edge (against the median-of-3 position; never tighter than half the deadband, so jitter
+    stays smoothed). A face too wide for that (a tight close-up) is not contained: the
+    deadband alone holds the crop still. Commas are NOT escaped."""
     hi = max(in_w - crop_w, 0)
     room = crop_w / 2 - (face_w or 0.0) * in_w / 2 - TRACK_MARGIN * crop_w
-    allow = max(room, 0.0) / in_w
+    allow = max(room / in_w, TRACK_DEADBAND / 2) if room > 0 else None
     pts = [(t, min(max(s * in_w - crop_w / 2, 0.0), hi)) for t, s in _smooth(keyframes, allow)]
     if not pts:
         return _fmt(hi / 2)
@@ -422,6 +433,8 @@ def zoom_schedule(
         near = [c for c in cuts if abs(c - e) < ZOOM_MIN_STEP]
         if near:
             e = min(near, key=lambda c: abs(c - e))
+            if e < ZOOM_MIN_STEP:
+                continue  # its cut is too close to the start: that cut's own step stands
         if not punches or e >= punches[-1] + punch_len + ZOOM_MIN_STEP:
             punches.append(e)
     events: list[tuple[float, str]] = []
@@ -593,7 +606,10 @@ def scene_filter(
     if kind == "FACE_TRACK":
         cw = _track_w(in_w, in_h)
         rel = [(t - layout.start, x) for t, x in layout.track_x]
-        x = track_x_expr(rel, in_w, cw, layout.face_w).replace(",", r"\,")
+        x = track_x_expr(rel, in_w, cw, layout.face_w)
+        if layout.step_shift and zoom_steps:
+            x = _shifted(x, layout, zoom_steps, in_w, cw)
+        x = x.replace(",", r"\,")
         ay = layout.anchor_px(OUT_H)
         return (
             f"[{label_in}]crop={cw}:{_even(in_h)}:{x}:0,scale={OUT_W}:{OUT_H}{flags}"
@@ -615,6 +631,20 @@ def scene_filter(
             f"[{label_out}_top][{label_out}_bot]vstack,setsar=1[{label_out}]"
         )
     return _fit_blur(label_in, label_out, in_w, in_h, zoom, flags)
+
+
+def _shifted(
+    x: str, layout: SceneLayout, steps: Sequence[Sequence[float]], in_w: int, cw: int
+) -> str:
+    """Crop-left expression `x` plus a sideways shift that alternates 0 / STEP_SHIFT of the
+    crop width at every zoom step (eased like a zoom step), towards the side with more room
+    (from the median track position), clamped to the frame."""
+    xs = sorted(v for _, v in layout.track_x) or [0.5]
+    sign = -1 if xs[len(xs) // 2] > 0.5 else 1
+    shift = sign * STEP_SHIFT * cw
+    alt = [(float(t), shift if i % 2 else 0.0) for i, (t, _) in enumerate(steps)]
+    off = zoom_expr(alt, offset=layout.start, length=layout.end - layout.start)
+    return f"min(max(({x})+({off}),0),{_fmt(max(in_w - cw, 0))})"
 
 
 def _panel_y(layout: SceneLayout, y: float, in_w: int, in_h: int) -> tuple[float, float]:
@@ -656,19 +686,21 @@ def plan_zoom(layout: SceneLayout, in_w: int, in_h: int) -> SceneLayout:
     """The scene with its zoom plan (base_zoom, zoom_cap, zoom_anchor) filled in:
 
     - soft source (upscale > UPSCALE_SOFT): every level, punches included, <= ZOOM_IN;
-    - small FACE_TRACK face (< SMALL_FACE of the output height): a base zoom toward
-      FACE_TARGET, with every level <= MAX_ZOOM total zoom and MAX_UPSCALE total upscale,
-      leaving room for the full step range above the base (cut steps and punches keep their
-      size);
+    - small FACE_TRACK face (< SMALL_FACE of the output height) on a sharper source (upscale
+      <= UPSCALE_SOFT; soft sources get none): a base zoom toward FACE_TARGET, at most
+      MAX_BASE, with the step levels compressed into [base, MAX_ZOOM] and total upscale
+      <= MAX_UPSCALE;
     - headroom: the anchor row (and if need be a lower cap) keeps the head top >= HEADROOM of
-      the panel height below its top at every level (`_headroom`)."""
+      the panel height below its top at every level (`_headroom`);
+    - a scene whose levels end up (nearly) flat (top level <= base + FLAT_ZOOM) gets
+      `step_shift`: its steps shift the crop sideways instead, so cuts still change framing."""
     up = scene_upscale(layout, in_w, in_h)
     cap: float | None = ZOOM_IN if up > UPSCALE_SOFT else None
     base = 1.0
     face_h = layout.face_box[1] if layout.face_box else 0.0
-    if _kind(layout) == "FACE_TRACK" and 0 < face_h < SMALL_FACE:
-        room = min(MAX_ZOOM, MAX_UPSCALE / up, cap or MAX_ZOOM)
-        base = max(1.0, min(FACE_TARGET / face_h, room / ZOOM_PUNCH))
+    if _kind(layout) == "FACE_TRACK" and 0 < face_h < SMALL_FACE and up <= UPSCALE_SOFT:
+        room = min(MAX_ZOOM, MAX_UPSCALE / up)
+        base = max(1.0, min(FACE_TARGET / face_h, MAX_BASE, room))
         if base > 1.0:
             cap = room
     plan = layout.model_copy(update={"base_zoom": math.floor(base * 1e4) / 1e4, "zoom_cap": cap})
@@ -677,15 +709,18 @@ def plan_zoom(layout: SceneLayout, in_w: int, in_h: int) -> SceneLayout:
         return plan
     top, anchor = head
     if top < plan.zoom_level(ZOOM_TOP) - 1e-9:
-        base, cap = max(1.0, min(base, top / ZOOM_PUNCH)), top
+        base, cap = max(1.0, min(base, top / ZOOM_IN)), top
     ph = _panel_y(layout, 0.0, in_w, in_h)[1]
-    return plan.model_copy(
+    plan = plan.model_copy(
         update={
             "base_zoom": math.floor(base * 1e4) / 1e4,
             "zoom_cap": cap,
             "zoom_anchor": anchor / ph,
         }
     )
+    if plan.zoom_level(ZOOM_TOP) <= plan.zoom_level(1.0) + FLAT_ZOOM:
+        plan = plan.model_copy(update={"step_shift": STEP_SHIFT})
+    return plan
 
 
 def _merge_short(layouts: list[SceneLayout]) -> list[SceneLayout]:

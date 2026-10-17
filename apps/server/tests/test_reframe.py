@@ -59,7 +59,8 @@ def evaluate(expr: str, t: float) -> float:
         return 1 if a < b else 0
 
     py = expr.replace("if(", "_if(")
-    return float(eval(py, {"__builtins__": {}}, {"_if": _if, "lt": lt, "t": t}))
+    env = {"_if": _if, "lt": lt, "t": t, "min": min, "max": max}
+    return float(eval(py, {"__builtins__": {}}, env))
 
 
 def test_detect_crop_finds_letterbox(tmp_path):
@@ -670,20 +671,22 @@ def test_plan_zoom_soft_source_caps_every_level_and_uses_lanczos():
 
 def test_plan_zoom_small_face_gets_a_base_zoom_within_limits():
     small = SceneLayout(
-        start=0, end=4, kind="FACE_TRACK", track_x=[(0, 0.5)], face_box=(0.4, 0.12),
-        head_top=0.34,
+        start=0, end=4, kind="FACE_TRACK", track_x=[(0, 0.5)], face_box=(0.4, 0.15),
+        head_top=0.3,
     )  # fmt: skip
     plan = plan_zoom(small, 1920, 1080)  # 1.78x upscale
     up = scene_upscale(plan, 1920, 1080)
-    assert plan.base_zoom > 1.0
-    assert plan.zoom_level(1.0) * 0.12 <= 0.22 + 1e-9
-    for s in (1.0, ZOOM_IN, ZOOM_PUNCH):
-        assert plan.zoom_level(s) <= 1.4 + 1e-9 and plan.zoom_level(s) * up <= 2.5 + 1e-9
-    assert plan.zoom_level(ZOOM_IN) / plan.zoom_level(1.0) == pytest.approx(ZOOM_IN)
+    assert plan.base_zoom == pytest.approx(1.25)  # 15% -> 18.75% at the base level ...
+    assert plan.zoom_level(ZOOM_PUNCH) * 0.15 >= 0.21 - 1e-9  # ... ~21% at the top level
+    levels = [plan.zoom_level(s) for s in (1.0, ZOOM_IN, ZOOM_PUNCH)]
+    assert levels == sorted(set(levels))  # steps compressed into [base, 1.4], still distinct
+    assert levels[0] == pytest.approx(1.25) and levels[-1] <= 1.4 + 1e-9
+    assert all(v * up <= 2.5 + 1e-9 for v in levels)
     assert plan.model_dump()["base_zoom"] == plan.base_zoom  # recorded in the sidecar
-    # a big enough face, or a soft source, gets none
+    # a big enough face, or a soft source (> 2x upscale), gets none: 720p unchanged
     assert plan_zoom(small.model_copy(update={"face_box": (0.3, 0.25)}), 1920, 1080).base_zoom == 1
-    assert plan_zoom(small, 1280, 720).base_zoom == 1.0
+    soft = plan_zoom(small, 1280, 720)
+    assert soft.base_zoom == 1.0 and soft.zoom_cap == pytest.approx(1.12)
     flat = scene_filter(plan, 1920, 1080, "a", "b")  # no steps: the base zoom still applies
     assert "eval=frame" in flat
 
@@ -718,3 +721,62 @@ def test_plan_zoom_caps_the_level_when_head_and_chin_cannot_both_fit():
     assert plan.zoom_cap is not None and plan.zoom_cap < ZOOM_PUNCH
     for s in (1.0, ZOOM_IN, ZOOM_PUNCH):
         assert plan.zoom_y(0.92 * OUT_H, s, OUT_H) <= OUT_H + 1e-6
+
+
+# --- wave B review round 1 --------------------------------------------------------------
+
+
+def test_track_ignores_a_single_outlier_sample():
+    # another face for one 0.5 s sample: the crop must not pan towards it
+    kfs = (
+        [(i * 0.5, 0.4) for i in range(6)] + [(3.0, 0.8)] + [(3.5 + i * 0.5, 0.4) for i in range(6)]
+    )
+    for face_w in (None, 0.1):
+        expr = track_x_expr(kfs, in_w=1280, crop_w=404, face_w=face_w)
+        for t in (2.5, 3.0, 3.25, 3.5, 4.0, 6.0):
+            assert evaluate(expr, t=t) == pytest.approx(evaluate(expr, t=0))
+
+
+def test_track_wide_close_up_face_keeps_the_deadband():
+    # face_w 0.26 of a 1280 frame (333 px) leaves no room in a 404 px crop: no containment,
+    # so sub-deadband jitter must not move the crop sample by sample
+    kfs = [(0.0, 0.5)] + [(i * 0.5, 0.5 + (0.03 if i % 2 else -0.03)) for i in range(1, 16)]
+    expr = track_x_expr(kfs, in_w=1280, crop_w=404, face_w=0.26)
+    vals = {round(evaluate(expr, t=t), 3) for t, _ in kfs}
+    assert len(vals) == 1
+
+
+def test_track_containment_never_tighter_than_half_the_deadband():
+    # a face nearly as wide as the room left: jitter of +-0.02 (< deadband / 2) holds still
+    kfs = [(0.0, 0.5)] + [(i * 0.5, 0.5 + (0.02 if i % 2 else -0.02)) for i in range(1, 16)]
+    expr = track_x_expr(kfs, in_w=1280, crop_w=404, face_w=0.24)
+    assert len({round(evaluate(expr, t=t), 3) for t, _ in kfs}) == 1
+
+
+def test_zoom_schedule_punch_not_moved_onto_a_cut_before_min_step():
+    steps = zoom_schedule(10.0, [0.3], [0.6])
+    assert (0.3, ZOOM_IN) in steps  # the cut keeps its own step
+    assert all(s != ZOOM_PUNCH for _, s in steps)  # the punch would land at 0.3 s: dropped
+    assert all(t == 0 or t >= 0.3 for t, _ in steps)
+
+
+_FLAT = SceneLayout(
+    start=0, end=6, kind="FACE_TRACK", track_x=[(0, 0.3), (6, 0.3)], face_box=(0.3, 0.69),
+    head_top=0.05,
+)  # fmt: skip
+
+
+def test_plan_zoom_flat_headroom_scene_shifts_crop_at_each_step():
+    plan = plan_zoom(_FLAT, 3840, 2160)
+    assert plan.zoom_level(ZOOM_PUNCH) <= plan.zoom_level(1.0) + 0.03  # headroom flattened it
+    assert plan.step_shift == pytest.approx(0.04)
+    steps = [(0.0, 1.0), (2.0, ZOOM_IN), (4.0, 1.0)]
+    chain = scene_filter(plan, 3840, 2160, "a", "b", zoom_steps=steps)
+    x = chain.split("crop=", 1)[1].split(":", 3)[2].replace("\\,", ",")
+    cw = 1214  # _track_w(3840, 2160)
+    a, b, c = (evaluate(x, t) for t in (1.0, 3.0, 5.0))
+    assert b - a == pytest.approx(0.04 * cw, abs=1)  # track at 0.3: shifts right (more room)
+    assert c == pytest.approx(a)
+    assert "step_shift" in plan.model_dump()
+    # a scene with room to zoom gets no shift
+    assert plan_zoom(_SOFT_TRACK, 3840, 2160).step_shift == 0.0
