@@ -180,3 +180,52 @@ def long_sentences(long_transcript: Transcript) -> list[Sentence]:
 @pytest.fixture
 def short_transcript() -> Transcript:
     return _synthetic_transcript(60.0)
+
+
+def _lavfi_wav(dst: Path, *sources: str) -> Path:
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
+    for s in sources:
+        cmd += ["-f", "lavfi", "-i", s]
+    n = len(sources)
+    cmd += ["-filter_complex", f"{''.join(f'[{i}:a]' for i in range(n))}concat=n={n}:v=0:a=1[a]"]
+    cmd += ["-map", "[a]", "-c:a", "pcm_s16le", str(dst)]
+    subprocess.run(cmd, check=True)
+    return dst
+
+
+@pytest.fixture(scope="session")
+def tone_gap_wav(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """16 kHz mono: 1 s tone, 1 s silence, 2 s tone."""
+    return _lavfi_wav(
+        tmp_path_factory.mktemp("audio") / "tone_gap.wav",
+        "sine=frequency=440:sample_rate=16000:duration=1",
+        "anullsrc=r=16000:cl=mono:d=1",
+        "sine=frequency=440:sample_rate=16000:duration=2",
+    )
+
+
+@pytest.fixture(scope="session")
+def tone_wav(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """16 kHz mono: 3 s continuous tone."""
+    return _lavfi_wav(
+        tmp_path_factory.mktemp("audio") / "tone.wav",
+        "sine=frequency=440:sample_rate=16000:duration=3",
+    )
+
+
+FIXTURES = Path(__file__).parent / "fixtures"
+
+
+@pytest.fixture(scope="session")
+def synthetic_stream(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """3 s 1920x1080 testsrc2 with portrait.jpg (400 px tall) as a top-right facecam."""
+    out = tmp_path_factory.mktemp("stream") / "stream.mp4"
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+         "-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=25:duration=3",
+         "-loop", "1", "-i", str(FIXTURES / "portrait.jpg"),
+         "-filter_complex", "[1:v]scale=-2:400[cam];[0:v][cam]overlay=W-w-40:40:shortest=1[v]",
+         "-map", "[v]", "-t", "3", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(out)],
+        check=True,
+    )  # fmt: skip
+    return out

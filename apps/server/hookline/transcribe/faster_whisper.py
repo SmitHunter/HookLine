@@ -12,6 +12,11 @@ class FasterWhisperBackend:
         self.compute_type = compute_type
         self._model = None
 
+    @property
+    def cache_key(self) -> dict:
+        """What the transcript depends on; a cached transcript with another key is stale."""
+        return {"backend": "faster-whisper", "model": self.model_name, "dtw": None}
+
     def _load(self):
         if self._model is None:
             from faster_whisper import WhisperModel
@@ -31,4 +36,4 @@ class FasterWhisperBackend:
                 words.append(Word(start=w.start, end=w.end, text=w.word, prob=w.probability))
             if on_progress and info.duration:
                 on_progress(min(seg.end / info.duration, 1.0))
-        return words_to_transcript(words, info.language, info.duration)
+        return words_to_transcript(words, info.language, info.duration, timing="whisper")

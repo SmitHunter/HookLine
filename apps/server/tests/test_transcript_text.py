@@ -69,3 +69,29 @@ def test_clip_pick_json_roundtrip_with_total(sample_pick):
     back = ClipPick.model_validate_json(p.model_dump_json())
     assert back.cold_open == (50.0, 52.5)
     assert back == p
+
+
+def test_compact_appends_markers():
+    out = compact_transcript([Sentence(start=50, end=53, text="No way.")], {51: ["🔊loud"]})
+    assert out == "[00:50.0] No way. ⟨🔊loud⟩"
+
+
+def test_compact_marker_window_is_half_open_and_ordered_deduped():
+    sents = [Sentence(start=10, end=12, text="A."), Sentence(start=12, end=14, text="B.")]
+    out = compact_transcript(sents, {10: ["🔥chat×4"], 11: ["🔊loud", "🔥chat×4"], 12: ["🔊loud"]})
+    assert out == "[00:10.0] A. ⟨🔥chat×4 🔊loud⟩\n[00:12.0] B. ⟨🔊loud⟩"
+
+
+def test_compact_no_markers_unchanged():
+    assert compact_transcript([Sentence(start=1, end=2, text="Hi.")], {}) == "[00:01.0] Hi."
+
+
+def test_compact_pause_markers_attach_to_next_sentence():
+    sents = [Sentence(start=10, end=12, text="A."), Sentence(start=15, end=17, text="B.")]
+    out = compact_transcript(sents, {11: ["x"], 13: ["pause"], 20: ["late"]})
+    assert out == "[00:10.0] A. ⟨x⟩\n[00:15.0] B. ⟨pause late⟩"
+
+
+def test_compact_markers_before_first_sentence_attach_to_it():
+    sents = [Sentence(start=10, end=12, text="A.")]
+    assert compact_transcript(sents, {3: ["early"]}) == "[00:10.0] A. ⟨early⟩"

@@ -1,8 +1,16 @@
 # Hookline
 
-Hookline turns a long video, such as a stream VOD, podcast or interview, into 5 short clips. It downloads the video (or takes a local file), transcribes it with Whisper (GPU-accelerated whisper.cpp where available, faster-whisper otherwise), has Claude pick the 5 best self-contained moments from the transcript, and cuts each one with ffmpeg into an MP4 plus a JSON sidecar (title, hook text, reason, rubric scores).
+Hookline turns a long video, such as a stream VOD, podcast or interview, into 5 short vertical clips. It downloads the video (or takes a local file), transcribes it with Whisper (GPU-accelerated whisper.cpp with word-level DTW timestamps where available, faster-whisper otherwise), has Claude pick the 5 best self-contained moments, and renders each one with ffmpeg into a 1080x1920 MP4 plus a JSON sidecar (title, hook text, reason, rubric scores, layout, keep ranges, removed seconds).
 
-**Status:** M1: CLI pipeline; web UI, reframing, captions and animated edits coming. Today's output is horizontal clips cut from the source with the original framing and no captions.
+**Status:** M2: the CLI pipeline produces captioned vertical clips. There is no web UI yet, and no Remotion/HyperFrames animated edits yet.
+
+Features:
+
+- Vertical 9:16 reframing, chosen per scene: STACKED (facecam over gameplay, including Twitch facecam stacking), FACE_TRACK (follows the speaker), SPLIT (two people side by side), and FIT_BLUR (full frame over a blurred background).
+- Burned-in word-by-word captions and a 3 s hook title at the start of each clip.
+- Dead-air removal: long pauses inside a clip are cut out.
+- Silence-snapped cuts: clip boundaries move to the nearest low-energy point in the audio.
+- Chat- and loudness-aware picks: Claude also sees audio loudness peaks and, for Twitch VODs, chat activity.
 
 ## Quickstart
 
@@ -23,7 +31,14 @@ uv run hookline run <url-or-file>
 
 Without the GPU whisper.cpp build, the first run downloads the Whisper model (~1.6 GB) and transcribes on CPU at about 2x realtime. `workspace/` and `output/` are created in the current directory.
 
-Clips land in `output/<job_id>/NN-<slug>.mp4` with a matching `.json`. Intermediate artifacts (download, audio, transcript, picks) are cached in `workspace/<job_id>/`, so re-running the same source skips finished stages and only re-cuts. Options: `--clips N`, `--backend claude-code|api`, `--model`, `--out DIR`.
+Clips land in `output/<job_id>/NN-<slug>.mp4` with a matching `.json`. Intermediate artifacts (download, audio, transcript, picks) are cached in `workspace/<job_id>/`, so re-running the same source skips finished stages and only re-cuts. Options: `--clips N`, `--backend claude-code|api`, `--model`, `--out DIR`, plus:
+
+- `--horizontal`: keep the source aspect ratio instead of reframing to 9:16.
+- `--no-captions`: do not burn in captions or the hook title.
+- `--no-chat`: skip the Twitch chat download and chat signals.
+- `--facecam X,Y,W,H`: facecam box as 0-1 fractions of the frame, overriding auto-detection.
+
+The first vertical run downloads a small face-detection model, and for Twitch VODs also TwitchDownloaderCLI, into `tools/`.
 
 ## How clips are picked
 
@@ -47,7 +62,9 @@ powershell -ExecutionPolicy Bypass -File scripts/build-whisper-vulkan.ps1
 
 Hookline then picks whisper.cpp automatically: when `HOOKLINE_WHISPER_CPP_BIN` and `HOOKLINE_WHISPER_CPP_MODEL` are unset, it looks for `<repo>/tools/bin/whisper-cli.exe` and `<repo>/tools/models/ggml-large-v3-turbo.bin` (`whisper-cli` on non-Windows) and uses them if they exist. To use a different build or model, set those two variables to your own paths. With neither the variables nor those files it falls back to faster-whisper. `hookline run` prints which backend it is using.
 
-Run `hookline doctor` to confirm the whisper.cpp row is OK.
+Run `hookline doctor` to confirm the whisper.cpp row is OK. Doctor also has a "GPU (whisper.cpp)" row: it runs `vulkaninfo --summary` (when installed) and lists the Vulkan devices, flagging "discrete GPU not visible — check driver" when no discrete GPU shows up.
+
+During transcription Hookline logs the Vulkan device whisper.cpp runs on and warns if it is an integrated GPU (`uma`), which usually means the discrete GPU's driver failed to load. whisper.cpp uses device 0 by default; set `HOOKLINE_WHISPER_DEVICE=<n>` to pick another one (passed as `-dev <n>`; the warning suggests the index of the first discrete device).
 
 | Backend | Hardware | Speed (`large-v3-turbo`) |
 |---|---|---|

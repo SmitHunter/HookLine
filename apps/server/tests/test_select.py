@@ -275,11 +275,14 @@ def test_system_prompt_covers_brief():
         "8 words",
         "best first",
         "timestamp of the line after",
-        "ONE WHOLE SENTENCE",
-        "at most 3 seconds",
+        "short phrase or sentence",
+        "at most 5 seconds",
         '"And", "So", "But", "Because", "Which"',
         "introduces the subject",
         "score `hook` and `context` lower",
+        "⟨🔥chat×4 🔊loud⟩",
+        "audience and audio reactions",
+        "not a requirement",
     ):
         assert needle in SYSTEM_PROMPT
 
@@ -334,10 +337,20 @@ def test_cold_open_teasing_final_line_is_snapped_and_kept(long_transcript, fake_
 
 
 def test_cold_open_snapped_longer_than_limit_is_removed(long_transcript, fake_llm, settings):
-    # 45.0-48.5 snaps to 45.0-50.3 (two sentences, 5.3s)
-    fake_llm.queue({"clips": [raw(30, 60, cold_open=(45.0, 48.5))]}, EMPTY)
+    # 45.0-51.0 snaps to 45.0-50.3 (5.3s)
+    fake_llm.queue({"clips": [raw(30, 60, cold_open=(45.0, 51.0))]}, EMPTY)
     (p,) = select_clips(long_transcript, fake_llm, settings)
     assert p.cold_open is None
+
+
+def test_cold_open_snaps_to_words_and_allows_5s(long_transcript, fake_llm, settings):
+    # words: 45.0-45.5, 45.6-46.1, 46.2-46.7, 46.8-47.3, 48.0-48.5 ...
+    fake_llm.queue({"clips": [raw(30, 60, cold_open=(45.5, 48.4))]}, EMPTY)
+    (p,) = select_clips(long_transcript, fake_llm, settings)
+    assert p.cold_open == (45.6, 48.5)  # mid-sentence word boundaries, 2.9s
+    fake_llm.queue({"clips": [raw(30, 60, cold_open=(45.0, 50.0))]}, EMPTY)
+    (p,) = select_clips(long_transcript, fake_llm, settings)
+    assert p.cold_open == (45.0, 49.7)  # 4.7s: more than the old 3.5s cap
 
 
 def test_cold_open_pushing_over_max_length_is_dropped_pick_kept(
@@ -398,9 +411,9 @@ def test_dropped_cold_open_outside_clip_logs_reason(long_transcript, fake_llm, s
 
 def test_dropped_cold_open_too_long_logs_reason(long_transcript, fake_llm, settings, caplog):
     msgs = _cold_open_warnings(
-        caplog, fake_llm, long_transcript, settings, raw(30, 60, cold_open=(45.0, 48.5))
+        caplog, fake_llm, long_transcript, settings, raw(30, 60, cold_open=(45.0, 51.0))
     )
-    assert len(msgs) == 1 and "Clip at 30" in msgs[0] and "exceeds the 3.5s cap" in msgs[0]
+    assert len(msgs) == 1 and "Clip at 30" in msgs[0] and "exceeds the 5.0s cap" in msgs[0]
 
 
 def test_dropped_cold_open_over_max_length_logs_reason(long_transcript, fake_llm, settings, caplog):
@@ -423,3 +436,36 @@ def test_raw_sink_receives_every_payload(long_transcript, fake_llm, settings):
     sink: list[dict] = []
     select_clips(long_transcript, fake_llm, settings, raw_sink=sink)
     assert sink == [first, EMPTY]
+
+
+def test_cold_open_without_whole_words_logs_reason(long_transcript, fake_llm, settings, caplog):
+    # 46.75-46.78 falls between words: snapped start (46.8) is after snapped end (46.7)
+    msgs = _cold_open_warnings(
+        caplog, fake_llm, long_transcript, settings, raw(30, 60, cold_open=(46.75, 46.78))
+    )
+    assert len(msgs) == 1 and "no whole words fit" in msgs[0]
+
+
+def test_markers_reach_the_prompt(long_transcript, fake_llm, settings):
+    fake_llm.queue(make_payload(8))
+    select_clips(long_transcript, fake_llm, settings, markers={31: ["🔊loud"]})
+    assert "⟨🔊loud⟩" in fake_llm.calls[0]["prompt"]
+
+
+def test_markers_reach_chunk_prompts(long_transcript, fake_llm, settings):
+    s = settings.model_copy(update={"max_prompt_tokens": 500})
+    fake_llm.queue_forever(make_payload(5))
+    select_clips(long_transcript, fake_llm, s, markers={31: ["🔊loud"], 400: ["🔊loud"]})
+    assert len(fake_llm.calls) > 1
+    assert sum("⟨🔊loud⟩" in c["prompt"] for c in fake_llm.calls) >= 2
+
+
+def test_chunk_prompts_keep_markers_on_their_own_lines(long_transcript, fake_llm, settings):
+    # a marker at the very end belongs to the transcript's last sentence only; a chunk ending
+    # earlier must not pull it onto its own last line
+    s = settings.model_copy(update={"max_prompt_tokens": 500})
+    fake_llm.queue_forever(make_payload(5))
+    select_clips(long_transcript, fake_llm, s, markers={599: ["🔥end"]})
+    prompts = [c["prompt"] for c in fake_llm.calls]
+    assert len(prompts) > 1
+    assert all("🔥end" not in p for p in prompts[:-1]) and "🔥end" in prompts[-1]

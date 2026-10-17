@@ -8,7 +8,7 @@ from pydantic import BaseModel, ValidationError
 
 from hookline.config import Settings
 from hookline.llm.base import LLMBackend, LLMError
-from hookline.models import ClipPick, RubricScores, Sentence, Transcript
+from hookline.models import ClipPick, RubricScores, Sentence, Transcript, Word
 from hookline.transcript_text import compact_transcript, format_timestamp, split_sentences
 
 logger = logging.getLogger(__name__)
@@ -26,6 +26,8 @@ line is `[timestamp] sentence`, where the timestamp is when the sentence starts,
 `mm:ss.s` (or `h:mm:ss.s` past the first hour) from the start of the video. You only have the \
 words, so read energy from them: exclamations, laughter, sudden reversals, arguments, reveals, \
 fails, wins, confessions and strong opinions.
+
+Some lines end with markers in angle brackets, such as `⟨🔥chat×4 🔊loud⟩`. They are audience and audio reactions inside that sentence: `🔥chat×N` means chat activity ran about N times the usual rate, and `🔊loud` means the audio got far louder than normal. Treat them as evidence of emotional intensity, not a requirement: a moment without markers can still be great, and a marked one can still be a poor clip.
 
 ## Your task
 
@@ -83,11 +85,11 @@ anything likely to be suppressed or removed by the platforms.
 the timestamp of the line after the clip's last line; the clip is cut where its last line \
 finishes, so that following line is not included. If the clip's last line is the final line of \
 the transcript, set `end` to the video duration.
-- `cold_open_start`, `cold_open_end`: when the natural opening is weak, set these to ONE WHOLE \
-SENTENCE from inside the clip (between `start` and `end`) that lasts at most 3 seconds; only \
-short, punchy sentences qualify. That sentence plays first as a teaser, then the clip runs from \
-`start`. Use it only when the clip needs its setup and the strongest line comes later. If no \
-such sentence exists, leave both fields null. Use the same convention as `start` and \
+- `cold_open_start`, `cold_open_end`: when the natural opening is weak, set these to a short \
+phrase or sentence from inside the clip (between `start` and `end`), at most 5 seconds, that \
+works as a hook; it need not be a whole sentence. That teaser plays first, then the clip runs \
+from `start`. Use it only when the clip needs its setup and the strongest line comes later. If \
+no such phrase exists, leave both fields null. Use the same convention as `start` and \
 `end`: `cold_open_start` is the timestamp of the teaser line, and `cold_open_end` is the \
 timestamp of the line after it (the video duration if the teaser is the transcript's final \
 line). The teaser may be the clip's own last line.
@@ -151,7 +153,8 @@ SELECTION_SCHEMA: dict = _object(
     }
 )
 
-_COLD_OPEN_MAX_S = 3.5
+_COLD_OPEN_MAX_S = 5.0
+_COLD_OPEN_TOLERANCE_S = 0.2
 _CHUNK_OVERLAP_S = 120.0
 _SNAP_TOLERANCE_S = 0.5
 
@@ -272,17 +275,29 @@ def _drop_cold_open(raw: _RawClip, reason: str) -> None:
     logger.warning("dropped cold open for clip %r: %s", raw.title, reason)
 
 
-def _cold_open(
-    raw: _RawClip, pick: ClipPick, sentences: list[Sentence], duration: float
-) -> tuple[float, float] | None:
-    """Snap the raw cold open like the clip itself; None unless it then lies inside the
-    (snapped) clip and is at most 3.5s long. Logs a warning naming the reason when dropped."""
+def _snap_to_words(start: float, end: float, words: list[Word]) -> tuple[float, float] | None:
+    """Start of the first word starting at/after `start - 0.2`; end of the last word ending
+    at/before `end + 0.2`. None if no words qualify or they do not form a span."""
+    starts = [w.start for w in words if w.start >= start - _COLD_OPEN_TOLERANCE_S]
+    ends = [w.end for w in words if w.end <= end + _COLD_OPEN_TOLERANCE_S]
+    if not starts or not ends or starts[0] >= ends[-1]:
+        return None
+    return starts[0], ends[-1]
+
+
+def _cold_open(raw: _RawClip, pick: ClipPick, words: list[Word]) -> tuple[float, float] | None:
+    """Snap the raw cold open to word boundaries; None unless it then lies inside the
+    (snapped) clip and is at most 5s long. Logs a warning naming the reason when dropped."""
     if raw.cold_open_start is None or raw.cold_open_end is None:
         return None
     if raw.cold_open_end <= raw.cold_open_start:
         _drop_cold_open(raw, "cold_open_end is not after cold_open_start")
         return None
-    co_s, co_e = _snap_span(raw.cold_open_start, raw.cold_open_end, sentences, duration)
+    snapped = _snap_to_words(raw.cold_open_start, raw.cold_open_end, words)
+    if snapped is None:
+        _drop_cold_open(raw, "no whole words fit inside the cold open range")
+        return None
+    co_s, co_e = snapped
     if not pick.start <= co_s < co_e <= pick.end:
         _drop_cold_open(raw, f"outside the clip ({co_s:.1f}-{co_e:.1f}s)")
         return None
@@ -297,6 +312,7 @@ def _cold_open(
 def _to_pick(
     raw: _RawClip,
     sentences: list[Sentence],
+    words: list[Word],
     duration: float,
     settings: Settings,
     exclude: list[tuple[float, float]],
@@ -317,7 +333,7 @@ def _to_pick(
         duration,
     )
     min_s, max_s = settings.min_clip_s * 0.75, settings.max_clip_s * 1.25
-    cold_open = _cold_open(raw, pick, sentences, duration)
+    cold_open = _cold_open(raw, pick, words)
     if cold_open:
         if pick.duration + (cold_open[1] - cold_open[0]) <= max_s:
             pick = pick.model_copy(update={"cold_open": cold_open})
@@ -353,14 +369,18 @@ def _ask(
     raise AssertionError("unreachable")
 
 
-def _chunks(sentences: list[Sentence], max_chars: int) -> list[list[Sentence]]:
+def _chunks(
+    sentences: list[Sentence], max_chars: int, markers: dict[int, list[str]] | None = None
+) -> list[list[Sentence]]:
     """Split sentences (one compact line each) into chunks of at most `max_chars` of new lines;
     each chunk after the first is prefixed with the previous chunk's final 2 minutes."""
     primaries: list[list[Sentence]] = []
     cur: list[Sentence] = []
     size = 0
-    for s in sentences:
-        line_len = len(compact_transcript([s])) + 1
+    # Line lengths from the whole transcript, so markers attach exactly as in the full text.
+    lines = compact_transcript(sentences, markers).split("\n")
+    for s, line in zip(sentences, lines, strict=True):
+        line_len = len(line) + 1
         if cur and size + line_len > max_chars:
             primaries.append(cur)
             cur, size = [], 0
@@ -381,24 +401,30 @@ def select_clips(
     settings: Settings,
     exclude: list[tuple[float, float]] = [],  # noqa: B006 - never mutated
     raw_sink: list[dict] | None = None,
+    markers: dict[int, list[str]] | None = None,
 ) -> list[ClipPick]:
-    """Pick the best clips. If `raw_sink` is given, each raw LLM payload is appended to it."""
+    """Pick the best clips. If `raw_sink` is given, each raw LLM payload is appended to it.
+    `markers` (second -> heat markers) annotate the transcript lines Claude reads."""
     if transcript.duration < settings.short_input_s:
         return [polish_pick(transcript)]
 
     duration = transcript.duration
-    sentences = split_sentences(transcript.words())
-    compact = compact_transcript(sentences)
+    words = transcript.words()
+    sentences = split_sentences(words)
+    compact = compact_transcript(sentences, markers)
 
     def valid(raws: list[_RawClip]) -> list[ClipPick]:
         return [
             p
             for raw in raws
-            if (p := _to_pick(raw, sentences, duration, settings, exclude)) is not None
+            if (p := _to_pick(raw, sentences, words, duration, settings, exclude)) is not None
         ]
 
     if len(compact) / 4 > settings.max_prompt_tokens:
-        chunks = _chunks(sentences, settings.max_prompt_tokens * 4)
+        chunks = _chunks(sentences, settings.max_prompt_tokens * 4, markers)
+        # Chunk lines are cut from the full text: re-rendering a chunk alone would hand its
+        # last sentence every marker after it (it has no "next sentence" in the chunk).
+        line_of = dict(zip(map(id, sentences), compact.split("\n"), strict=True))
         logger.info("transcript over prompt budget; selecting across %d chunks", len(chunks))
         raws = []
         for i, chunk in enumerate(chunks, 1):
@@ -407,7 +433,7 @@ def select_clips(
                 f"{format_timestamp(chunk[0].start)}-{format_timestamp(chunk[-1].end)})"
             )
             prompt = build_prompt(
-                compact_transcript(chunk),
+                "\n".join(line_of[id(s)] for s in chunk),
                 settings.clips,
                 duration,
                 exclude,

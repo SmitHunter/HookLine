@@ -1,17 +1,18 @@
 # M2 backlog (carried over from M1 reviews)
 
 ## Do first (gates dead-air removal and captions)
-- **whisper.cpp DTW timestamps.** M1 runs without `--dtw`, so word times are interpolated: real pauses don't show up as word gaps, and cut points can land up to ~0.3s inside speech. Add `--dtw large.v3.turbo`, parse the per-token `t_dtw` fields (verify the format), add a test that real pauses become word gaps, and nudge each cut point to the nearest low-energy frame within ±250 ms. Replace Task 8's transcript-only boundary check with an audio-based one.
+- ~~**whisper.cpp DTW timestamps.**~~ Done in M2.
+  Original note: M1 runs without `--dtw`, so word times are interpolated: real pauses don't show up as word gaps, and cut points can land up to ~0.3s inside speech. Add `--dtw large.v3.turbo`, parse the per-token `t_dtw` fields (verify the format), add a test that real pauses become word gaps, and nudge each cut point to the nearest low-energy frame within ±250 ms. Replace Task 8's transcript-only boundary check with an audio-based one.
 
 ## Clip quality (seen in the M1 real run)
-- Word-level cold opens (a clause or the tail of a sentence, cap ~5s). M1 only keeps whole sentences ≤3.5s, and the median real sentence is 4.9s.
-- Trim leading connectives at word level ("so", "and", "but", "I mean", "you know"). Needs DTW.
+- ~~Word-level cold opens~~ Done in M2. Original note: (a clause or the tail of a sentence, cap ~5s). M1 only keeps whole sentences ≤3.5s, and the median real sentence is 4.9s.
+- ~~Trim leading connectives~~ Done in M2. Original note: at word level ("so", "and", "but", "I mean", "you know"). Needs DTW.
 - A real-transcript fixture (CC-BY slice, attributed) for selection tests. The synthetic 2.3s sentences hid the cold-open problem.
 - Keep the extra candidates (clips+3) so Swap moment can reuse them without another Claude call.
 
 ## Pipeline
-- Selection cache key (clips, model, min/max) in picks.json; re-select on mismatch.
-- Make the cut a workspace intermediate so the spec's single final encode holds.
+- ~~Selection cache key~~ Done in M2. Original note: (clips, model, min/max) in picks.json; re-select on mismatch.
+- ~~Make the cut a workspace intermediate~~ Done in M2 (single final encode). Original note: so the spec's single final encode holds.
 - Chunked, resumable transcription for 4–8h VODs; whisper.cpp `--vad`.
 - Download progress, and resumable downloads (download.tmp is wiped on every run).
 - Route select.py logging into run_job's `log` callback (needed for M3's live progress).
@@ -25,3 +26,29 @@
 - Build script: sort Vulkan SDK folders as versions, and support non-default SDK paths.
 - Chunk mode: one failed chunk fails the whole selection; overlap can exceed the budget slightly.
 - h264_nvenc quality args are untested (no NVIDIA GPU here).
+
+## New in M2 (from the real run and reviews)
+- ~~False STACKED on wide multi-person shots~~ Fixed in the M2 final review: multi-face veto, 160 px minimum cam box, and small-face group shots go to FIT_BLUR. Original note: the podcast's wide table shot got a zoomed, soft facecam crop on top of the wide frame (seen in clips 01 and 04).
+- ~~Choppiness from many short keep ranges~~ Addressed in the M2 final review (max pause 0.6 s, pad 0.12 s, no kept piece under 1.5 s); re-check on the next real run. Original note: clip 01 has 7, clip 03 has 10 in under a minute.
+- VFR sources may drift by up to a frame per cut.
+- Horizontal + captions test: the `--horizontal` path with captions burned in has no test.
+- One ffmpeg spawn per face sample; batch frame extraction.
+- Layout flicker on fast-cut gameplay is likely; add scene-layout hysteresis.
+- Twitch VOD real-world check: pending (no URL provided).
+- Transcription took about 41 min for the 1h+ podcast because whisper.cpp ran on the integrated GPU (AMD Radeon(TM) Graphics, `uma: 1`): the RX 7800 XT driver had failed to load. DTW is not the cost. The run now logs the device and warns on `uma`; `HOOKLINE_WHISPER_DEVICE` selects a device and `hookline doctor` reports the GPU. Re-measure on the discrete GPU once its driver works.
+- ~~The first hook title box overlaps the top of the head on tight FACE_TRACK crops~~ Fixed in the M2 final review: `hook_y_for` moves the hook above the captions when the first scene's face reaches the hook band (STACKED: under the seam captions).
+- Source lower-third graphics are cropped mid-word in FACE_TRACK and STACKED crops.
+- Clip 03 uses a cold open, so keep_ranges are not monotonic (the opening line repeats later); intended, but the sidecar consumer should expect it.
+- clips.json manifest + stale output cleanup: `output/<job>/` accumulates old clips alongside new ones when a job is re-run; write a manifest of the current clips and remove outputs it no longer lists.
+- Hybrid per-clip DTW (fast full pass without DTW, DTW only over the picked clips) only if a discrete-GPU re-measure shows DTW costs more than 3x.
+- Chunked/resumable full-pass transcription, so a crash or driver fault mid-VOD does not lose the whole pass.
+- Overlay band detection (lower-thirds, Twitch widgets/alerts), so crops and caption placement avoid them.
+- Collapsed DTW word starts (several words sharing one start) → spread them evenly across the span instead of stacking caption words.
+- Mark the slow ffmpeg tests (`pytest -m slow`): the full suite takes over 6 minutes.
+
+## Left over from the M2 final review
+- SPLIT: the hook title can cover the bottom speaker's face when faces sit near the top of their panel; place it in the seam gap instead.
+- A hand-edited transcript.json with a non-dict `key` raises AttributeError (not treated as corrupt).
+- Chunked selection assumes one line per sentence (strict zip); a newline inside word text would raise.
+- Cache migration: M1/early-M2 transcript.json files are re-transcribed once (old format). Accept old files with `timing == "dtw"` when the backend matches, to skip a long re-run.
+- Hook and caption placement use only the first scene's layout.

@@ -1,3 +1,5 @@
+from bisect import bisect_left
+
 from hookline.models import Sentence, Word
 
 _TRAILING = "\"'”’)]}»"
@@ -44,5 +46,22 @@ def format_timestamp(t: float) -> str:
     return f"{m:02d}:{s:04.1f}"
 
 
-def compact_transcript(sentences: list[Sentence]) -> str:
-    return "\n".join(f"[{format_timestamp(s.start)}] {s.text}" for s in sentences)
+def compact_transcript(
+    sentences: list[Sentence], markers: dict[int, list[str]] | None = None
+) -> str:
+    """One `[mm:ss.s] sentence` line each, with heat markers appended as ` ⟨a b⟩` (ascending
+    second order, de-duplicated). A sentence owns markers in [previous sentence's end, its
+    end): markers in a pause attach to the NEXT sentence; markers before the first sentence
+    go to the first, and markers after the last sentence go to the last."""
+    markers = markers or {}
+    keys = sorted(markers)
+    lines = []
+    for i, s in enumerate(sentences):
+        lo = sentences[i - 1].end if i else float("-inf")
+        hi = s.end if i + 1 < len(sentences) else float("inf")
+        found: list[str] = []
+        for sec in keys[bisect_left(keys, lo) : bisect_left(keys, hi)]:
+            found.extend(m for m in markers[sec] if m not in found)
+        suffix = f" ⟨{' '.join(found)}⟩" if found else ""
+        lines.append(f"[{format_timestamp(s.start)}] {s.text}{suffix}")
+    return "\n".join(lines)

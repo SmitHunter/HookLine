@@ -9,3 +9,4 @@ __pycache__/
 *.tmp.mp4
 .pytest_cache/
 .ruff_cache/
+tools/downloads/

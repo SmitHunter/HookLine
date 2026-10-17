@@ -8,7 +8,12 @@ from hookline.config import Settings
 from hookline.transcribe import get_transcriber
 from hookline.transcribe.base import TranscriptionError
 from hookline.transcribe.faster_whisper import FasterWhisperBackend
-from hookline.transcribe.whisper_cpp import WhisperCppBackend, parse_whisper_cpp_json
+from hookline.transcribe.whisper_cpp import (
+    WhisperCppBackend,
+    dtw_preset,
+    parse_vulkan_devices,
+    parse_whisper_cpp_json,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -75,3 +80,158 @@ def test_whisper_cpp_vulkan_on_speech(speech_wav):
     t = WhisperCppBackend(Path(bin_), Path(model)).transcribe(speech_wav)
     joined = " ".join(w.text.lower() for w in t.words())
     assert "welcome" in joined and "test" in joined
+
+
+def _load(name: str) -> dict:
+    return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
+
+
+def test_dtw_preset():
+    assert dtw_preset(Path("ggml-large-v3-turbo.bin")) == "large.v3.turbo"
+    assert dtw_preset(Path("x/ggml-base.en.bin")) == "base.en"
+    assert dtw_preset(Path("ggml-large-v3-turbo-q5_0.bin")) == "large.v3.turbo"
+    assert dtw_preset(Path("ggml-medium.en-q8_0.bin")) == "medium.en"
+    assert dtw_preset(Path("ggml-large-v3.bin")) == "large.v3"
+    assert dtw_preset(Path("ggml-small-f16.bin")) == "small"
+    assert dtw_preset(Path("ggml-tiny.en-q4_k.bin")) == "tiny.en"
+    assert dtw_preset(Path("custom.bin")) is None
+
+
+def test_parse_prefers_dtw_and_matches_real_pauses():
+    t = parse_whisper_cpp_json(_load("whisper_cpp_dtw_sample.json"), duration=60.0)
+    words = t.words()
+    assert t.timing == "dtw"
+    assert 1.0 <= words[0].start <= 1.4  # audio: silence until 1.11s (offsets said 0.00)
+    starts = [w.start for w in words]
+    assert starts == sorted(starts)
+    assert all(w.end > w.start for w in words)
+    after_pause = next(w for w in words if w.start > 5.5)  # silence 5.20-6.22 in the audio
+    assert 6.1 <= after_pause.start <= 6.7
+
+
+def test_parse_falls_back_to_offsets_without_dtw():
+    t = parse_whisper_cpp_json(_load("whisper_cpp_sample.json"), duration=5.0)
+    assert t.timing == "segment" and t.words()[0].start == pytest.approx(0.32)
+
+
+def test_backend_passes_dtw_flags(monkeypatch, tmp_path):
+    argv: list[str] = []
+
+    class FakePopen:
+        def __init__(self, cmd, **kwargs):
+            argv.extend(cmd)
+            stem = Path(cmd[cmd.index("-of") + 1])
+            Path(f"{stem}.json").write_text(
+                json.dumps({"result": {"language": "en"}, "transcription": []}),
+                encoding="utf-8",
+            )
+            self.stderr = iter([])
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr("hookline.transcribe.whisper_cpp.subprocess.Popen", FakePopen)
+    monkeypatch.setattr("hookline.transcribe.whisper_cpp.probe_duration", lambda p: 1.0)
+    WhisperCppBackend(tmp_path / "w.exe", tmp_path / "ggml-large-v3-turbo.bin").transcribe(
+        tmp_path / "a.wav"
+    )
+    assert "-nfa" in argv and argv[argv.index("-dtw") + 1] == "large.v3.turbo"
+
+
+def _fake_popen(argv: list[str], stderr_lines: list[str] | None = None):
+    class FakePopen:
+        def __init__(self, cmd, **kwargs):
+            argv.extend(cmd)
+            stem = Path(cmd[cmd.index("-of") + 1])
+            Path(f"{stem}.json").write_text(
+                json.dumps({"result": {"language": "en"}, "transcription": []}),
+                encoding="utf-8",
+            )
+            self.stderr = iter(stderr_lines or [])
+
+        def wait(self):
+            return 0
+
+    return FakePopen
+
+
+def test_backend_without_dtw_preset_omits_dtw_flags(monkeypatch, tmp_path):
+    argv: list[str] = []
+    logs: list[str] = []
+    monkeypatch.setattr("hookline.transcribe.whisper_cpp.subprocess.Popen", _fake_popen(argv))
+    monkeypatch.setattr("hookline.transcribe.whisper_cpp.probe_duration", lambda p: 1.0)
+    WhisperCppBackend(tmp_path / "w.exe", tmp_path / "custom.bin", log=logs.append).transcribe(
+        tmp_path / "a.wav"
+    )
+    assert "-dtw" not in argv and "-nfa" not in argv
+    assert "transcribe: no DTW preset for custom.bin; using segment timing" in logs
+
+
+VK_STDERR = [
+    "ggml_vulkan: Found 2 Vulkan devices:\n",
+    "ggml_vulkan: 0 = AMD Radeon(TM) Graphics (AMD proprietary driver) | uma: 1 | fp16: 1 | warp size: 64\n",
+    "ggml_vulkan: 1 = AMD Radeon RX 7800 XT (AMD proprietary driver) | uma: 0 | fp16: 1 | warp size: 64\n",
+    "whisper_init_with_params_no_state: use gpu    = 1\n",
+    "whisper_print_progress_callback: progress =  50%\n",
+]
+
+
+def test_parse_vulkan_devices():
+    devices = parse_vulkan_devices(VK_STDERR)
+    assert devices == {
+        0: ("AMD Radeon(TM) Graphics (AMD proprietary driver)", True),
+        1: ("AMD Radeon RX 7800 XT (AMD proprietary driver)", False),
+    }
+
+
+def test_backend_logs_device_and_warns_on_uma(monkeypatch, tmp_path):
+    argv: list[str] = []
+    logs: list[str] = []
+    monkeypatch.setattr(
+        "hookline.transcribe.whisper_cpp.subprocess.Popen", _fake_popen(argv, VK_STDERR)
+    )
+    monkeypatch.setattr("hookline.transcribe.whisper_cpp.probe_duration", lambda p: 1.0)
+    model = tmp_path / "ggml-large-v3-turbo.bin"
+    WhisperCppBackend(tmp_path / "w.exe", model, log=logs.append).transcribe(tmp_path / "a.wav")
+    assert "-dev" not in argv
+    assert "transcribe: device AMD Radeon(TM) Graphics (AMD proprietary driver)" in logs
+    assert any("integrated GPU (uma)" in m and "discrete GPU driver" in m for m in logs)
+    assert any("HOOKLINE_WHISPER_DEVICE=1" in m for m in logs)
+
+
+def test_backend_passes_device_and_logs_discrete(monkeypatch, tmp_path):
+    argv: list[str] = []
+    logs: list[str] = []
+    monkeypatch.setattr(
+        "hookline.transcribe.whisper_cpp.subprocess.Popen", _fake_popen(argv, VK_STDERR)
+    )
+    monkeypatch.setattr("hookline.transcribe.whisper_cpp.probe_duration", lambda p: 1.0)
+    model = tmp_path / "ggml-large-v3-turbo.bin"
+    WhisperCppBackend(tmp_path / "w.exe", model, device=1, log=logs.append).transcribe(
+        tmp_path / "a.wav"
+    )
+    assert argv[argv.index("-dev") + 1] == "1"
+    assert logs == ["transcribe: device AMD Radeon RX 7800 XT (AMD proprietary driver)"]
+
+
+def test_whisper_device_setting_from_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOOKLINE_WHISPER_DEVICE", "1")
+    (tmp_path / "w.exe").write_bytes(b"")
+    (tmp_path / "m.bin").write_bytes(b"")
+    s = Settings.from_env().model_copy(
+        update={"whisper_cpp_bin": tmp_path / "w.exe", "whisper_cpp_model": tmp_path / "m.bin"}
+    )
+    assert s.whisper_device == 1
+    t = get_transcriber(s)
+    assert isinstance(t, WhisperCppBackend) and t.device == 1
+
+
+def test_backend_cache_keys(tmp_path):
+    cpp = WhisperCppBackend(tmp_path / "w.exe", tmp_path / "ggml-medium.en-q8_0.bin")
+    assert cpp.cache_key == {
+        "backend": "whisper-cpp",
+        "model": "ggml-medium.en-q8_0.bin",
+        "dtw": "medium.en",
+    }
+    fw = FasterWhisperBackend("large-v3-turbo", "cpu", "int8")
+    assert fw.cache_key == {"backend": "faster-whisper", "model": "large-v3-turbo", "dtw": None}

@@ -8,6 +8,7 @@ from hookline.media.ffmpeg import (
     extract_audio,
     pick_encoder,
     probe_duration,
+    probe_fps,
 )
 from tests.conftest import ffprobe_stream
 
@@ -71,7 +72,7 @@ def test_cut_segments_passes_encoder_args(monkeypatch, tmp_path):
         (tmp_path / "o.tmp.mp4").write_bytes(b"x")
 
     monkeypatch.setattr(ffmpeg_mod, "_run", fake_run)
-    cut_segments(tmp_path / "in.mp4", [(0.0, 1.0)], tmp_path / "o.mp4", "h264_amf")
+    cut_segments(tmp_path / "in.mp4", [(0.0, 1.0)], tmp_path / "o.mp4", "h264_amf", fps=25)
     cmd = seen[0]
     i = cmd.index("-c:v")
     assert cmd[i : i + len(encoder_args("h264_amf"))] == encoder_args("h264_amf")
@@ -88,3 +89,58 @@ def test_amf_cut_has_sane_bitrate_when_available(fixture_video, tmp_path):
         pytest.skip("h264_amf not usable here")
     out = cut_segments(fixture_video, [(10.0, 50.0)], tmp_path / "c.mp4", "h264_amf")
     assert out.stat().st_size * 8 / probe_duration(out) < 2_000_000
+
+
+def test_cut_segments_quality_replaces_rate_control(monkeypatch, tmp_path):
+    seen: list[list[str]] = []
+
+    def fake_run(cmd):
+        seen.append(cmd)
+        (tmp_path / "o.tmp.mp4").write_bytes(b"x")
+
+    monkeypatch.setattr(ffmpeg_mod, "_run", fake_run)
+    q = ["-preset", "veryfast", "-crf", "12"]
+    cut_segments(
+        tmp_path / "in.mp4", [(0.0, 1.0)], tmp_path / "o.mp4", "libx264", quality=q, fps=25
+    )
+    cmd = seen[0]
+    i = cmd.index("-c:v")
+    assert cmd[i : i + 6] == ["-c:v", "libx264", *q]
+    assert cmd.count("-crf") == 1
+
+
+def test_probe_fps(fixture_video):
+    assert probe_fps(fixture_video) == pytest.approx(25.0)
+
+
+def _frame(video, t):
+    from hookline.vision.faces import sample_frames
+
+    return sample_frames(video, [t], width=320)[0].astype("int32")
+
+
+def test_cut_segments_exact_with_many_short_ranges(fixture_video, tmp_path):
+    import numpy as np
+
+    from hookline.models import Word
+    from hookline.pipeline.deadair import remap_words, snap_ranges
+
+    fps = 25.0
+    raw = [(10.013 + 1.37 * i, 10.013 + 1.37 * i + 0.41 + 0.07 * i) for i in range(12)]
+    keep = snap_ranges(raw, fps)
+    assert len(keep) == 12 and all(round(t * fps, 6) == round(t * fps) for r in keep for t in r)
+    out = cut_segments(fixture_video, keep, tmp_path / "c.mp4", "libx264")
+    expected = sum(e - s for s, e in keep)
+    assert probe_duration(out) == pytest.approx(expected, abs=1 / fps)
+
+    k_start, _ = keep[7]
+    word = Word(start=k_start + 4 / fps, end=k_start + 8 / fps, text="x")
+    (mapped,) = remap_words([word], keep)
+    assert mapped.start == pytest.approx(sum(e - s for s, e in keep[:7]) + 4 / fps, abs=1e-6)
+    eps = 0.25 / fps
+    got = _frame(out, mapped.start + eps)
+    diffs = {
+        k: np.abs(got - _frame(fixture_video, word.start + k / fps + eps)).mean()
+        for k in (-1, 0, 1)
+    }
+    assert diffs[0] < min(diffs[-1], diffs[1]), diffs
