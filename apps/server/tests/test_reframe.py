@@ -1,7 +1,9 @@
 import math
 import re
+import shutil
 import subprocess
 from itertools import pairwise
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -12,7 +14,9 @@ from hookline.media.reframe import (
     OUT_W,
     ZOOM_IN,
     ZOOM_PUNCH,
+    combine_crop,
     detect_crop,
+    detect_overlay_bands,
     reframe_graph,
     scene_filter,
     scene_upscale,
@@ -381,3 +385,128 @@ def test_zoom_step_across_scene_boundary_has_no_jump(tmp_path):
     assert edges[0] - edges[-1] > 60  # the band edge moved outward with the zoom
     assert all(m <= 1 for m in moves)  # monotonic: scene 2 continues, never restarts
     assert max(-m for m in moves) <= 30  # no jump at the scene boundary
+
+
+# --- burned-in overlay bands -------------------------------------------------------------
+
+_FONT = Path(__file__).resolve().parents[3] / "assets" / "fonts" / "Anton-Regular.ttf"
+_REAL_SRC = Path(__file__).resolve().parents[1] / "workspace" / "e87398ed46" / "source.mp4"
+_LOWER_THIRD = (
+    "drawbox=x=0:y=612:w=1280:h=108:color=0x6a1fb0:t=fill,"
+    "drawtext=fontfile=Anton-Regular.ttf:text='The History of Public Access - Episode 1':"
+    "x=40:y=622:fontsize=40:fontcolor=white,"
+    "drawtext=fontfile=Anton-Regular.ttf:text='Harrison Goldstein, Myles Jewell 10/21/2022':"
+    "x=40:y=670:fontsize=34:fontcolor=white"
+)
+
+
+def _make_overlay(
+    dst: Path, vf: str, duration: float = 12, still: bool = False, pan: bool = False
+) -> Path:
+    """testsrc2 1280x720 with `vf`; `still` freezes the first frame (a paused video), `pan`
+    scrolls the picture sideways (a moving game camera). Runs in dst's folder so drawtext can
+    name the font file without Windows path escaping."""
+    shutil.copy(_FONT, dst.parent / _FONT.name)
+    src = f"testsrc2=size=1280x720:rate=25:duration={duration}"
+    if pan:
+        src = f"testsrc2=size=2560x720:rate=25:duration={duration}"
+        vf = f"crop=1280:720:x='t*100':y=0,{vf}"
+    if still:
+        vf = f"trim=end_frame=1,loop=loop=-1:size=1,setpts=N/25/TB,trim=duration={duration},{vf}"
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", src,
+         "-vf", vf, "-c:v", "libx264", "-pix_fmt", "yuv420p", dst.name],
+        check=True, cwd=dst.parent,
+    )  # fmt: skip
+    return dst
+
+
+def test_overlay_bottom_lower_third_detected(tmp_path):
+    bands = detect_overlay_bands(_make_overlay(tmp_path / "lt.mp4", _LOWER_THIRD))
+    assert bands is not None
+    top, bottom = bands
+    assert top == 0
+    assert bottom / 720 == pytest.approx(0.15, abs=0.02)
+    assert bottom % 2 == 0
+
+
+def test_overlay_moving_ticker_at_bottom_is_none(tmp_path):
+    ticker = (
+        "drawbox=x=0:y=612:w=1280:h=108:color=0x6a1fb0:t=fill,"
+        "drawtext=fontfile=Anton-Regular.ttf:text='BREAKING  NEWS  TICKER  SCROLLS  BY  FAST':"
+        r"x='w-mod(t*400\,w+tw)':y=640:fontsize=48:fontcolor=white"
+    )
+    assert detect_overlay_bands(_make_overlay(tmp_path / "ticker.mp4", ticker)) is None
+
+
+def test_overlay_corner_minimap_is_game_content(tmp_path):
+    # A static HUD/minimap touching the bottom edge but covering a corner, not the width.
+    hud = (
+        "drawbox=x=0:y=500:w=300:h=220:color=0x204020:t=fill,"
+        + ",".join(
+            f"drawtext=fontfile=Anton-Regular.ttf:text='{t}':x=12:y={y}:fontsize=40:fontcolor=white"
+            for t, y in (("MAP  N  12", 510), ("HP 100  AMMO 30", 560), ("X 512 Y 77", 610))
+        )
+        + ",drawtext=fontfile=Anton-Regular.ttf:text='SCORE 4521':x=12:y=660:fontsize=40:"
+        "fontcolor=white"
+    )
+    assert detect_overlay_bands(_make_overlay(tmp_path / "hud.mp4", hud, pan=True)) is None
+    # a full-width lower-third over the same moving camera is an overlay
+    bands = detect_overlay_bands(_make_overlay(tmp_path / "strip.mp4", _LOWER_THIRD, pan=True))
+    assert bands is not None and bands[1] / 720 == pytest.approx(0.15, abs=0.02)
+
+
+def test_overlay_paused_video_is_none(tmp_path):
+    paused = _make_overlay(tmp_path / "paused.mp4", _LOWER_THIRD, still=True)
+    assert detect_overlay_bands(paused) is None
+
+
+def test_overlay_plain_testsrc_is_none(tmp_path):
+    assert detect_overlay_bands(_make_overlay(tmp_path / "plain.mp4", "null")) is None
+
+
+def test_overlay_bands_are_in_cropped_space(tmp_path):
+    boxed = _make_overlay(tmp_path / "boxed.mp4", f"{_LOWER_THIRD},pad=1280:920:0:100")
+    bands = detect_overlay_bands(boxed, crop=(1280, 720, 0, 100))
+    assert bands is not None
+    assert bands[1] / 720 == pytest.approx(0.15, abs=0.02)
+
+
+def test_combine_crop_shrinks_letterbox_crop_to_exclude_bands():
+    assert combine_crop((1920, 1080), None, None) is None
+    assert combine_crop((1920, 1080), None, (0, 200)) == (1920, 880, 0, 0)
+    assert combine_crop((1920, 1080), (1920, 800, 0, 140), (20, 100)) == (1920, 680, 0, 160)
+    # odd cuts keep even dimensions and offsets
+    w, h, _, y = combine_crop((1280, 720), None, (13, 101))
+    assert (w, h % 2, y % 2) == (1280, 0, 0)
+    assert y >= 13 and y + h <= 720 - 101
+
+
+def test_combine_crop_refuses_to_remove_too_much():
+    # > 30% of the height in total: band removal skipped, letterbox crop kept
+    assert combine_crop((1920, 1080), None, (200, 200)) is None
+    assert combine_crop((1920, 1080), (1920, 800, 0, 140), (0, 300)) == (1920, 800, 0, 140)
+    # letterbox + bands leaving < 60% of the original height: skipped too
+    assert combine_crop((1920, 1080), (1920, 800, 0, 140), (0, 200)) == (1920, 800, 0, 140)
+
+
+@pytest.mark.skipif(not _REAL_SRC.exists(), reason="real source not present")
+def test_overlay_real_source_lower_third():
+    # The purple lower-third is on screen for the whole VOD (630/630 samples, every 5 s).
+    clip = _REAL_SRC.parent / "_overlay_window.mp4"
+    try:
+        subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", "600", "-t", "20",
+             "-i", str(_REAL_SRC), "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "16",
+             str(clip)],
+            check=True,
+        )  # fmt: skip
+        bands = detect_overlay_bands(clip)
+        assert bands is not None
+        assert bands[0] == 0
+        assert 0.15 <= bands[1] / 1080 <= 0.22
+        # Without the lower-third in the frame (cropped above it), the talking-head shot
+        # (static curtain, moving speaker) has no overlay band.
+        assert detect_overlay_bands(clip, crop=(1920, 860, 0, 0)) is None
+    finally:
+        clip.unlink(missing_ok=True)

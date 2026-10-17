@@ -70,6 +70,31 @@ def test_render_clip_vertical_with_captions(
     json.dumps(extras)  # sidecar-serialisable
 
 
+def test_render_clip_crops_overlay_bands(
+    fixture_video, fixture_wav, fixture_words, sample_pick, settings, tmp_path, monkeypatch,
+    final_argvs,
+):  # fmt: skip
+    from hookline.pipeline import render as render_mod
+
+    seen = []
+
+    def fake_bands(video, crop=None):
+        seen.append(crop)
+        return (0, 40)
+
+    monkeypatch.setattr(render_mod, "detect_overlay_bands", fake_bands)
+    dst = tmp_path / "03-o.mp4"
+    extras = render_clip(
+        fixture_video, fixture_wav, sample_pick, fixture_words, tmp_path / "r", dst, settings,
+        NoFaces(),
+    )  # fmt: skip
+    assert seen == [None]  # no letterbox on the fixture
+    assert extras["overlay_bands"] == [0, 40]
+    assert _graph(final_argvs[0]).startswith("[0:v]crop=320:140:0:0,")
+    assert probe_size(dst) == (1080, 1920)
+    json.dumps(extras)
+
+
 def test_render_clip_horizontal_no_captions(
     fixture_video,
     fixture_wav,
@@ -88,6 +113,7 @@ def test_render_clip_horizontal_no_captions(
     w, h = probe_size(dst)
     assert w / h == pytest.approx(320 / 180, abs=0.02)
     assert extras["layout"] == []
+    assert extras["overlay_bands"] is None
     assert not (tmp_path / "r" / "02.ass").exists()
     assert "subtitles=" not in _graph(final_argvs[0])
 

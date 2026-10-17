@@ -25,7 +25,13 @@ from hookline.media.loudness import (
     loudnorm_mode,
     measure_loudness,
 )
-from hookline.media.reframe import detect_crop, reframe_graph, zoom_schedule
+from hookline.media.reframe import (
+    combine_crop,
+    detect_crop,
+    detect_overlay_bands,
+    reframe_graph,
+    zoom_schedule,
+)
 from hookline.media.subtitles import fonts_dir, subtitles_filter
 from hookline.models import ClipPick, Word
 from hookline.pipeline.boundaries import refine_boundaries
@@ -88,8 +94,11 @@ def render_clip(
     loud_seconds: set[int] | None = None,
 ) -> dict:
     """Write the finished clip to `dst`; returns sidecar extras (segments, layout, keep_ranges,
-    removed_s, cut_times, zoom_steps). Cut and zoom times are on the output timeline; zooms are
-    applied before captions, so captions never zoom (vertical only; empty when horizontal).
+    removed_s, cut_times, zoom_steps, overlay_bands). Cut and zoom times are on the output
+    timeline; zooms are applied before captions, so captions never zoom (vertical only; empty
+    when horizontal).
+    `overlay_bands` is the [top, bottom] px of burned-in overlay cropped away (vertical only),
+    or None.
 
     The intermediate cut (`work_dir/NN.mkv`, near-lossless libx264 + PCM audio, deleted after success)
     and the ASS file live in `work_dir`. Video is lossily encoded once (the final encode);
@@ -126,8 +135,14 @@ def render_clip(
     )
     loudness = measure_loudness(inter, COMPRESSOR)
     audio_args = ["-af", loudnorm_filter(loudness)] if loudness else []
-    crop = detect_crop(inter)
-    in_w, in_h = (crop[0], crop[1]) if crop else probe_size(inter)
+    letterbox = detect_crop(inter)
+    # Vertical only: burned-in lower-thirds/edge overlays would show cropped mid-word.
+    bands = detect_overlay_bands(inter, crop=letterbox) if settings.vertical else None
+    size = probe_size(inter)
+    crop = combine_crop(size, letterbox, bands)
+    if crop == letterbox:
+        bands = None  # none found, or removal refused (too much of the height)
+    in_w, in_h = (crop[0], crop[1]) if crop else size
 
     duration = probe_duration(inter)
     out_words = remap_words(near, keep)
@@ -187,4 +202,5 @@ def render_clip(
         "removed_s": round(max(refined.duration - kept, 0.0), 3),
         "cut_times": cuts,
         "zoom_steps": [list(st) for st in steps],
+        "overlay_bands": list(bands) if bands else None,
     }

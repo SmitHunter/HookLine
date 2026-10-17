@@ -1,5 +1,6 @@
 """9:16 reframing helpers."""
 
+import logging
 import math
 import re
 from collections import Counter
@@ -7,8 +8,13 @@ from collections.abc import Sequence
 from itertools import pairwise
 from pathlib import Path
 
+import numpy as np
+
 from hookline.media.ffmpeg import _run, probe_duration, probe_size
 from hookline.pipeline.layout import SceneLayout
+from hookline.vision.faces import sample_frames
+
+log = logging.getLogger(__name__)
 
 OUT_W, OUT_H = 1080, 1920
 STACK_CAM_H = 640
@@ -61,6 +67,149 @@ def detect_crop(video: Path) -> tuple[int, int, int, int] | None:
     if width - crop[0] < _MIN_REMOVED * width and height - crop[1] < _MIN_REMOVED * height:
         return None
     return crop
+
+
+# Burned-in overlays (lower-thirds, alert boxes, sub goals): edge-touching bands of rows whose
+# edges stay put while the rest of the frame moves. Measured on 12 grayscale samples, 320 px wide.
+_OVERLAY_SAMPLES = 12
+_OVERLAY_W = 320
+_EDGE_T = 20  # gradient (max of |dx|, |dy|) above this is an edge pixel
+_EDGE_TOL = 0.3  # an edge is static when within 30% of the median frame's gradient there
+_EDGE_DENSITY = 0.08  # a row is static in a sample when > 8% of its pixels are static edges
+_STATIC_SHARE = 0.9  # ... in at least 90% of the samples
+_BAND_MARGIN = 0.08  # a band's outermost static row lies within 8% of the frame edge
+_BAND_GAP = 0.03  # flat rows inside a band (between text lines) bridged up to 3% of height
+_BAND_SLIT = 0.015  # ... and any rows (descenders, a border) up to 1.5%
+_BAND_MIN = 0.03  # at least 3% of the height in static rows
+_BAND_PAD = 0.01  # cut 1% past the last static row: borders/shadows whose contrast varies
+_BORDER_DENSITY = 0.2  # a row with edges across >= 20% of the width is a box border
+_SPAN_BINS, _SPAN_MIN = 16, 0.5  # a band's static edges reach >= half of 16 column bins
+_MAX_BAND = 0.30  # never more than 30% of the height, per band and in total
+_MIN_KEPT = 0.6  # letterbox + bands must leave >= 60% of the original height
+_MIN_MOTION = 2.0  # 90th-percentile row motion outside the bands; below it nothing moves
+
+
+def _gradient(gray: np.ndarray) -> np.ndarray:
+    """max(|dx|, |dy|) per pixel; a vertical step is attributed to the row below it, so a
+    box's top border belongs to the box."""
+    grad = np.zeros_like(gray)
+    grad[..., :, :-1] = np.abs(np.diff(gray, axis=-1))
+    grad[..., 1:, :] = np.maximum(grad[..., 1:, :], np.abs(np.diff(gray, axis=-2)))
+    return grad
+
+
+def _row_flags(gray: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Per row (n, H, W -> H): `static` -- in >= 90% of samples > 8% of its pixels are edges
+    matching the median gradient; `flat` -- the median frame has almost no edges there (the
+    plain fill between an overlay's text lines); `strong` -- an edge across >= 20% of the median
+    frame's width (a box border); plus the per-pixel static-edge map (H, W). Gradients, not
+    intensities: a semi-transparent band shifts in brightness with what is behind it, but its
+    text edges stay put."""
+    grad = _gradient(gray)
+    med = np.median(grad, axis=0)
+    match = (
+        (grad > _EDGE_T)
+        & (med > _EDGE_T)
+        & (np.abs(grad - med) < _EDGE_TOL * np.maximum(grad, med))
+    )
+    static = ((match.mean(axis=2) > _EDGE_DENSITY).mean(axis=0)) >= _STATIC_SHARE
+    density = (med > _EDGE_T).mean(axis=1)
+    pixels = match.mean(axis=0) >= _STATIC_SHARE
+    return static, density < _EDGE_DENSITY / 2, density >= _BORDER_DENSITY, pixels
+
+
+def _wide(pixels: np.ndarray) -> bool:
+    """Whether a band's static edges (rows, W) spread over >= half of 16 column bins: an
+    overlay strip, not a corner HUD element or minimap that happens to touch the edge."""
+    bins = np.array_split(pixels.any(axis=0), _SPAN_BINS)
+    return sum(b.any() for b in bins) >= _SPAN_MIN * _SPAN_BINS
+
+
+def _edge_band(static: np.ndarray, flat: np.ndarray, strong: np.ndarray) -> int:
+    """Height in rows of the band touching index 0 (flags ordered edge first), or 0.
+
+    Candidate runs start at each static row within the margin (live content may sit between
+    the band and the frame edge) and extend over static rows; gaps up to _BAND_SLIT are
+    bridged, up to _BAND_GAP only when flat (a wider gap with edges that aren't static is live
+    content: the band ends). The longest run wins. Its end moves out to a box border (`strong`
+    row) within _BAND_GAP, whose contrast varies with what is behind it, plus _BAND_PAD. Over
+    _MAX_BAND it is not a band."""
+    h = len(static)
+    hits = np.flatnonzero(static)
+    best_last, best_count = -1, 0
+    for start in hits[hits <= _BAND_MARGIN * h]:
+        last, count = int(start), 0
+        for i in hits[hits >= start]:
+            gap = i - last - 1
+            if gap > _BAND_GAP * h or (gap > _BAND_SLIT * h and not flat[last + 1 : i].all()):
+                break
+            last, count = int(i), count + 1
+        if count > best_count:
+            best_last, best_count = last, count
+    if best_count < _BAND_MIN * h:
+        return 0
+    window = np.flatnonzero(strong[best_last + 1 : best_last + 1 + math.ceil(_BAND_GAP * h)])
+    if len(window):
+        best_last += int(window[0]) + 1
+    band = min(best_last + 1 + math.ceil(_BAND_PAD * h), h)
+    return band if band <= _MAX_BAND * h else 0
+
+
+def detect_overlay_bands(
+    video: Path, crop: tuple[int, int, int, int] | None = None
+) -> tuple[int, int] | None:
+    """Burned-in overlay bands at the top/bottom edge as `(top_cut_px, bottom_cut_px)` in
+    (cropped) source pixels, or None. A band is a run of rows whose edges are static in >= 90%
+    of 12 samples while the rest of the frame moves, touching the frame edge, <= 30% of the
+    height, its static edges spread over at least half the width. A paused video (nothing
+    moves), a static frame-sized region, or a corner HUD element/minimap is not a band."""
+    duration = probe_duration(video)
+    times = [duration * (i + 0.5) / _OVERLAY_SAMPLES for i in range(_OVERLAY_SAMPLES)]
+    frames = sample_frames(video, times, width=_OVERLAY_W, crop=crop)
+    gray = np.stack(
+        [f[..., 0] * 0.114 + f[..., 1] * 0.587 + f[..., 2] * 0.299 for f in frames]
+    ).astype(np.float32)
+    h = gray.shape[1]
+    static, flat, strong, pixels = _row_flags(gray)
+    top = _edge_band(static, flat, strong)
+    bottom = _edge_band(static[::-1], flat[::-1], strong[::-1])
+    top = top if top and _wide(pixels[:top]) else 0
+    bottom = bottom if bottom and _wide(pixels[h - bottom :]) else 0
+    if not top and not bottom:
+        return None
+    if top + bottom > _MAX_BAND * h:
+        log.info("overlay bands %d+%d of %d rows exceed 30%%; not cropped", top, bottom, h)
+        return None
+    motion = np.median(np.abs(gray - np.median(gray, axis=0)).mean(axis=2), axis=0)
+    if np.percentile(motion[top : h - bottom], 90) < _MIN_MOTION:
+        return None  # nothing moves: an overlay can't be told from the picture
+    src_h = crop[1] if crop else probe_size(video)[1]
+    return _even_up(top * src_h / h) if top else 0, _even_up(bottom * src_h / h) if bottom else 0
+
+
+def _even_up(v: float) -> int:
+    return math.ceil(v / 2) * 2
+
+
+def combine_crop(
+    size: tuple[int, int],
+    crop: tuple[int, int, int, int] | None,
+    bands: tuple[int, int] | None,
+) -> tuple[int, int, int, int] | None:
+    """The letterbox `crop` (or the full `size` frame) shrunk in height to exclude overlay
+    `bands` (top, bottom px in crop space), even dimensions. Band removal is refused (logged),
+    returning the letterbox crop unchanged, when it would remove more than 30% of the crop's
+    height or leave less than 60% of the original frame's height."""
+    if not bands or not any(bands):
+        return crop
+    w, h, x, y = crop or (size[0], size[1], 0, 0)
+    top, bottom = _even_up(bands[0]), bands[1]
+    if top + bottom > _MAX_BAND * h or h - top - bottom < _MIN_KEPT * size[1]:
+        log.info(
+            "overlay bands %s on %d of %d px rows removed too much; skipped", bands, h, size[1]
+        )
+        return crop
+    return w, _even(h - top - bottom), x, y + top
 
 
 def _even(v: float) -> int:
