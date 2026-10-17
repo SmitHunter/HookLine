@@ -1,3 +1,5 @@
+from collections.abc import Callable
+
 from hookline.config import Settings
 from hookline.transcribe.base import Transcriber, TranscriptionError
 from hookline.transcribe.faster_whisper import FasterWhisperBackend
@@ -13,7 +15,7 @@ __all__ = [
 ]
 
 
-def get_transcriber(settings: Settings) -> Transcriber:
+def get_transcriber(settings: Settings, log: Callable[[str], None] | None = None) -> Transcriber:
     cpp_ready = bool(
         settings.whisper_cpp_bin
         and settings.whisper_cpp_model
@@ -23,7 +25,9 @@ def get_transcriber(settings: Settings) -> Transcriber:
     if settings.transcriber == "whisper-cpp" or (settings.transcriber == "auto" and cpp_ready):
         if not (settings.whisper_cpp_bin and settings.whisper_cpp_model):
             raise TranscriptionError("whisper-cpp selected but whisper_cpp_bin/model not set")
-        return WhisperCppBackend(settings.whisper_cpp_bin, settings.whisper_cpp_model)
+        return WhisperCppBackend(
+            settings.whisper_cpp_bin, settings.whisper_cpp_model, settings.whisper_device, log
+        )
     import ctranslate2
 
     if ctranslate2.get_cuda_device_count() > 0:

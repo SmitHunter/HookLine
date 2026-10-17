@@ -23,7 +23,7 @@ def test_cli_flags_reach_settings(monkeypatch):
 
     monkeypatch.setattr(cli, "run_job", fake_run_job)
     monkeypatch.setattr(cli, "make_llm", lambda s: None)
-    monkeypatch.setattr(cli, "get_transcriber", lambda s: None)
+    monkeypatch.setattr(cli, "get_transcriber", lambda s, log=None: None)
     args = ["run", "x.mp4", "--horizontal", "--no-captions", "--no-chat"]
     res = CliRunner().invoke(cli.app, [*args, "--facecam", "0.7,0,0.3,0.25"])
     assert res.exit_code == 0, res.output

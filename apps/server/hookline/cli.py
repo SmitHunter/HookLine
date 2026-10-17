@@ -90,15 +90,10 @@ def run(
         if out is not None:
             overrides["output_dir"] = out
         settings = Settings.model_validate({**Settings.from_env().model_dump(), **overrides})
-        transcriber = get_transcriber(settings)
+        log = lambda m: console.print(m, highlight=False, markup=False)
+        transcriber = get_transcriber(settings, log)
         console.print(f"Transcriber: {_backend_label(transcriber)}", markup=False)
-        paths = run_job(
-            source,
-            settings,
-            make_llm(settings),
-            transcriber,
-            log=lambda m: console.print(m, highlight=False, markup=False),
-        )
+        paths = run_job(source, settings, make_llm(settings), transcriber, log=log)
     except (
         LLMError,
         TranscriptionError,

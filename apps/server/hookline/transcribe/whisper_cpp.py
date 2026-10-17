@@ -14,9 +14,60 @@ _PROGRESS = re.compile(r"progress\s*=\s*(\d+)%")
 _NON_SPEECH = re.compile(r"^(\[[^\]]*\]|\([^)]*\)|\*[^*]*\*)$")
 
 
-def dtw_preset(model: Path) -> str:
-    """ggml-large-v3-turbo.bin -> large.v3.turbo (whisper.cpp's -dtw preset name)."""
-    return model.stem.removeprefix("ggml-").replace("-", ".")
+# whisper.cpp's built-in -dtw alignment-head presets.
+DTW_PRESETS: tuple[str, ...] = (
+    "tiny",
+    "tiny.en",
+    "base",
+    "base.en",
+    "small",
+    "small.en",
+    "medium",
+    "medium.en",
+    "large.v1",
+    "large.v2",
+    "large.v3",
+    "large.v3.turbo",
+)
+_QUANT_SUFFIX = re.compile(r"-(q\d_\d|q\d_k|f16|f32)$", re.IGNORECASE)
+# "ggml_vulkan: 0 = AMD Radeon RX 7800 XT (AMD proprietary driver) | uma: 0 | fp16: 1 | ..."
+_VK_DEVICE = re.compile(r"ggml_vulkan:\s*(\d+)\s*=\s*(.+?)\s*\|\s*uma:\s*([01])")
+
+
+def dtw_preset(model: Path) -> str | None:
+    """ggml-large-v3-turbo-q5_0.bin -> large.v3.turbo (whisper.cpp's -dtw preset name), by
+    longest-prefix match against the known presets; None when no preset fits."""
+    name = _QUANT_SUFFIX.sub("", model.stem.removeprefix("ggml-")).replace("-", ".").lower()
+    hits = [p for p in DTW_PRESETS if name == p or name.startswith(p + ".")]
+    return max(hits, key=len, default=None)
+
+
+def parse_vulkan_devices(lines: list[str]) -> dict[int, tuple[str, bool]]:
+    """`ggml_vulkan: <idx> = <name> ... | uma: <0|1>` lines -> {idx: (name, is_uma)}."""
+    devices: dict[int, tuple[str, bool]] = {}
+    for line in lines:
+        if m := _VK_DEVICE.search(line):
+            devices[int(m.group(1))] = (m.group(2), m.group(3) == "1")
+    return devices
+
+
+def device_report(devices: dict[int, tuple[str, bool]], used: int | None) -> list[str]:
+    """Log lines for the Vulkan device whisper.cpp runs on (`used`, default 0)."""
+    idx = used if used is not None else 0
+    if idx not in devices:
+        return []
+    name, uma = devices[idx]
+    lines = [f"transcribe: device {name}"]
+    if uma:
+        lines.append(
+            "warning: transcribe: running on an integrated GPU (uma) — check your discrete GPU driver"
+        )
+        discrete = [i for i, (_, u) in sorted(devices.items()) if not u]
+        if discrete:
+            lines.append(
+                f"hint: set HOOKLINE_WHISPER_DEVICE={discrete[0]} to use {devices[discrete[0]][0]}"
+            )
+    return lines
 
 
 def _is_speech(text: str) -> bool:
@@ -73,9 +124,22 @@ def parse_whisper_cpp_json(data: dict, duration: float) -> Transcript:
 
 
 class WhisperCppBackend:
-    def __init__(self, bin: Path, model: Path) -> None:
+    def __init__(
+        self,
+        bin: Path,
+        model: Path,
+        device: int | None = None,
+        log: Callable[[str], None] | None = None,
+    ) -> None:
         self.bin = bin
         self.model = model
+        self.device = device
+        self.log = log or (lambda _m: None)
+
+    @property
+    def cache_key(self) -> dict:
+        """What the transcript depends on; a cached transcript with another key is stale."""
+        return {"backend": "whisper-cpp", "model": self.model.name, "dtw": dtw_preset(self.model)}
 
     def transcribe(
         self, wav: Path, on_progress: Callable[[float], None] | None = None
@@ -95,10 +159,14 @@ class WhisperCppBackend:
                 "1",
                 "-sow",
                 "-pp",
-                "-nfa",
-                "-dtw",
-                dtw_preset(self.model),
             ]
+            preset = dtw_preset(self.model)
+            if preset:
+                cmd += ["-nfa", "-dtw", preset]
+            else:
+                self.log(f"transcribe: no DTW preset for {self.model.name}; using segment timing")
+            if self.device is not None:
+                cmd += ["-dev", str(self.device)]
             try:
                 proc = subprocess.Popen(
                     cmd,
@@ -111,12 +179,20 @@ class WhisperCppBackend:
             except OSError as e:
                 raise TranscriptionError(f"could not run whisper.cpp ({self.bin}): {e}") from e
             tail: list[str] = []
+            vk_lines: list[str] = []
+            reported = False
             assert proc.stderr is not None
             for line in proc.stderr:
                 tail = [*tail[-19:], line.rstrip()]
+                if _VK_DEVICE.search(line):
+                    vk_lines.append(line)
+                elif vk_lines and not reported:
+                    reported = self._report_device(vk_lines)
                 if on_progress and (m := _PROGRESS.search(line)):
                     on_progress(int(m.group(1)) / 100)
             code = proc.wait()
+            if not reported:
+                self._report_device(vk_lines)
             if code != 0:
                 raise TranscriptionError(f"whisper.cpp exited with code {code}\n" + "\n".join(tail))
             try:
@@ -128,3 +204,8 @@ class WhisperCppBackend:
         if on_progress:
             on_progress(1.0)
         return parse_whisper_cpp_json(data, probe_duration(wav))
+
+    def _report_device(self, vk_lines: list[str]) -> bool:
+        for msg in device_report(parse_vulkan_devices(vk_lines), self.device):
+            self.log(msg)
+        return True

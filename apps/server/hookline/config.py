@@ -43,6 +43,7 @@ class Settings(BaseModel):
     whisper_model: str = "large-v3-turbo"
     whisper_cpp_bin: Path | None = None
     whisper_cpp_model: Path | None = None
+    whisper_device: int | None = None  # whisper.cpp `-dev` (Vulkan device index)
     clips: int = 5
     min_clip_s: float = 20
     max_clip_s: float = 60

@@ -3,7 +3,7 @@ import subprocess
 from typer.testing import CliRunner
 
 from hookline import cli
-from hookline.doctor import Check, run_doctor
+from hookline.doctor import Check, parse_vulkaninfo, run_doctor
 
 
 def fake_completed(stdout: str):
@@ -49,7 +49,7 @@ def test_cli_run_ingest_error(monkeypatch, tmp_path):
 
     monkeypatch.setattr(cli, "run_job", boom)
     monkeypatch.setattr(cli, "make_llm", lambda s: None)
-    monkeypatch.setattr(cli, "get_transcriber", lambda s: None)
+    monkeypatch.setattr(cli, "get_transcriber", lambda s, log=None: None)
     res = CliRunner().invoke(cli.app, ["run", "https://x.test/v"])
     assert res.exit_code == 1 and "download failed" in res.output
     assert "Traceback" not in res.output
@@ -74,7 +74,7 @@ def test_cli_run_no_clips_selected(monkeypatch):
 
     monkeypatch.setattr(cli, "run_job", boom)
     monkeypatch.setattr(cli, "make_llm", lambda s: None)
-    monkeypatch.setattr(cli, "get_transcriber", lambda s: None)
+    monkeypatch.setattr(cli, "get_transcriber", lambda s, log=None: None)
     res = CliRunner().invoke(cli.app, ["run", "x.mp4"])
     assert res.exit_code == 1 and "No clips were selected" in res.output
     assert "workspace/abc/select_raw.json" in res.output and "Traceback" not in res.output
@@ -86,3 +86,54 @@ def test_doctor_m2_asset_rows():
     assert by["Anton font"].required and by["Anton font"].ok
     assert not by["YuNet model"].required and not by["TwitchDownloaderCLI"].required
     assert "DTW on" in by["whisper.cpp"].detail or not by["whisper.cpp"].ok
+
+
+VULKANINFO_IGPU_ONLY = """Devices:
+========
+GPU0:
+	apiVersion         = 1.3.280
+	vendorID           = 0x1002
+	deviceType         = PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU
+	deviceName         = AMD Radeon(TM) Graphics
+GPU1:
+	deviceType         = PHYSICAL_DEVICE_TYPE_CPU
+	deviceName         = llvmpipe (LLVM 17.0.6, 256 bits)
+"""
+
+VULKANINFO_DISCRETE = (
+    VULKANINFO_IGPU_ONLY
+    + """GPU2:
+	deviceType         = PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
+	deviceName         = AMD Radeon RX 7800 XT
+"""
+)
+
+
+def test_parse_vulkaninfo():
+    assert parse_vulkaninfo(VULKANINFO_DISCRETE) == [
+        ("AMD Radeon(TM) Graphics", "INTEGRATED_GPU"),
+        ("llvmpipe (LLVM 17.0.6, 256 bits)", "CPU"),
+        ("AMD Radeon RX 7800 XT", "DISCRETE_GPU"),
+    ]
+
+
+def _gpu_row(which, text):
+    checks = run_doctor(which=which, run=fake_completed(text))
+    return next(c for c in checks if c.name == "GPU (whisper.cpp)")
+
+
+def test_doctor_gpu_row_flags_missing_discrete_gpu():
+    row = _gpu_row(lambda name: f"/bin/{name}", VULKANINFO_IGPU_ONLY)
+    assert not row.ok and not row.required
+    assert row.detail.startswith("discrete GPU not visible — check driver")
+    assert "AMD Radeon(TM) Graphics" in row.detail
+
+
+def test_doctor_gpu_row_ok_with_discrete_gpu():
+    row = _gpu_row(lambda name: f"/bin/{name}", VULKANINFO_DISCRETE)
+    assert row.ok and "AMD Radeon RX 7800 XT (discrete_gpu)" in row.detail
+
+
+def test_doctor_gpu_row_without_vulkaninfo():
+    row = _gpu_row(lambda name: None if name == "vulkaninfo" else f"/bin/{name}", "")
+    assert not row.ok and not row.required and "vulkaninfo" in row.detail

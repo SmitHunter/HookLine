@@ -38,6 +38,45 @@ def _lists(output: str, name: str) -> bool:
     return any(line.split()[1:2] == [name] for line in output.splitlines())
 
 
+def parse_vulkaninfo(summary: str) -> list[tuple[str, str]]:
+    """`vulkaninfo --summary` text -> [(deviceName, type)], type like DISCRETE_GPU."""
+    devices: list[tuple[str, str]] = []
+    kind = None
+    for line in summary.splitlines():
+        key, _, value = line.strip().partition("=")
+        key, value = key.strip(), value.strip()
+        if key == "deviceType":
+            kind = value.removeprefix("PHYSICAL_DEVICE_TYPE_")
+        elif key == "deviceName" and kind is not None:
+            devices.append((value, kind))
+            kind = None
+    return devices
+
+
+def _gpu_check(which: Callable[[str], str | None], run: Callable) -> Check:
+    name = "GPU (whisper.cpp)"
+    exe = which("vulkaninfo")
+    if not exe:
+        return Check(name, False, False, "vulkaninfo not on PATH; GPU not checked")
+    try:
+        res = run(
+            [exe, "--summary"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=30,
+        )
+        devices = parse_vulkaninfo((res.stdout or "") + (res.stderr or ""))
+    except (OSError, subprocess.SubprocessError):
+        devices = []
+    listed = ", ".join(f"{n} ({k.lower()})" for n, k in devices) or "no Vulkan devices"
+    discrete = any(k == "DISCRETE_GPU" for _, k in devices)
+    detail = listed if discrete else f"discrete GPU not visible — check driver ({listed})"
+    return Check(name, discrete, False, detail)
+
+
 def _cuda_available() -> bool:
     try:
         import ctranslate2
@@ -127,6 +166,7 @@ def run_doctor(
             "cached" if tdl.exists() else "downloads on first Twitch VOD (chat signals)",
         )
     )
+    checks.append(_gpu_check(which, run))
     cuda = _cuda_available()
     checks.append(Check("CUDA", cuda, False, "available" if cuda else "not available"))
     return checks
