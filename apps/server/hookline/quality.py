@@ -1,11 +1,13 @@
 """Measurements on rendered frames, and the automated M2.5 quality bar (`hookline audit`)."""
 
+import hashlib
 import json
 import re
 import subprocess
 import tempfile
-from collections import Counter
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
+from difflib import SequenceMatcher
 from itertools import pairwise
 from pathlib import Path
 from typing import Literal
@@ -84,7 +86,7 @@ def box_bbox(
     return _bbox(diff > 24, region)
 
 
-# --- The quality bar (Q1-Q8, plus Q4b: captions off the face) -----------------------------
+# --- The quality bar (Q1-Q8, plus Q4b: captions and hook off the face) -------------------
 
 LUFS_TARGET, LUFS_TOL, TP_MAX = -14.0, 1.0, -1.0
 CAP_MIN_PX = 55
@@ -99,13 +101,17 @@ PACE_MAX_GAP = 5.0
 MIN_VIDEO_KBPS = 5000
 # AAC is encoded at 192k; the measured average undershoots on simple audio (real clips 176-189k).
 AUDIO_KBPS, AUDIO_KBPS_RANGE = 192, (160, 200)
-MAX_CAPTION_SAMPLES = 12
+MAX_CAPTION_SAMPLES = 400  # one per caption group; beyond this the widest/smallest groups win
+FRAME_BATCH = 24  # frames rendered per ffmpeg run (~150 MB of RGB), measured, then dropped
+DOMINANT_ROWS = 0.4  # Q2: a line's cap band = rows with >= 40% of its densest row's pixels
 SAMPLE_FPS = 25
 EARLIER_TAG = "EARLIER"  # the cold-open seam tag (hook style), not the hook title
 
 _TIME_RE = re.compile(r"(\d+):(\d\d):(\d\d(?:\.\d+)?)")
 _TAG_RE = re.compile(r"\{[^}]*\}")
 _TOKEN_RE = re.compile(r"[a-z0-9']+")
+_FS_RE = re.compile(r"\\fs(\d+)")
+_FSCX_RE = re.compile(r"\\fscx(\d+)")
 
 
 @dataclass(frozen=True)
@@ -126,6 +132,7 @@ class _Event:
     end: float
     style: str
     text: str  # override tags stripped; "\N" kept as the line break
+    raw: str = ""  # the Dialogue text field, override tags included
 
     @property
     def mid(self) -> float:
@@ -159,9 +166,20 @@ def render_ass_frames(ass_path: Path, times: list[float], bg: str = "black") -> 
     return [by_n[n] for n in idx]
 
 
-def line_heights(frame: np.ndarray, color: TextColor = "any") -> list[int]:
-    """Cap height (px) of each text line in `frame`: row runs of text pixels separated by
-    empty rows, ignoring sparse rows (comma tails) under 5% of the run's densest row."""
+def _measure_frames[T](
+    ass_path: Path, times: list[float], fn: Callable[[np.ndarray], T], bg: str = "black"
+) -> list[T]:
+    """`fn` of each frame at `times`, rendered FRAME_BATCH at a time so memory stays bounded."""
+    out: list[T] = []
+    for i in range(0, len(times), FRAME_BATCH):
+        out += [fn(f) for f in render_ass_frames(ass_path, times[i : i + FRAME_BATCH], bg)]
+    return out
+
+
+def line_heights(frame: np.ndarray, color: TextColor = "any", dense: float = 0.05) -> list[int]:
+    """Height (px) of each text line in `frame`: row runs of text pixels separated by empty
+    rows, counting only rows with at least `dense` x the run's densest row (the default drops
+    comma tails; DOMINANT_ROWS keeps just the cap band)."""
     rows = text_mask(frame, color).sum(axis=1)
     heights, y = [], 0
     while y < len(rows):
@@ -172,8 +190,8 @@ def line_heights(frame: np.ndarray, color: TextColor = "any") -> list[int]:
         while y1 < len(rows) and rows[y1] > 0:
             y1 += 1
         run = rows[y:y1]
-        dense = np.nonzero(run >= max(1, 0.05 * run.max()))[0]
-        heights.append(int(dense[-1] - dense[0] + 1))
+        keep = np.nonzero(run >= max(1, dense * run.max()))[0]
+        heights.append(int(keep[-1] - keep[0] + 1))
         y = y1
     return heights
 
@@ -193,8 +211,9 @@ def _split_ass(text: str) -> tuple[str, list[tuple[str, _Event]]]:
     for ln in lines[first:]:
         if ln.startswith("Dialogue:"):
             parts = ln.split(",", 9)
-            body = _TAG_RE.sub("", parts[9]).replace("⁠", "")
-            events.append((ln, _Event(_secs(parts[1]), _secs(parts[2]), parts[3].strip(), body)))
+            body = _TAG_RE.sub("", parts[9]).replace("\u2060", "")
+            ev = _Event(_secs(parts[1]), _secs(parts[2]), parts[3].strip(), body, parts[9])
+            events.append((ln, ev))
     return "\n".join(lines[:first]), events
 
 
@@ -215,10 +234,46 @@ def _covered(spans: list[tuple[float, float]], cover: list[tuple[float, float]])
     return hit / total if total else 1.0
 
 
-def _spread[T](items: list[T], n: int) -> list[T]:
-    if len(items) <= n:
-        return items
-    return [items[round(i * (len(items) - 1) / (n - 1))] for i in range(n)]
+def _visible(e: _Event) -> bool:
+    return any(c.isalnum() for c in e.text) and e.end - e.start >= 0.08
+
+
+def _priority(e: _Event) -> tuple[int, int, int]:
+    """Riskiest first: smallest \\fs, then most condensed \\fscx, then the longest text."""
+    fs = _FS_RE.search(e.raw)
+    sx = _FSCX_RE.search(e.raw)
+    return (int(fs.group(1)) if fs else 10_000, int(sx.group(1)) if sx else 100, -len(e.text))
+
+
+def caption_samples(caps: list[_Event], layouts: list[dict]) -> list[float]:
+    """Sample times for caption frames: each caption group's final event (consecutive events
+    with the same text are one group; its words light up in turn), plus one inside every
+    FACE_TRACK/SPLIT scene that has captions but no sample yet. Above MAX_CAPTION_SAMPLES the
+    scene samples stay and the smallest/most condensed/widest groups are kept."""
+    groups: list[list[_Event]] = []
+    for e in caps:
+        if groups and groups[-1][-1].text == e.text:
+            groups[-1].append(e)
+        else:
+            groups.append([e])
+    # the last event long enough to land on a sampled frame
+    finals = [vis[-1] for g in groups if (vis := [e for e in g if _visible(e)])]
+    times = {e.mid for e in finals}
+    scene_times = set()
+    for lay in layouts:
+        if lay.get("kind") not in ("FACE_TRACK", "SPLIT"):
+            continue
+        a, b = lay["start"], lay["end"]
+        if any(a <= t < b for t in times):
+            continue
+        inside = [e for e in caps if _visible(e) and e.start < b and e.end > a]
+        if inside:
+            e = inside[0]
+            scene_times.add((max(e.start, a) + min(e.end, b)) / 2)
+    if len(finals) + len(scene_times) > MAX_CAPTION_SAMPLES:
+        room = max(MAX_CAPTION_SAMPLES - len(scene_times), 0)
+        finals = sorted(finals, key=_priority)[:room]
+    return sorted({e.mid for e in finals} | scene_times)
 
 
 def _excursion(box: Box) -> int:
@@ -228,7 +283,7 @@ def _excursion(box: Box) -> int:
 
 
 def _tokens(text: str) -> list[str]:
-    return _TOKEN_RE.findall(text.lower().replace("’", "'"))
+    return _TOKEN_RE.findall(text.lower().replace("\u2019", "'"))
 
 
 def _strip_fillers(tokens: list[str]) -> list[str]:
@@ -250,6 +305,15 @@ def _layout_at(layouts: list[dict], t: float) -> SceneLayout | None:
         if lay["start"] - 1e-6 <= t < lay["end"]:
             return SceneLayout.model_validate(lay)
     return None
+
+
+def zoom_at(steps: list, t: float) -> float:
+    """The zoom step scale in effect at output time `t` (easing ignored); 1.0 without steps."""
+    scale = 1.0
+    for st, s in sorted((float(a), float(b)) for a, b in steps or []):
+        if st <= t + 1e-9:
+            scale = s
+    return scale
 
 
 def _probe(mp4: Path) -> dict:
@@ -287,11 +351,8 @@ def _check_encode(info: dict) -> CheckResult:
         problems.append(f"{v.get('codec_name')} {v.get('pix_fmt')}")
     if v_kbps < MIN_VIDEO_KBPS:
         problems.append(f"video {v_kbps:.0f} kb/s")
-    if (
-        a is None
-        or a.get("codec_name") != "aac"
-        or not AUDIO_KBPS_RANGE[0] <= a_kbps <= AUDIO_KBPS_RANGE[1]
-    ):
+    lo, hi = AUDIO_KBPS_RANGE
+    if a is None or a.get("codec_name") != "aac" or not lo <= a_kbps <= hi:
         problems.append(f"audio {a.get('codec_name') if a else 'none'} {a_kbps:.0f}k")
     detail = f"{size} {v.get('codec_name')} {v.get('pix_fmt')} {v_kbps:.0f} kb/s, aac {a_kbps:.0f}k"
     if problems:
@@ -299,9 +360,10 @@ def _check_encode(info: dict) -> CheckResult:
     return CheckResult("Q8", not problems, round(v_kbps), thr, detail)
 
 
-def _check_caption_size(frames: list[np.ndarray], has_speech: bool) -> CheckResult:
+def _check_caption_size(heights_per_frame: list[list[int]], has_speech: bool) -> CheckResult:
     thr = f"cap height >= {CAP_MIN_PX}px"
-    heights = [min(hs) for hs in (line_heights(f) for f in frames) if hs]
+    # captions are one line: the tallest run is the line, smaller runs are lifted accents
+    heights = [max(hs) for hs in heights_per_frame if hs]
     if not heights:
         return CheckResult("Q2", not has_speech, None, thr, "no caption frames")
     cap = min(heights)
@@ -322,37 +384,50 @@ def _check_coverage(caps: list[_Event], words: list[Word] | None) -> CheckResult
     return CheckResult("Q3", cov >= COVERAGE_MIN, round(cov, 4), thr, detail)
 
 
-def _check_safe_zone(frames: list[np.ndarray]) -> CheckResult:
+def _check_safe_zone(boxes: list[Box | None]) -> CheckResult:
     thr = f"x in {list(SAFE_X)}, y in {list(SAFE_Y)}"
-    boxes = [b for b in (box_bbox(f) for f in frames) if b is not None]
-    worst = max(boxes, key=_excursion, default=None)
+    drawn = [b for b in boxes if b is not None]
+    worst = max(drawn, key=_excursion, default=None)
     if worst is None:
         return CheckResult("Q4", True, 0, thr, "nothing drawn")
     out = _excursion(worst)
-    return CheckResult("Q4", out == 0, out, thr, f"{len(boxes)} boxes; worst {worst}")
+    return CheckResult("Q4", out == 0, out, thr, f"{len(drawn)} boxes; worst {worst}")
 
 
-def _check_face(times: list[float], frames: list[np.ndarray], layouts: list[dict]) -> CheckResult:
-    """Q4b: share of the caption text box covering the layout's face box (output px)."""
-    worst, worst_t = 0.0, None
-    for t, frame in zip(times, frames, strict=True):
-        box = text_bbox(frame)
-        lay = _layout_at(layouts, t)
-        if box is None or lay is None:
+def _face_share(box: Box, layouts: list[dict], steps: list, t: float) -> float:
+    """Largest share of `box` covered by a face of the scene at `t`, the face scaled by the
+    zoom step in effect at `t`."""
+    lay = _layout_at(layouts, t)
+    if lay is None:
+        return 0.0
+    x0, y0, x1, y1 = box
+    area = (x1 - x0 + 1) * (y1 - y0 + 1)
+    share = 0.0
+    for fx0, fy0, fx1, fy1 in face_rects(lay, zoom_at(steps, t)):
+        ov = max(0.0, min(x1, fx1) - max(x0, fx0)) * max(0.0, min(y1, fy1) - max(y0, fy0))
+        share = max(share, ov / area)
+    return share
+
+
+def _check_face(
+    samples: list[tuple[str, float, Box | None]], layouts: list[dict], steps: list
+) -> CheckResult:
+    """Q4b: the share of each caption text box (cap band), hook box and EARLIER-tag box
+    (what, t, box) that covers the face (zoomed as at t)."""
+    worst, where = 0.0, None
+    for what, t, box in samples:
+        if box is None:
             continue
-        x0, y0, x1, y1 = box
-        area = (x1 - x0 + 1) * (y1 - y0 + 1)
-        for fx0, fy0, fx1, fy1 in face_rects(lay):
-            ov = max(0.0, min(x1, fx1) - max(x0, fx0)) * max(0.0, min(y1, fy1) - max(y0, fy0))
-            if ov / area > worst:
-                worst, worst_t = ov / area, t
-    detail = f"worst {worst:.0%} at {worst_t:.1f}s" if worst_t is not None else "no overlap"
-    thr = f"caption/face overlap <= {FACE_OVERLAP_MAX:.0%}"
+        share = _face_share(box, layouts, steps, t)
+        if share > worst:
+            worst, where = share, f"{what} at {t:.1f}s"
+    detail = f"worst {worst:.0%} ({where})" if where else "no overlap"
+    thr = f"caption/hook face overlap <= {FACE_OVERLAP_MAX:.0%}"
     return CheckResult("Q4b", worst <= FACE_OVERLAP_MAX, round(worst, 3), thr, detail)
 
 
-def _check_hook(hooks: list[_Event], frames: list[np.ndarray], duration: float) -> CheckResult:
-    """Q5 from the hook event at 0 s and its frames rendered over black at 0.1 s and 2.7 s."""
+def _check_hook(hooks: list[_Event], per_frame: list[list[int]], duration: float) -> CheckResult:
+    """Q5 from the hook event at 0 s and its line heights rendered over black at 0.1/2.7 s."""
     thr = (
         f"<= {HOOK_MAX_LINES} lines, <= {HOOK_MAX_WORDS} words, cap >= {HOOK_MIN_PX}px, "
         f"0-{HOOK_UNTIL:g}s"
@@ -362,8 +437,8 @@ def _check_hook(hooks: list[_Event], frames: list[np.ndarray], duration: float) 
         return CheckResult("Q5", False, None, thr, "no hook title at 0 s")
     lines = [ln for ln in hook.text.split("\\N") if ln.strip()]
     n_words = len(" ".join(lines).split())
-    per_frame = [line_heights(f, "white") for f in frames]
-    cap = min((h for hs in per_frame for h in hs), default=0)
+    # each line's height; runs under half the tallest are lifted accents, not lines
+    cap = min((h for hs in per_frame for h in hs if h >= max(hs) / 2), default=0)
     problems = []
     if len(lines) > HOOK_MAX_LINES:
         problems.append(f"{len(lines)} lines")
@@ -379,24 +454,32 @@ def _check_hook(hooks: list[_Event], frames: list[np.ndarray], duration: float) 
     return CheckResult("Q5", not problems, cap, thr, detail)
 
 
+def first_words_match(first_words: str, spoken: str) -> float:
+    """Order-aware similarity (SequenceMatcher ratio) of the declared first words and the
+    first len(want) + 2 spoken tokens, leading filler openers stripped from both."""
+    want = _strip_fillers(_tokens(first_words))
+    if not want:
+        return 0.0
+    got = _strip_fillers(_tokens(spoken))[: len(want) + 2]
+    return SequenceMatcher(None, want, got, autojunk=False).ratio()
+
+
 def _check_opening(words: list[Word] | None, first_words: str, seam: float | None) -> CheckResult:
     """Q6: speech by 0.5 s, and the opening (after a cold-open seam, where the declared first
-    sentence begins) matches `first_words`, leading filler openers ignored on both sides."""
-    thr = f"speech <= {SPEECH_START_MAX:g}s, first_words overlap >= {FIRST_WORDS_MIN:.0%}"
+    sentence begins) matches `first_words` in order."""
+    thr = f"speech <= {SPEECH_START_MAX:g}s, first_words match >= {FIRST_WORDS_MIN:.0%}"
     if words is None:
         return CheckResult("Q6", False, None, thr, "no caption_words in sidecar (re-render)")
     if not words:
         return CheckResult("Q6", False, None, thr, "no speech")
     start = words[0].start
     main = [w for w in words if seam is None or w.start >= seam - 0.05]
-    want = _strip_fillers(_tokens(first_words))
-    have = _strip_fillers(_tokens(" ".join(w.text for w in main)))[: len(want) + 2]
-    overlap = sum((Counter(want) & Counter(have)).values()) / len(want) if want else 0.0
-    ok = start <= SPEECH_START_MAX and overlap >= FIRST_WORDS_MIN
-    detail = f"speech at {start:.2f}s; first_words overlap {overlap:.0%}"
+    match = first_words_match(first_words, " ".join(w.text for w in main))
+    ok = start <= SPEECH_START_MAX and match >= FIRST_WORDS_MIN
+    detail = f"speech at {start:.2f}s; first_words match {match:.0%}"
     if seam is not None:
         detail += f" after the seam at {seam:.2f}s"
-    if not want:
+    if not first_words.strip():
         detail += " (no first_words declared)"
     return CheckResult("Q6", ok, round(start, 3), thr, detail)
 
@@ -413,72 +496,115 @@ def _check_pacing(side: dict, duration: float) -> CheckResult:
     return CheckResult("Q7", gap <= PACE_MAX_GAP + 1e-6, round(gap, 3), thr, detail)
 
 
+def cap_band_bbox(frame: np.ndarray) -> Box | None:
+    """Caption text box with its vertical extent cut to the cap band (rows with at least
+    DOMINANT_ROWS of the densest row), so comma tails and lifted accents don't count."""
+    box = text_bbox(frame)
+    if box is None:
+        return None
+    rows = text_mask(frame).sum(axis=1)
+    band = np.nonzero(rows >= DOMINANT_ROWS * rows.max())[0]
+    return box[0], int(band[0]), box[2], int(band[-1])
+
+
+def _cap_black(frame: np.ndarray) -> tuple[list[int], Box | None]:
+    return line_heights(frame, dense=DOMINANT_ROWS), cap_band_bbox(frame)
+
+
+def _hook_black(frame: np.ndarray) -> list[int]:
+    return line_heights(frame, "white")
+
+
 def audit_clip(
     mp4: Path, sidecar: dict, ass_path: Path | None, words: list[Word] | None = None
 ) -> list[CheckResult]:
-    """Q1-Q8 plus Q4b (captions off the face) for one rendered clip. `words` are the clip's
-    output-time spoken words; by default the sidecar's `caption_words` ([start, end, text]).
+    """Q1-Q8 plus Q4b (caption, hook and tag off the face) for one rendered clip. `words` are
+    the clip's output-time spoken words; by default the sidecar's `caption_words`.
     Caption and hook events are rendered separately over plain canvases (black for text
     measurement, grey for boxes), so neither hides or inflates the other."""
     if words is None and sidecar.get("caption_words") is not None:
         words = [Word(start=s, end=e, text=t) for s, e, t in sidecar["caption_words"]]
     duration = probe_duration(mp4)
+    layouts = sidecar.get("layout") or []
+    steps = sidecar.get("zoom_steps") or []
     caps: list[_Event] = []
     hooks: list[_Event] = []
-    cap_black: list[np.ndarray] = []
-    cap_grey: list[np.ndarray] = []
-    hook_black: list[np.ndarray] = []
-    hook_grey: list[np.ndarray] = []
+    cap_black: list[tuple[list[int], Box | None]] = []
+    cap_grey: list[Box | None] = []
+    hook_heights: list[list[int]] = []
+    hook_grey: list[Box | None] = []
     cap_times: list[float] = []
+    hook_times: list[float] = []
     if ass_path is not None and Path(ass_path).exists():
         header, events = _split_ass(Path(ass_path).read_text(encoding="utf-8"))
         caps = [e for _, e in events if e.style == "Cap"]
         hooks = [e for _, e in events if e.style == "Hook"]
-        samples = _spread(
-            [e for e in caps if any(c.isalnum() for c in e.text) and e.end - e.start >= 0.08],
-            MAX_CAPTION_SAMPLES,
-        )
-        cap_times = [e.mid for e in samples]
-        hook_times = [0.1, min(2.7, max(duration - 0.2, 0.1))]
-        tag_times = [e.mid for e in hooks if EARLIER_TAG in e.text]
+        cap_times = caption_samples(caps, layouts)
+        title_times = [0.1, min(2.7, max(duration - 0.2, 0.1))]
+        hook_times = [*title_times, *(e.mid for e in hooks if EARLIER_TAG in e.text)]
         with tempfile.TemporaryDirectory(prefix="hookline-audit-") as tmp:
             cap_ass, hook_ass = Path(tmp) / "cap.ass", Path(tmp) / "hook.ass"
             for path, style in ((cap_ass, "Cap"), (hook_ass, "Hook")):
                 body = [ln for ln, e in events if e.style == style]
                 path.write_text("\n".join([header, *body]) + "\n", encoding="utf-8")
-            cap_black = render_ass_frames(cap_ass, cap_times)
-            cap_grey = render_ass_frames(cap_ass, cap_times, GREY)
+            cap_black = _measure_frames(cap_ass, cap_times, _cap_black)
+            cap_grey = _measure_frames(cap_ass, cap_times, box_bbox, GREY)
             if hooks:
-                hook_black = render_ass_frames(hook_ass, hook_times)
-                hook_grey = render_ass_frames(hook_ass, [*hook_times, *tag_times], GREY)
+                hook_heights = _measure_frames(hook_ass, title_times, _hook_black)
+                hook_grey = _measure_frames(hook_ass, hook_times, box_bbox, GREY)
+    face_samples = [("caption", t, box) for t, (_, box) in zip(cap_times, cap_black, strict=True)]
+    face_samples += [("hook", t, box) for t, box in zip(hook_times, hook_grey, strict=True)]
     return [
         _check_loudness(mp4),
-        _check_caption_size(cap_black, bool(words)),
+        _check_caption_size([hs for hs, _ in cap_black], bool(words)),
         _check_coverage(caps, words),
         _check_safe_zone([*cap_grey, *hook_grey]),
-        _check_face(cap_times, cap_black, sidecar.get("layout") or []),
-        _check_hook(hooks, hook_black, duration),
+        _check_face(face_samples, layouts, steps),
+        _check_hook(hooks, hook_heights, duration),
         _check_opening(words, sidecar.get("first_words") or "", sidecar.get("seam")),
         _check_pacing(sidecar, duration),
         _check_encode(_probe(mp4)),
     ]
 
 
+def _ass_for(mp4: Path, side: dict, work_dir: Path) -> tuple[Path | None, CheckResult | None]:
+    """The clip's ASS file (the sidecar's recorded `ass`, else `render/NN.ass`) and, when the
+    sidecar records a hash, a failed "ASS" check if the file is missing or changed."""
+    name = side.get("ass") or f"{mp4.stem.split('-', 1)[0]}.ass"
+    ass = work_dir / "render" / name
+    want = side.get("ass_sha1")
+    if not ass.exists():
+        bad = CheckResult("ASS", False, None, "recorded ASS present", f"{ass} missing")
+        return None, bad if want else None
+    if want and hashlib.sha1(ass.read_bytes()).hexdigest() != want:
+        detail = f"{ass.name} changed since the render (another clip or job overwrote it?)"
+        return ass, CheckResult("ASS", False, None, "ASS matches the render's sha1", detail)
+    return ass, None
+
+
 def audit_job(out_dir: Path, work_dir: Path) -> dict:
-    """Audit every `NN-*.mp4` in `out_dir` against its sidecar and `work_dir/render/NN.ass`,
-    and write the report to `out_dir/audit.json`."""
+    """Audit every `NN-*.mp4` in `out_dir` against its sidecar and the ASS file the sidecar
+    records (verified by sha1; `render/NN.ass` for older sidecars), and write the report to
+    `out_dir/audit.json`. A clip whose audit raises is reported as a failed "ERR" check."""
     clips = []
     for mp4 in sorted(out_dir.glob("*.mp4")):
         if mp4.name.endswith(".tmp.mp4"):
             continue
-        side_path = mp4.with_suffix(".json")
-        side = json.loads(side_path.read_text(encoding="utf-8")) if side_path.exists() else {}
-        ass = work_dir / "render" / f"{mp4.stem.split('-', 1)[0]}.ass"
-        results = audit_clip(mp4, side, ass if ass.exists() else None)
+        ass: Path | None = None
+        try:
+            side_path = mp4.with_suffix(".json")
+            side = json.loads(side_path.read_text(encoding="utf-8")) if side_path.exists() else {}
+            ass, ass_check = _ass_for(mp4, side, work_dir)
+            results = ([ass_check] if ass_check else []) + audit_clip(mp4, side, ass)
+        except Exception as e:  # noqa: BLE001 - one broken clip must not stop the audit
+            msg = (str(e).splitlines() or [""])[0][:300]
+            results = [
+                CheckResult("ERR", False, None, "audit completes", f"{type(e).__name__}: {msg}")
+            ]
         clips.append(
             {
                 "clip": mp4.name,
-                "ass": str(ass) if ass.exists() else None,
+                "ass": str(ass) if ass else None,
                 "ok": all(r.ok for r in results),
                 "checks": [r.as_dict() for r in results],
             }

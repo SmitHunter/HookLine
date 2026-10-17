@@ -12,7 +12,17 @@ from hookline import cli
 from hookline.captions.ass import build_ass
 from hookline.media.loudness import measure_loudness
 from hookline.models import Word
-from hookline.quality import CheckResult, audit_clip, audit_job
+from hookline.quality import (
+    DOMINANT_ROWS,
+    CheckResult,
+    _split_ass,
+    audit_clip,
+    audit_job,
+    caption_samples,
+    first_words_match,
+    line_heights,
+    render_ass_frames,
+)
 
 DUR = 8.0
 FIRST = "This is the opening line."
@@ -159,6 +169,57 @@ def test_caption_on_the_face_fails_q4b(good_mp4, tmp_path):
     assert _by_id(audit_clip(good_mp4, _sidecar(layout=clear), _ass(tmp_path)))["Q4b"].ok
 
 
+def test_hook_on_the_face_fails_q4b(good_mp4, tmp_path):
+    # face 230-614 px: clear of the 1180 captions, but under the top hook box (290-466)
+    high = [{"start": 0.0, "end": DUR, "kind": "FACE_TRACK", "face_box": [0.12, 0.2]}]
+    by = _by_id(audit_clip(good_mp4, _sidecar(layout=high), _ass(tmp_path)))
+    assert not by["Q4b"].ok and "hook" in by["Q4b"].detail
+
+
+def test_zoomed_face_overlap_detected_q4b(good_mp4, tmp_path):
+    # face 1240-1320 px misses the 1180 caption text (~1146-1214) unzoomed; a 3x step
+    # (centre 1280, half 120) reaches up to 1160 while it is in effect
+    low = [{"start": 0.0, "end": DUR, "kind": "FACE_TRACK", "face_box": [1240 / 1920, 80 / 1920]}]
+    flat = _sidecar(layout=low, zoom_steps=[[0.0, 1.0]], cut_times=[2.5, 5.0])
+    assert _by_id(audit_clip(good_mp4, flat, _ass(tmp_path)))["Q4b"].ok
+    zoomed = _sidecar(layout=low, zoom_steps=[[0.0, 1.0], [4.0, 3.0]], cut_times=[2.5])
+    by = _by_id(audit_clip(good_mp4, zoomed, _ass(tmp_path)))
+    assert not by["Q4b"].ok and by["Q4b"].value > 0.10
+
+
+def test_one_overflowing_group_among_many_fails_q4(good_mp4, tmp_path):
+    # 30 one-word groups; the 2nd is a word too long even at CAP_MIN_FS / MIN_SCALE_X. An
+    # evenly spread 12-sample audit (indices 0, 3, 5, ...) never looked at it.
+    words = [Word(start=0.2 + 0.25 * i, end=0.4 + 0.25 * i, text=f"W{i}.") for i in range(30)]
+    words[1] = Word(start=words[1].start, end=words[1].end, text="W" * 30)
+    side = _sidecar(caption_words=[[w.start, w.end, w.text] for w in words], first_words="W0")
+    by = _by_id(audit_clip(good_mp4, side, _ass(tmp_path, build_ass(words, "Wait", DUR))))
+    assert not by["Q4"].ok and by["Q4"].value > 0
+
+
+def test_caption_samples_one_per_group_and_every_face_scene():
+    ass = build_ass(_words(), "Wait for the twist", DUR)
+    _, events = _split_ass(ass)
+    caps = [e for _, e in events if e.style == "Cap"]
+    groups = len({e.text for e in caps})
+    scenes = [
+        {"start": 0.0, "end": 7.2, "kind": "FIT_BLUR"},
+        {"start": 7.2, "end": 7.3, "kind": "FACE_TRACK"},  # no group ends in here
+    ]
+    times = caption_samples(caps, scenes)
+    assert len(times) == groups + 1 and any(7.2 <= t < 7.3 for t in times)
+
+
+def test_q2_measures_the_cap_band_not_comma_tails_or_accents(tmp_path):
+    ass = tmp_path / "c.ass"
+    ass.write_text(build_ass([Word(start=0, end=2, text="É,Ü,À,Q,")], "", 2), encoding="utf-8")
+    frame = render_ass_frames(ass, [1.0])[0]
+    loose = line_heights(frame)
+    dense = line_heights(frame, dense=DOMINANT_ROWS)
+    assert len(dense) == 2  # the accents float above the line as their own row run
+    assert 60 <= max(dense) <= 72 < max(loose)  # comma tails inflate the loose measure
+
+
 @pytest.mark.parametrize(
     "edit",
     [
@@ -194,7 +255,20 @@ def test_late_speech_fails_q6(good_mp4, tmp_path):
 
 def test_wrong_first_words_fail_q6(good_mp4, tmp_path):
     by = _by_id(audit_clip(good_mp4, _sidecar(first_words="Nobody saw it coming."), _ass(tmp_path)))
-    assert not by["Q6"].ok and "overlap" in by["Q6"].detail
+    assert not by["Q6"].ok and "match" in by["Q6"].detail
+
+
+@pytest.mark.parametrize(
+    ("want", "got", "ok"),
+    [
+        ("the reason we did that was money", "we did it because the money was there", False),
+        ("the reason we did that was money", "the reason we did that was money and", True),
+        ("the reason we did that was money", "um the reason we did that was the money", True),
+        ("Nobody saw it coming.", "coming it saw nobody", False),
+    ],
+)
+def test_first_words_match_is_order_aware(want, got, ok):
+    assert (first_words_match(want, got) >= 0.6) is ok
 
 
 def test_first_words_match_after_trimmed_filler_opener(good_mp4, tmp_path):
@@ -268,3 +342,26 @@ def test_audit_job_pairs_clips_with_their_ass(good_mp4, tmp_path):
     out, ws = _job(tmp_path, good_mp4)
     report = audit_job(out / "job1", ws / "job1")
     assert report["clips"][0]["ass"].endswith("01.ass")
+
+
+def test_audit_job_uses_the_recorded_ass_and_verifies_its_hash(good_mp4, tmp_path):
+    import hashlib
+
+    out, ws = _job(tmp_path, good_mp4)
+    real = _ass(ws / "job1" / "render", name="01-abc.ass")
+    side = _sidecar(ass="01-abc.ass", ass_sha1=hashlib.sha1(real.read_bytes()).hexdigest())
+    (out / "job1" / "01-good.json").write_text(json.dumps(side), encoding="utf-8")
+    report = audit_job(out / "job1", ws / "job1")
+    assert report["ok"] and report["clips"][0]["ass"].endswith("01-abc.ass")
+    real.write_text(real.read_text(encoding="utf-8") + "; edited", encoding="utf-8")
+    checks = audit_job(out / "job1", ws / "job1")["clips"][0]["checks"]
+    assert checks[0]["id"] == "ASS" and not checks[0]["ok"]
+
+
+def test_audit_job_reports_a_broken_clip_and_continues(good_mp4, tmp_path):
+    out, ws = _job(tmp_path, good_mp4)
+    (out / "job1" / "00-broken.mp4").write_bytes(b"not a video")
+    report = audit_job(out / "job1", ws / "job1")
+    broken, good = report["clips"]
+    assert broken["clip"] == "00-broken.mp4" and broken["checks"][0]["id"] == "ERR"
+    assert good["ok"] and report["ok"] is False

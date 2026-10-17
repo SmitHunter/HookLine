@@ -1,5 +1,6 @@
 """Per-clip render: refine boundaries, drop dead air, reframe to 9:16 and burn captions."""
 
+import hashlib
 import logging
 import os
 import re
@@ -170,13 +171,14 @@ def render_clip(
     loud_seconds: set[int] | None = None,
 ) -> dict:
     """Write the finished clip to `dst`; returns sidecar extras (segments, layout, keep_ranges,
-    removed_s, cut_times, zoom_steps, overlay_bands, seam, caption_words). Cut and zoom times
-    are on the output timeline; zooms are applied before captions, so captions never zoom
-    (vertical only; empty when horizontal).
+    removed_s, cut_times, zoom_steps, overlay_bands, seam, ass, ass_sha1, caption_words). Cut
+    and zoom times are on the output timeline; zooms are applied before captions, so captions
+    never zoom (vertical only; empty when horizontal).
     `overlay_bands` is the [top, bottom] px of burned-in overlay cropped away (vertical only),
     or None. `seam` is the output time where a cold open ends (None without one); it gets a
-    3-frame white flash and the "EARLIER…" tag. `caption_words` are the spoken words on the
-    output timeline, [start, end, text], so `hookline audit` needs no transcript.
+    3-frame white flash and the "EARLIER…" tag. `ass`/`ass_sha1` name the burned caption file
+    in `work_dir` and its hash (None without captions). `caption_words` are the spoken words
+    on the output timeline, [start, end, text], so `hookline audit` needs no transcript.
 
     The intermediate cut (`work_dir/NN.mkv`, near-lossless libx264 + PCM audio, deleted after success)
     and the ASS file live in `work_dir`. Video is lossily encoded once (the final encode);
@@ -240,6 +242,7 @@ def render_clip(
     if seam is not None:
         graph += f";[vout]{seam_flash(seam, fps)}[vseam]"
         out_label = "[vseam]"
+    ass_ref: dict = {"ass": None, "ass_sha1": None}
     if settings.captions:
         ass = work_dir / f"{name}.ass"
         text = build_ass(
@@ -249,8 +252,10 @@ def render_clip(
             caption_y_for(layouts),
             hook_y_for(layouts),
             seam=seam,
+            caption_y_late=caption_y_for(layouts, late=True),
         )
         atomic_write_text(ass, text)
+        ass_ref = {"ass": ass.name, "ass_sha1": hashlib.sha1(ass.read_bytes()).hexdigest()}
         graph += f";{out_label}{subtitles_filter(ass, fonts_dir())}[vfinal]"
         out_label = "[vfinal]"
 
@@ -283,5 +288,6 @@ def render_clip(
         "zoom_steps": [list(st) for st in steps],
         "overlay_bands": list(bands) if bands else None,
         "seam": seam,
+        **ass_ref,
         "caption_words": [[w.start, w.end, w.text] for w in out_words],
     }

@@ -55,20 +55,25 @@ TEXT_X = 474  # centre of [60, 888]
 MAX_TEXT_W = 828
 SAFE_TOP = 290
 SAFE_BOTTOM = 1250
-# Highest caption line: its visible top (y - 36) clears a two-line hook box at the top (to 602).
-CAPTION_MIN_Y = 644
-CAPTION_MAX_Y = 1180
-CAPTION_Y = CAPTION_MAX_Y
 # Visible caption extent around its \pos y at Fontsize 136, outline and shadow included
 # (measured over grey: y-36 .. y+56; the glyphs sit low in Anton's tall line box).
 CAPTION_ABOVE = 36
 CAPTION_BELOW = 56
+HOOK_HALF = FONT_SIZE + HOOK_PAD  # half-height of a two-line hook box (2 x 136 / 2 + pad)
+HOOK_TOP_Y = SAFE_TOP + HOOK_HALF  # 446: a two-line hook clamped to the top of Q4
+TAG_HALF = FONT_SIZE // 2 + HOOK_PAD  # half-height of the one-line EARLIER tag box
+TEXT_SEPARATION = 24  # visible px between a hook/tag box and the caption below it
+# Highest caption line while the hook is up: visible top clears a two-line top hook box (602).
+CAPTION_MIN_Y = HOOK_TOP_Y + HOOK_HALF + TEXT_SEPARATION + CAPTION_ABOVE  # 662
+# Highest line once hook and tag are gone: clears the space a top one-line tag box uses (466).
+CAPTION_LATE_MIN_Y = SAFE_TOP + 2 * TAG_HALF + TEXT_SEPARATION + CAPTION_ABOVE  # 526
+CAPTION_MAX_Y = 1180
+CAPTION_Y = CAPTION_MAX_Y
 CAPTION_FACE_GAP = 40  # clearance (px) kept between a face and the caption's visible extent
-CAPTION_STEP = 4  # caption line candidates, px apart
+CAPTION_STEP = 4  # caption / hook line candidates, px apart
+FACE_ZOOM_BUDGET = 1.2  # ZOOM_PUNCH: a punch-in grows the face about its centre this much
 STACKED_CAPTION_Y = 700  # just below the cam/game seam (640), inside the safe band
 HOOK_Y = 360  # requested centre; clamped so the box stays in Q4 (1 line: 378, 2 lines: 446)
-HOOK_BAND_BOTTOM = 600  # a two-line hook box at the top reaches about this far down
-HOOK_ABOVE_CAPTION = 260
 STACKED_HOOK_Y = 940  # a two-line hook box clears the 700 captions (visible to 756)
 
 HEADER = f"""[Script Info]
@@ -217,15 +222,20 @@ def _clamp_hook_y(y: int, n_lines: int, fs: int) -> int:
     return min(max(y, math.ceil(SAFE_TOP + half)), math.floor(SAFE_BOTTOM - half))
 
 
-def _hold_ends(groups: list[list[Word]], duration: float) -> list[float]:
+def _hold_ends(groups: list[list[Word]], duration: float, seam: float | None = None) -> list[float]:
+    """When each group leaves the screen (see HOLD_GAP_S/TAIL_S). A group spoken before a
+    cold-open `seam` never holds past it."""
     ends = []
     for i, group in enumerate(groups):
         last = group[-1].end
         if i + 1 < len(groups):
             nxt = groups[i + 1][0].start
-            ends.append(nxt if nxt - last <= HOLD_GAP_S else min(last + TAIL_S, nxt))
+            end = nxt if nxt - last <= HOLD_GAP_S else min(last + TAIL_S, nxt)
         else:
-            ends.append(min(last + TAIL_S, max(duration, last)))
+            end = min(last + TAIL_S, max(duration, last))
+        if seam is not None and last <= seam + 1e-6:
+            end = min(end, max(seam, last))
+        ends.append(end)
     return ends
 
 
@@ -236,29 +246,45 @@ def build_ass(
     caption_y: int = CAPTION_Y,
     hook_y: int = HOOK_Y,
     seam: float | None = None,
+    caption_y_late: int | None = None,
 ) -> str:
     """`seam` (output s; cold opens only) adds SEAM_TAG for SEAM_TAG_S s at `hook_y`. When the
-    seam falls inside the hook title's 3 s, the tag waits for the title to finish."""
+    seam falls inside the hook title's 3 s, the tag waits for the title to finish; caption
+    groups spoken before the seam never hold past it.
+
+    `caption_y_late` (default `caption_y`) is the caption line for groups that start once the
+    hook and tag are off screen; it may sit higher (down to CAPTION_LATE_MIN_Y), e.g. above a
+    close-up's head where the hook needed that space."""
     lines = [HEADER.rstrip("\n")]
     hook, fs, scale = _layout_hook(hook_text)
-    hook_end = min(HOOK_S, duration)
+    hook_end = min(HOOK_S, duration) if hook else 0.0
     if hook:
         y = _clamp_hook_y(hook_y, len(hook), fs)
         tags = f"\\pos({TEXT_X},{y})\\fad(0,{HOOK_FADE_MS})" + _size_tags(fs, scale)
         body = "\\N".join(_esc(line) for line in hook)
         lines.append(_dialogue(1, 0.0, hook_end, "Hook", f"{{{tags}}}{body}"))
+    busy_until = hook_end
     if seam is not None:
-        start = max(seam, hook_end) if hook else seam
+        start = max(seam, hook_end)
         if start < duration:
+            busy_until = min(start + SEAM_TAG_S, duration)
             tag = f"{{\\pos({TEXT_X},{_clamp_hook_y(hook_y, 1, FONT_SIZE)})}}{SEAM_TAG}"
-            lines.append(_dialogue(1, start, min(start + SEAM_TAG_S, duration), "Hook", tag))
+            lines.append(_dialogue(1, start, busy_until, "Hook", tag))
     cy = min(max(caption_y, CAPTION_MIN_Y), CAPTION_MAX_Y)
+    cy_late = cy
+    if caption_y_late is not None:
+        cy_late = min(max(caption_y_late, CAPTION_LATE_MIN_Y), CAPTION_MAX_Y)
+    tag_start = busy_until - SEAM_TAG_S if busy_until > hook_end else busy_until
     groups = group_words(_normalise(words))
-    for group, hold_end in zip(groups, _hold_ends(groups, duration), strict=True):
+    for group, hold_end in zip(groups, _hold_ends(groups, duration, seam), strict=True):
         texts = [word.text.upper() for word in group]
         # A single over-long word that cannot fit even at the minimum size keeps that size.
         fs, scale = _fit([" ".join(texts)], CAP_SIDE, CAP_MIN_FS) or (CAP_MIN_FS, MIN_SCALE_X)
-        tags = f"\\pos({TEXT_X},{cy})" + _size_tags(fs, scale)
+        # the early line whenever the hook or the tag shares the screen with this group
+        clash = group[0].start < hook_end or (
+            busy_until > hook_end and group[0].start < busy_until and hold_end > tag_start
+        )
+        tags = f"\\pos({TEXT_X},{cy if clash else cy_late})" + _size_tags(fs, scale)
         for i, active in enumerate(group):
             end = group[i + 1].start if i + 1 < len(group) else hold_end
             parts = [
@@ -268,18 +294,21 @@ def build_ass(
     return "\n".join(lines) + "\n"
 
 
-def face_rects(layout: SceneLayout) -> list[tuple[float, float, float, float]]:
-    """Output-px (x0, y0, x1, y1) of the layout's median face(s), zoom ignored: one for
-    FACE_TRACK, one per panel for SPLIT. The layout stores only the face's (y, h); tracking
-    and split crops centre the face horizontally, and a detector box is about FACE_W_PER_H
-    as wide as tall, so x is estimated from that."""
+def face_rects(layout: SceneLayout, zoom: float = 1.0) -> list[tuple[float, float, float, float]]:
+    """Output-px (x0, y0, x1, y1) of the layout's median face(s), scaled by `zoom` about the
+    face centre: one for FACE_TRACK, one per panel for SPLIT. The layout stores only the
+    face's (y, h); tracking and split crops centre the face horizontally, and a detector box
+    is about FACE_W_PER_H as wide as tall, so x is estimated from that."""
     face = _face_px(layout)
     if face is None:
         return []
     top, bottom = face
-    half_w = (bottom - top) / 2 * FACE_W_PER_H
+    cy, half_h = (top + bottom) / 2, (bottom - top) / 2 * zoom
+    half_w = half_h * FACE_W_PER_H
     panels = (0, SPLIT_PANEL_H) if layout.kind == "SPLIT" else (0,)
-    return [(OUT_W / 2 - half_w, top + p, OUT_W / 2 + half_w, bottom + p) for p in panels]
+    return [
+        (OUT_W / 2 - half_w, cy - half_h + p, OUT_W / 2 + half_w, cy + half_h + p) for p in panels
+    ]
 
 
 def _face_px(layout: SceneLayout) -> tuple[float, float] | None:
@@ -291,43 +320,68 @@ def _face_px(layout: SceneLayout) -> tuple[float, float] | None:
     return y * scale, (y + h) * scale
 
 
-def _face_overlap(y: int, faces: list[tuple[float, float, float]]) -> float:
-    """Duration-weighted px of vertical overlap between a caption line at `y` (visible extent
-    plus CAPTION_FACE_GAP) and each (weight, face top, face bottom)."""
-    top, bottom = y - CAPTION_ABOVE - CAPTION_FACE_GAP, y + CAPTION_BELOW + CAPTION_FACE_GAP
+Faces = list[tuple[float, float, float]]  # (weight s, top px, bottom px)
+
+
+def _faces(layouts: list[SceneLayout], until: float | None = None) -> Faces:
+    """Zoom-budgeted face spans of the scenes (those starting before `until`), weighted by
+    scene duration."""
+    return [
+        (max(lay.end - lay.start, 1e-3), y0, y1)
+        for lay in layouts
+        if until is None or lay.start < until
+        for _, y0, _, y1 in face_rects(lay, FACE_ZOOM_BUDGET)
+    ]
+
+
+def _overlap(top: float, bottom: float, faces: Faces) -> float:
+    """Duration-weighted px of vertical overlap between [top, bottom] and the faces."""
     return sum(wt * max(0.0, min(bottom, fb) - max(top, ft)) for wt, ft, fb in faces)
 
 
-def caption_y_for(layouts: list[SceneLayout]) -> int:
-    """One caption line for the clip, inside [CAPTION_MIN_Y, CAPTION_MAX_Y]. STACKED first
-    scene: just below the seam. Otherwise the lowest line clear of every FACE_TRACK/SPLIT face
-    (default 1180, i.e. below the chin when the face ends higher; else just above the head);
-    when no line is clear, the line with the least face overlap weighted by scene duration
-    (a close-up filling the band puts captions above the head, under the hook band)."""
+def _caption_cost(y: int, faces: Faces) -> float:
+    gap = CAPTION_FACE_GAP
+    return _overlap(y - CAPTION_ABOVE - gap, y + CAPTION_BELOW + gap, faces)
+
+
+def caption_y_for(layouts: list[SceneLayout], late: bool = False) -> int:
+    """The caption line. STACKED first scene: just below the seam. Otherwise the lowest line
+    clear of every FACE_TRACK/SPLIT face, budgeting for a 1.2x punch-in (default 1180, i.e.
+    below the chin when the face ends higher; else just above the head); when none is clear,
+    the line with the least face overlap weighted by scene duration.
+
+    The default (`late=False`) line is for while the hook title is up: scenes under the
+    hook's 3 s, lines in [CAPTION_MIN_Y, CAPTION_MAX_Y] so a top hook box stays 24 px clear.
+    `late=True` is for after the hook and tag: every scene, lines from CAPTION_LATE_MIN_Y."""
     if not layouts:
         return CAPTION_Y
     if layouts[0].kind == "STACKED":
         return STACKED_CAPTION_Y
-    faces = [
-        (max(lay.end - lay.start, 1e-3), y0, y1)
-        for lay in layouts
-        for _, y0, _, y1 in face_rects(lay)
-    ]
+    faces = _faces(layouts, None if late else HOOK_S)
     if not faces:
         return CAPTION_Y
-    lines = range(CAPTION_MAX_Y, CAPTION_MIN_Y - 1, -CAPTION_STEP)
-    return min(lines, key=lambda y: _face_overlap(y, faces))  # ties: the lowest line
+    lo = CAPTION_LATE_MIN_Y if late else CAPTION_MIN_Y
+    lines = [*range(CAPTION_MAX_Y, lo, -CAPTION_STEP), lo]
+    return min(lines, key=lambda y: _caption_cost(y, faces))  # ties: the lowest line
 
 
 def hook_y_for(layouts: list[SceneLayout]) -> int:
-    """Hook title centre for the first scene: 360 (top) unless that covers a face, then
-    260 px above the captions; 940 when STACKED (below the seam captions)."""
+    """Hook title centre: 940 when STACKED (below the seam captions). Otherwise 360 (the top
+    of Q4) unless a face under the hook's 3 s (punch-in budgeted) reaches the hook band; then
+    the centre in [HOOK_TOP_Y, caption visible top - TEXT_SEPARATION - two-line half height]
+    with the least face overlap (ties: the highest)."""
     if not layouts:
         return HOOK_Y
-    first = layouts[0]
-    if first.kind == "STACKED":
+    if layouts[0].kind == "STACKED":
         return STACKED_HOOK_Y
-    face = _face_px(first)
-    if face and face[0] < HOOK_BAND_BOTTOM:
-        return caption_y_for(layouts) - HOOK_ABOVE_CAPTION
-    return HOOK_Y
+    faces = _faces(layouts, HOOK_S)
+    gap = CAPTION_FACE_GAP
+
+    def cost(y: int) -> float:
+        return _overlap(y - HOOK_HALF - gap, y + HOOK_HALF + gap, faces)
+
+    hi = caption_y_for(layouts) - CAPTION_ABOVE - TEXT_SEPARATION - HOOK_HALF
+    if not faces or cost(HOOK_TOP_Y) == 0 or hi <= HOOK_TOP_Y:
+        return HOOK_Y
+    best = min(range(HOOK_TOP_Y, hi + 1, CAPTION_STEP), key=cost)
+    return HOOK_Y if best == HOOK_TOP_Y else best

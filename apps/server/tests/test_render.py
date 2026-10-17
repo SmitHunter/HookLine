@@ -342,9 +342,8 @@ def _real_job() -> Path | None:
 def test_real_footage_bitrate_at_least_5mbps(tmp_path):
     job = _real_job()
     assert job is not None
-    transcript = Transcript.model_validate_json(
-        (job / "transcript.json").read_text(encoding="utf-8")
-    )
+    raw = json.loads((job / "transcript.json").read_text(encoding="utf-8"))
+    transcript = Transcript.model_validate(raw.get("transcript", raw))  # keyed cache format
     pick = _ZOOM_PICK.model_copy(update={"start": 1000.0, "end": 1015.0, "edit_beats": []})
     s = Settings()
     dst = tmp_path / "07-real.mp4"
@@ -414,4 +413,9 @@ def test_render_clip_sidecar_caption_words_and_no_seam(
     words = extras["caption_words"]
     assert words and words[0][0] <= 0.5 and words[0][2] == "line10"
     assert all(len(w) == 3 and w[0] < w[1] for w in words)
-    assert "EARLIER" not in (tmp_path / "r" / "03.ass").read_text(encoding="utf-8")
+    ass = tmp_path / "r" / "03.ass"
+    assert "EARLIER" not in ass.read_text(encoding="utf-8")
+    import hashlib
+
+    assert extras["ass"] == "03.ass"
+    assert extras["ass_sha1"] == hashlib.sha1(ass.read_bytes()).hexdigest()
