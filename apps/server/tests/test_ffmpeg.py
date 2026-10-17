@@ -38,29 +38,15 @@ def test_cut_segments_raises_ffmpeg_error_on_bad_input(tmp_path):
 
 
 def test_encoder_args_table():
-    assert encoder_args("libx264") == ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"]
+    assert encoder_args("libx264") == [
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-maxrate", "10M", "-bufsize", "20M",
+    ]  # fmt: skip
     assert encoder_args("h264_amf") == [
-        "-c:v",
-        "h264_amf",
-        "-rc",
-        "cqp",
-        "-qp_i",
-        "22",
-        "-qp_p",
-        "24",
-        "-qp_b",
-        "26",
-    ]
+        "-c:v", "h264_amf", "-rc", "cqp", "-qp_i", "20", "-qp_p", "22", "-qp_b", "24",
+    ]  # fmt: skip
     assert encoder_args("h264_nvenc") == [
-        "-c:v",
-        "h264_nvenc",
-        "-rc",
-        "vbr",
-        "-cq",
-        "21",
-        "-b:v",
-        "0",
-    ]
+        "-c:v", "h264_nvenc", "-rc", "vbr", "-cq", "19", "-b:v", "0",
+    ]  # fmt: skip
     assert encoder_args("unknown_enc") == ["-c:v", "unknown_enc"]
 
 

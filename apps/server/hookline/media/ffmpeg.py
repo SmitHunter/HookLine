@@ -10,11 +10,12 @@ _ENCODER_PREFERENCE = ("h264_nvenc", "h264_amf", "libx264")
 # Rate control per encoder: without it hardware encoders default to very high bitrates
 # (h264_amf ~19 Mbps), producing huge clips from modest sources.
 _ENCODER_QUALITY_ARGS: dict[str, list[str]] = {
-    "libx264": ["-preset", "veryfast", "-crf", "20"],
+    # CRF 18 capped at 10 Mb/s (VBV) keeps detail on upscaled faces without runaway sizes.
+    "libx264": ["-preset", "veryfast", "-crf", "18", "-maxrate", "10M", "-bufsize", "20M"],
     # The requested QVBR mode (-rc qvbr / hqvbr) fails to initialise on this AMD driver (error 4),
     # so use constant-QP: quality-driven like CRF, bitrate scales with the content.
-    "h264_amf": ["-rc", "cqp", "-qp_i", "22", "-qp_p", "24", "-qp_b", "26"],
-    "h264_nvenc": ["-rc", "vbr", "-cq", "21", "-b:v", "0"],
+    "h264_amf": ["-rc", "cqp", "-qp_i", "20", "-qp_p", "22", "-qp_b", "24"],
+    "h264_nvenc": ["-rc", "vbr", "-cq", "19", "-b:v", "0"],
 }
 
 

@@ -1,17 +1,24 @@
 import math
 import re
 import subprocess
+from itertools import pairwise
 
+import numpy as np
 import pytest
 
 from hookline.media.ffmpeg import probe_duration, probe_size
 from hookline.media.reframe import (
     OUT_H,
     OUT_W,
+    ZOOM_IN,
+    ZOOM_PUNCH,
     detect_crop,
     reframe_graph,
     scene_filter,
+    scene_upscale,
     track_x_expr,
+    zoom_expr,
+    zoom_schedule,
 )
 from hookline.pipeline.layout import SceneLayout
 
@@ -200,3 +207,138 @@ def test_render_with_crop(tmp_path):
 def test_reframe_graph_all_tiny_but_long_enough_becomes_one_scene():
     tiny = [SceneLayout(start=i * 0.02, end=(i + 1) * 0.02, kind="FIT_BLUR") for i in range(5)]
     assert _trim_spans(reframe_graph(tiny, 1280, 720)) == [(0, 0.1)]
+
+
+# --- pacing zooms -------------------------------------------------------------------------
+
+
+def _gaps(steps: list[tuple[float, float]], duration: float) -> list[float]:
+    times = [t for t, _ in steps] + [duration]
+    return [b - a for a, b in pairwise(times)]
+
+
+def test_zoom_schedule_long_take_no_gap_over_max_and_alternates():
+    steps = zoom_schedule(30.0, [], [])
+    assert steps[0] == (0.0, 1.0)
+    assert max(_gaps(steps, 30.0)) <= 4.5 + 1e-9
+    assert all(a[1] != b[1] for a, b in pairwise(steps))
+    assert {s for _, s in steps} == {1.0, ZOOM_IN}
+    assert all(b[0] - a[0] >= 0.5 for a, b in pairwise(steps))
+
+
+def test_zoom_schedule_steps_at_cuts():
+    steps = zoom_schedule(12.0, [2.0, 7.5], [])
+    times = [t for t, _ in steps]
+    assert 2.0 in times and 7.5 in times
+    assert max(_gaps(steps, 12.0)) <= 4.5 + 1e-9
+    assert all(a[1] != b[1] for a, b in pairwise(steps))
+
+
+def test_zoom_schedule_emphasis_punch_held_then_released():
+    steps = zoom_schedule(20.0, [], [6.0])
+    assert (6.0, ZOOM_PUNCH) in steps
+    i = steps.index((6.0, ZOOM_PUNCH))
+    t_back, s_back = steps[i + 1]
+    assert t_back == pytest.approx(6.0 + 0.2 + 1.2) and s_back in (1.0, ZOOM_IN)
+    assert max(s for _, s in steps) <= 1.2
+    assert max(_gaps(steps, 20.0)) <= 4.5 + 1e-9
+
+
+def test_zoom_schedule_drops_out_of_range_and_overlapping_punches():
+    steps = zoom_schedule(10.0, [], [-1.0, 3.0, 3.5, 12.0])
+    assert [t for t, s in steps if s == ZOOM_PUNCH] == [3.0]
+
+
+def test_zoom_schedule_prefers_sentence_boundaries():
+    steps = zoom_schedule(9.0, [], [], boundaries=[3.9])
+    assert [t for t, _ in steps][:2] == [0.0, 3.9]
+    assert max(_gaps(steps, 9.0)) <= 4.5
+    far = zoom_schedule(9.0, [], [], boundaries=[3.4])  # > 1 s from nominal 4.5: ignored
+    assert [t for t, _ in far] == [0.0, 4.5]
+
+
+def test_zoom_expr_eases_between_steps():
+    steps = [(0.0, 1.0), (2.0, ZOOM_IN), (5.0, ZOOM_PUNCH), (6.4, 1.0)]
+    expr = zoom_expr(steps)
+    assert evaluate(expr, 1.0) == pytest.approx(1.0)
+    assert evaluate(expr, 2.1) == pytest.approx(1.06)  # halfway through the 0.2 s ease
+    assert evaluate(expr, 3.0) == pytest.approx(ZOOM_IN)
+    assert evaluate(expr, 5.5) == pytest.approx(ZOOM_PUNCH)
+    assert evaluate(expr, 6.55) == pytest.approx(1.1)  # 0.3 s release from the punch
+    assert evaluate(expr, 9.0) == pytest.approx(1.0)
+    # scene-relative: the scene starting at 2.0 sees the step at its t=0
+    assert evaluate(zoom_expr(steps, offset=2.0), 1.0) == pytest.approx(ZOOM_IN)
+
+
+def test_scene_upscale_factors():
+    assert scene_upscale(_LAYOUTS["FACE_TRACK"], 1280, 720) == pytest.approx(1920 / 720, rel=0.01)
+    assert scene_upscale(_LAYOUTS["FIT_BLUR"], 1920, 1080) == pytest.approx(1080 / 1920)
+    assert scene_upscale(_LAYOUTS["SPLIT"], 3840, 2160) < 1.3
+
+
+_STEPS = [(0.0, 1.0), (1.5, ZOOM_IN), (3.0, 1.0)]
+
+
+def test_scene_filter_zoom_and_sharpen_per_kind():
+    track = scene_filter(_LAYOUTS["FACE_TRACK"], 1280, 720, "a", "b", zoom_steps=_STEPS)
+    assert track.count("eval=frame") == 1 and "unsharp=5:5:0.6:5:5:0.0" in track
+    stacked = scene_filter(_LAYOUTS["STACKED"], 1280, 720, "a", "b", zoom_steps=_STEPS)
+    assert stacked.count("eval=frame") == 1  # facecam panel only
+    assert stacked.index("eval=frame") < stacked.index("_cam]")
+    split = scene_filter(_LAYOUTS["SPLIT"], 1280, 720, "a", "b", zoom_steps=_STEPS)
+    assert split.count("eval=frame") == 2
+    blur = scene_filter(_LAYOUTS["FIT_BLUR"], 1920, 1080, "a", "b", zoom_steps=_STEPS)
+    assert blur.count("eval=frame") == 1 and "unsharp" not in blur
+    assert blur.index("eval=frame") > blur.index("_fg]")  # foreground only
+    plain = scene_filter(_LAYOUTS["FACE_TRACK"], 1280, 720, "a", "b")
+    assert "eval=frame" not in plain
+
+
+def test_scene_filter_flat_schedule_skips_zoom():
+    flat = scene_filter(_LAYOUTS["FACE_TRACK"], 1280, 720, "a", "b", zoom_steps=[(0.0, 1.0)])
+    assert "eval=frame" not in flat
+
+
+@pytest.mark.parametrize("kind", list(_LAYOUTS))
+def test_render_each_kind_with_zoom(src, tmp_path, kind):
+    graph = reframe_graph([_LAYOUTS[kind]], 1280, 720, zoom_steps=_STEPS)
+    out = _render(src, graph, tmp_path / "z.mp4")
+    assert probe_size(out) == (1080, 1920)
+    assert probe_duration(out) == pytest.approx(4.0, abs=0.1)
+
+
+def _gray(path, t: float) -> np.ndarray:
+    raw = subprocess.run(
+        ["ffmpeg", "-loglevel", "error", "-ss", str(t), "-i", str(path), "-frames:v", "1",
+         "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+        check=True, capture_output=True,
+    ).stdout  # fmt: skip
+    return np.frombuffer(raw, np.uint8).reshape(OUT_H, OUT_W).astype(int)
+
+
+_STATIC_SRC = (
+    "color=c=yellow:s=1280x720:r=25:d=12,drawbox=x=640:y=0:w=640:h=720:c=blue:t=fill,"
+    "drawbox=x=0:y=300:w=1280:h=60:c=red:t=fill"
+)
+
+
+def _top_edge(col: np.ndarray) -> int:
+    return int(np.nonzero(np.abs(np.diff(col)) > 40)[0][0])
+
+
+def test_rendered_face_track_zoom_changes_crop_on_static_source(tmp_path):
+    static = tmp_path / "static.mp4"
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+         _STATIC_SRC,
+         "-c:v", "libx264", "-pix_fmt", "yuv420p", str(static)],
+        check=True,
+    )  # fmt: skip
+    lay = SceneLayout(start=0, end=12, kind="FACE_TRACK", track_x=[(0, 0.5), (12, 0.5)])
+    steps = zoom_schedule(12.0, [], [])
+    assert evaluate(zoom_expr(steps), 1.0) == 1.0 and evaluate(zoom_expr(steps), 6.0) != 1.0
+    out = _render(static, reframe_graph([lay], 1280, 720, zoom_steps=steps), tmp_path / "z.mp4")
+    a, b = _gray(out, 1.0), _gray(out, 6.0)
+    assert np.abs(a - b).mean() > 0.5  # the crop region differs
+    # centre-anchored zoom-in pushes the band edge away from the centre
+    assert _top_edge(b[:, 100]) < _top_edge(a[:, 100]) - 10

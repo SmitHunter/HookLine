@@ -1,6 +1,7 @@
 """Per-clip render: refine boundaries, drop dead air, reframe to 9:16 and burn captions."""
 
 import os
+import re
 from pathlib import Path
 
 from hookline.captions.ass import build_ass, caption_y_for, hook_y_for
@@ -23,7 +24,7 @@ from hookline.media.loudness import (
     loudnorm_mode,
     measure_loudness,
 )
-from hookline.media.reframe import detect_crop, reframe_graph
+from hookline.media.reframe import detect_crop, reframe_graph, zoom_schedule
 from hookline.media.subtitles import fonts_dir, subtitles_filter
 from hookline.models import ClipPick, Word
 from hookline.pipeline.boundaries import refine_boundaries
@@ -33,6 +34,38 @@ from hookline.vision.faces import FaceDetector
 
 INTERMEDIATE_QUALITY = ["-preset", "veryfast", "-crf", "12"]
 MAX_HORIZONTAL_W = 1920
+_ZOOM_BEAT_RE = re.compile(r"^\s*zoom\s*:.*@\s*(\d+(?:\.\d+)?)\s*s?\s*$", re.IGNORECASE)
+_SENTENCE_END = (".", "!", "?")
+
+
+def cut_times_for(keep: list[tuple[float, float]]) -> list[float]:
+    """Output-time cut points: the joins between consecutive keep ranges."""
+    out, t = [], 0.0
+    for start, end in keep[:-1]:
+        t += end - start
+        out.append(round(t, 3))
+    return out
+
+
+def _to_output_time(t: float, keep: list[tuple[float, float]]) -> float | None:
+    offset = 0.0
+    for start, end in keep:
+        if start <= t < end:
+            return round(offset + t - start, 3)
+        offset += end - start
+    return None
+
+
+def emphasis_times(beats: list[str], keep: list[tuple[float, float]]) -> list[float]:
+    """Output times of `zoom: '<word>' @ <t>s` beats (absolute source seconds), mapped through
+    the keep ranges; beats in removed ranges, without a time, or of other kinds are dropped."""
+    out = []
+    for beat in beats:
+        m = _ZOOM_BEAT_RE.match(beat)
+        t = _to_output_time(float(m.group(1)), keep) if m else None
+        if t is not None:
+            out.append(t)
+    return out
 
 
 def _horizontal_graph(crop: tuple[int, int, int, int] | None) -> str:
@@ -53,7 +86,9 @@ def render_clip(
     encoder: str | None = None,
     loud_seconds: set[int] | None = None,
 ) -> dict:
-    """Write the finished clip to `dst`; returns sidecar extras (layout, keep_ranges, removed_s).
+    """Write the finished clip to `dst`; returns sidecar extras (segments, layout, keep_ranges,
+    removed_s, cut_times, zoom_steps). Cut and zoom times are on the output timeline; zooms are
+    applied before captions, so captions never zoom (vertical only; empty when horizontal).
 
     The intermediate cut (`work_dir/NN.mkv`, near-lossless libx264 + PCM audio, deleted after success)
     and the ASS file live in `work_dir`. Video is lossily encoded once (the final encode);
@@ -93,21 +128,30 @@ def render_clip(
     crop = detect_crop(inter)
     in_w, in_h = (crop[0], crop[1]) if crop else probe_size(inter)
 
+    duration = probe_duration(inter)
+    out_words = remap_words(near, keep)
+    cuts = cut_times_for(keep)
     layouts: list[SceneLayout] = []
+    steps: list[tuple[float, float]] = []
     if settings.vertical:
         layouts = plan_layouts(inter, detector, settings.facecam, crop=crop)
-        graph = reframe_graph(layouts, in_w, in_h, crop=crop)
+        steps = zoom_schedule(
+            duration,
+            cuts,
+            emphasis_times(pick.edit_beats, keep),
+            boundaries=[w.end for w in out_words if w.text.rstrip().endswith(_SENTENCE_END)],
+        )
+        graph = reframe_graph(layouts, in_w, in_h, crop=crop, zoom_steps=steps)
     else:
         graph = _horizontal_graph(crop)
 
     out_label = "[vout]"
     if settings.captions:
         ass = work_dir / f"{name}.ass"
-        cap_words = remap_words(near, keep)
         text = build_ass(
-            cap_words,
+            out_words,
             pick.hook_text,
-            probe_duration(inter),
+            duration,
             caption_y_for(layouts),
             hook_y_for(layouts),
         )
@@ -139,4 +183,6 @@ def render_clip(
         "layout": [lay.model_dump(mode="json") for lay in layouts],
         "keep_ranges": [list(k) for k in keep],
         "removed_s": round(max(refined.duration - kept, 0.0), 3),
+        "cut_times": cuts,
+        "zoom_steps": [list(st) for st in steps],
     }
