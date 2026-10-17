@@ -70,14 +70,17 @@ def device_report(devices: dict[int, tuple[str, bool]], used: int | None) -> lis
     return lines
 
 
+_WORDISH = re.compile(r"\w")
+
+
 def _is_speech(text: str) -> bool:
     text = text.strip()
     return bool(text) and not text.startswith("[")
 
 
 def parse_whisper_cpp_json(data: dict, duration: float) -> Transcript:
-    # Each entry: (text, offset_start, offset_end, dtw_start | None, dtw_last | None)
-    entries: list[tuple[str, float, float, float | None, float | None]] = []
+    # Each entry: (text, offset_start, offset_end, dtw_start | None, dtw_last | None, prob)
+    entries: list[tuple[str, float, float, float | None, float | None, float]] = []
     for e in data.get("transcription", []):
         text = e.get("text", "").strip()
         if not text or _NON_SPEECH.match(text):
@@ -90,6 +93,12 @@ def parse_whisper_cpp_json(data: dict, duration: float) -> Transcript:
         # Ignore DTW unless the first speech token (not just a later one) has it.
         first_tok = next((t for t in e.get("tokens", []) if _is_speech(t.get("text", ""))), None)
         has_first = first_tok is not None and first_tok.get("t_dtw", -1) >= 0
+        # the word's confidence: its least likely speech token (punctuation tokens excluded)
+        probs = [
+            float(tok["p"])
+            for tok in e.get("tokens", [])
+            if _is_speech(tok.get("text", "")) and "p" in tok and _WORDISH.search(tok["text"])
+        ]
         entries.append(
             (
                 text,
@@ -97,21 +106,22 @@ def parse_whisper_cpp_json(data: dict, duration: float) -> Transcript:
                 e["offsets"]["to"] / 1000,
                 dtws[0] if has_first else None,
                 dtws[-1] if dtws else None,
+                min(probs, default=1.0),
             )
         )
     language = (data.get("result") or {}).get("language", "en")
     n_dtw = sum(1 for en in entries if en[3] is not None)
     use_dtw = bool(entries) and n_dtw * 2 >= len(entries)
     if not use_dtw:
-        words = [Word(start=s, end=t, text=x) for x, s, t, _, _ in entries]
+        words = [Word(start=s, end=t, text=x, prob=p) for x, s, t, _, _, p in entries]
         return words_to_transcript(words, language, duration)
     starts: list[float] = []
     prev = 0.0
-    for _, off_from, _, d_start, _ in entries:
+    for _, off_from, _, d_start, _, _ in entries:
         prev = max(d_start if d_start is not None else off_from, prev)
         starts.append(prev)
     words = []
-    for i, (text, _, off_to, _, d_last) in enumerate(entries):
+    for i, (text, _, off_to, _, d_last, prob) in enumerate(entries):
         start = starts[i]
         if i + 1 < len(entries):
             end = starts[i + 1]
@@ -119,7 +129,7 @@ def parse_whisper_cpp_json(data: dict, duration: float) -> Transcript:
                 end = min(end, d_last + 0.15)
         else:
             end = off_to
-        words.append(Word(start=start, end=max(end, start + 0.05), text=text))
+        words.append(Word(start=start, end=max(end, start + 0.05), text=text, prob=prob))
     return words_to_transcript(words, language, duration, timing="dtw")
 
 

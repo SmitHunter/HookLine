@@ -109,6 +109,15 @@ def test_parse_prefers_dtw_and_matches_real_pauses():
     assert 6.1 <= after_pause.start <= 6.7
 
 
+def test_parse_keeps_word_probability_from_tokens():
+    # the lowest speech-token p of each word; punctuation tokens ("," p=0.56) do not count
+    words = parse_whisper_cpp_json(_load("whisper_cpp_dtw_sample.json"), duration=60.0).words()
+    assert [w.text for w in words[:3]] == ["All", "these", "people,"]
+    assert [w.prob for w in words[:3]] == pytest.approx([0.286783, 0.979268, 0.997626])
+    no_tokens = parse_whisper_cpp_json(_load("whisper_cpp_sample.json"), duration=5.0)
+    assert all(w.prob == 1.0 for w in no_tokens.words())
+
+
 def test_parse_falls_back_to_offsets_without_dtw():
     t = parse_whisper_cpp_json(_load("whisper_cpp_sample.json"), duration=5.0)
     assert t.timing == "segment" and t.words()[0].start == pytest.approx(0.32)

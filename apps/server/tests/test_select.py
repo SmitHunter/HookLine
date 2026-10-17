@@ -279,8 +279,9 @@ def test_schema_is_strict_and_has_no_numeric_bounds():
     assert props["verdict"]["enum"] == ["post", "maybe", "skip"]
     assert props["comment_risk"]["enum"] == ["low", "medium", "high"]
     assert props["hashtags"] == {"type": "array", "items": {"type": "string"}}
-    for k in ("first_words", "last_words", "post_caption", "search_title", "category"):
+    for k in ("first_words", "last_words", "post_caption", "category"):
         assert props[k] == {"type": "string"}
+    assert props["search_title"]["type"] == "string"  # plus a description of its limit
     assert not {"start", "end", "cold_open_start", "cold_open_end"} & props.keys()
 
 
@@ -354,7 +355,7 @@ def test_system_prompt_covers_brief():
         "✂️clip",
         "not a requirement",
         # review round 1
-        "quotes a conversation the viewer never saw",
+        "a conversation the viewer never saw",
         "The cause line is then your `first_words`",
         "must still work cold",
         "Everything in packaging must be literally true to the clip",
@@ -1239,6 +1240,9 @@ def _seq(text, t0=0.0, step=0.25):
         (_seq("I like, no way."), True),
         (_seq("She was like, absolutely not."), True),
         (_seq("I said, Hi, I'm here to borrow your equipment."), False),  # self-quote: allowed
+        (_seq("I was like, so you think it is worth the risk?"), False),  # >= 4 quoted words
+        (_seq("We were like, there is no way."), False),
+        (_seq("He was like, so you think it is worth the risk?"), True),  # not first person
         (_seq("So the rent doubled."), True),
         (_words((0.0, "So,"), (0.6, "the"), (0.85, "rent"), (1.1, "doubled.")), False),
         (_words((0.0, "So,"), (0.6, "and"), (0.85, "then"), (1.1, "this.")), True),
@@ -1323,8 +1327,9 @@ def test_opener_guard_never_moves_into_the_cold_open(fake_llm, settings, caplog)
     tr, item = _guard_item({**bad, 12: teaser}, bad[10])
     item["cold_open_words"] = teaser
     (p,) = _one(tr, fake_llm, settings, item, caplog)
-    assert p.start == 40.0 and p.cold_open == (48.25, _end_of(tr, 12))
-    assert "keeping it" in caplog.text
+    # wave C: L11 is a first-person self-quote with content, so the guard may land on it
+    assert p.start == 44.0 and p.cold_open == (48.25, _end_of(tr, 12))
+    assert "start moved to L11" in caplog.text
 
 
 # --- fix round 2: 50 s default maximum, 1.5 s minimum teaser ----------------------------------
@@ -1378,3 +1383,178 @@ def test_0_8s_teaser_without_an_extendable_start_is_dropped(fake_llm, settings, 
     )
     (p,) = _one(tr, fake_llm, settings, item, caplog)
     assert p.cold_open is None and "under 1.0s" in caplog.text
+
+
+# --- fix wave C: self-quotes, filler starts, drop_lines, mid-line starts, endings, titles ----
+
+
+@pytest.mark.parametrize(
+    "opener",
+    [
+        "I was like, so you think it is worth the risk?",
+        "We were like, there is no way this works.",
+        "I said, you cannot keep doing this to us.",
+    ],
+)
+def test_first_person_self_quote_with_content_is_not_moved(fake_llm, settings, caplog, opener):
+    # real case: "I was like, so, you think it's worth it to go to war?" lost its hook line
+    tr, item = _guard_item({10: opener}, opener)
+    (p,) = _one(tr, fake_llm, settings, item, caplog)
+    assert p.start == 40.0 and "weak opener" not in caplog.text
+
+
+def test_opener_guard_never_lands_on_a_filler_led_line(fake_llm, settings, caplog):
+    bad = {10: "So the point is this.", 11: "Like, the rent doubled in a year."}
+    tr, item = _guard_item(bad, bad[10])
+    (p,) = _one(tr, fake_llm, settings, item, caplog)
+    assert p.start == 48.0 and "start moved to L12" in caplog.text
+
+
+def test_leading_filler_is_stripped_from_the_clip_start(fake_llm, settings, caplog):
+    line = "Um, like, my landlord raised the rent forty percent."
+    tr, item = _guard_item({10: line}, line)
+    (p,) = _one(tr, fake_llm, settings, item, caplog)
+    assert p.start == 40.5 and p.first_words == "my landlord raised the rent forty percent."
+    assert "filler" in caplog.text
+
+
+@pytest.mark.parametrize("line", ["You know what she did next?", "Like a lot of people, I paid."])
+def test_filler_words_without_a_comma_are_kept(fake_llm, settings, line):
+    tr, item = _guard_item({10: line}, line)
+    (p,) = _one(tr, fake_llm, settings, item)
+    assert p.start == 40.0 and p.first_words == line
+
+
+def test_declared_first_words_are_persisted(fake_llm, settings):
+    tr, item = _guard_item({10: "So the point is this."}, "So the point is this.")
+    (p,) = _one(tr, fake_llm, settings, item)
+    assert p.start == 44.0 and p.declared_first_words == "So the point is this."
+
+
+_MID = "As soon as it was, I mean, the original investors walked out of the room."
+
+
+def test_start_moves_mid_line_to_the_declared_first_words(fake_llm, settings, caplog):
+    tr, item = _guard_item({10: _MID}, "the original investors walked out of the room.")
+    (p,) = _one(tr, fake_llm, settings, item, caplog)
+    assert p.start == 41.75 and p.first_words == "the original investors walked out of the room."
+    assert "mid-line" in caplog.text and "match none" not in caplog.text
+
+
+def test_drop_lines_in_the_schema():
+    item = SELECTION_SCHEMA["properties"]["clips"]["items"]
+    assert item["properties"]["drop_lines"] == {"type": "array", "items": {"type": "integer"}}
+    assert "drop_lines" in item["required"]
+
+
+def test_drop_lines_become_cuts_inside_the_clip(fake_llm, settings, caplog):
+    tr, item = _guard_item({}, _FILLER.format(n=10), drop_lines=[12, 13])
+    (p,) = _one(tr, fake_llm, settings, item, caplog)
+    # cut from midway between L11's end (45.2) and L12's start (48.0) to midway between
+    # L13's end (53.2) and L14's start (56.0)
+    assert p.segments() == [(40.0, 46.6), (54.6, _end_of(tr, 18))]
+    assert p.duration == pytest.approx(_end_of(tr, 18) - 40.0 - 8.0)
+    assert "dropped L12" in caplog.text and "dropped L13" in caplog.text
+
+
+def test_invalid_drop_lines_are_ignored_with_a_warning(fake_llm, settings, caplog):
+    tr, item = _guard_item({}, _FILLER.format(n=10), drop_lines=[10, 18, 25, 3, 12])
+    (p,) = _one(tr, fake_llm, settings, item, caplog)
+    assert p.segments() == [(40.0, 46.6), (50.6, _end_of(tr, 18))]
+    assert "drop_lines" in caplog.text and "L10" in caplog.text and "L25" in caplog.text
+
+
+def test_at_most_three_drop_lines(fake_llm, settings, caplog):
+    tr, item = _guard_item({}, _FILLER.format(n=10), drop_lines=[11, 13, 15, 17])
+    (p,) = _one(tr, fake_llm, settings, item, caplog)
+    assert len(p.segments()) == 4 and "at most 3" in caplog.text
+
+
+def test_drop_lines_never_remove_the_cold_open(fake_llm, settings, caplog):
+    teaser = _FILLER.format(n=15)
+    tr, item = _guard_item({}, _FILLER.format(n=10), drop_lines=[15], cold_open_words=teaser)
+    (p,) = _one(tr, fake_llm, settings, item, caplog)
+    assert p.cold_open is not None and len(p.segments()) == 2  # teaser + one main piece
+    assert "cold open" in caplog.text and "L15" in caplog.text
+
+
+def test_drops_count_toward_the_length_bounds(fake_llm, settings):
+    tr = _lines_transcript({})
+    # L10-L23 spans 53.2 s (over the 50 s max); dropping L12 and L14 (4 s each) leaves 45.2 s
+    item = _line_item(10, 23, _FILLER.format(n=10), _FILLER.format(n=23), drop_lines=[12, 14])
+    (p,) = _one(tr, fake_llm, settings, item)
+    assert p.start == 40.0 and p.duration == pytest.approx(45.2)
+    item["drop_lines"] = []
+    (p,) = _one(tr, fake_llm, settings, item)
+    assert p.start > 40.0  # without drops it is trimmed from the front
+
+
+def test_unfinished_ending_extends_across_one_backchannel(settings, caplog):
+    caplog.set_level(logging.INFO, logger="hookline.pipeline.select")
+    texts = {17: "and what we found was...", 18: "Yeah.", 19: "the money was never there."}
+    assert _fix(texts, settings) == 19
+    assert "extended to L19" in caplog.text
+
+
+def test_backchannel_crossing_needs_the_next_line_to_finish(settings):
+    assert _fix({17: "and what we found was...", 18: "Yeah.", 19: "Right."}, settings) == 17
+    texts = {17: "and what we found was...", 18: "Yeah.", 19: "that...", 20: "it was."}
+    assert _fix(texts, settings) == 17
+
+
+def test_backchannel_crossing_stays_within_max_length(settings):
+    s = settings.model_copy(update={"max_clip_s": 36})  # L10-L19 is 37.2 s
+    texts = {17: "and what we found was...", 18: "Yeah.", 19: "the money was never there."}
+    assert _fix(texts, s) == 17
+
+
+def test_backchannel_crossing_stays_within_20s(settings):
+    from hookline.models import Sentence
+    from hookline.pipeline.select import _fix_ending, _RawClip
+
+    texts = {17: "and what we found was...", 18: "Yeah.", 19: "the money was never there."}
+    src = _fix_src(texts, settings.model_copy(update={"max_clip_s": 120}))
+    late = src.sentences[19]
+    src.sentences[19] = Sentence(start=late.start + 20, end=late.end + 20, text=late.text)
+    item = _line_item(10, 17, _FILLER.format(n=10), texts[17])
+    assert _fix_ending(_RawClip.model_validate(item), 10, 17, src) == 17
+
+
+def test_system_prompt_has_no_examples_from_the_test_video():
+    low = SYSTEM_PROMPT.lower()
+    for needle in ("war worth it", "a little rude", "come to mock", "activists versus big money"):
+        assert needle not in low, needle
+
+
+def test_system_prompt_covers_wave_c():
+    for needle in (
+        "`drop_lines`",
+        "scores about 14",
+        "the payoff is after the interviewer's",
+        "I said",
+        "mid-line",
+    ):
+        assert needle in SYSTEM_PROMPT, needle
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Public Access Television Explained: Why Small Towns Fought Cable Giants for Air",
+        "How One Line Cook Ran a Three Hundred Cover Saturday Service Alone and the",
+        "The Real Reason Small Restaurants Close in Their First Year of Business With",
+    ],
+)
+def test_search_title_never_ends_on_a_function_word(text):
+    from hookline.pipeline.select import _clip_title
+
+    out = _clip_title(text)
+    assert len(out) <= 70 and text.startswith(out)
+    assert out.split()[-1].lower() not in {
+        "for", "to", "of", "and", "the", "a", "an", "with", "in", "on", "at", "by", "or",
+    }  # fmt: skip
+
+
+def test_search_title_schema_states_the_limit():
+    props = SELECTION_SCHEMA["properties"]["clips"]["items"]["properties"]
+    assert "70" in props["search_title"].get("description", "")

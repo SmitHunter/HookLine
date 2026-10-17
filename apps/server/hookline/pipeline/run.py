@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 from collections.abc import Callable
@@ -9,9 +10,10 @@ from hookline.fsutil import atomic_write_text, slugify
 from hookline.llm import LLMBackend
 from hookline.media.audio import rms_per_second
 from hookline.media.ffmpeg import FFmpegError, extract_audio, pick_encoder
-from hookline.models import ClipPick, Transcript
+from hookline.models import ClipPick, Transcript, Word
 from hookline.pipeline.chat import chat_keywords, chat_rate, try_fetch_chat
 from hookline.pipeline.ingest import find_source, ingest, job_id_for
+from hookline.pipeline.package import apply_caption_fixes, package_clips
 from hookline.pipeline.render import render_clip
 from hookline.pipeline.select import NoClipsSelectedError, select_clips
 from hookline.pipeline.signals import Signals, heat_markers, heat_seconds, loud_seconds
@@ -20,7 +22,8 @@ from hookline.transcribe.base import words_to_transcript
 from hookline.vision.faces import FaceDetector
 
 STAGES = 6
-PICKS_SCHEMA = 3  # bump when picks change shape or meaning, so old picks.json re-select
+PICKS_SCHEMA = 4  # bump when picks change shape or meaning, so old picks.json re-select
+PACKAGE_SCHEMA = 1  # bump when the packaging pass changes, so old package.json re-runs
 
 
 def transcript_key(transcriber: Transcriber) -> dict:
@@ -105,6 +108,49 @@ def _load_picks(ppath: Path, key: dict, log: Callable[[str], None]) -> list[Clip
         log(f"[5/6] select: settings changed ({', '.join(changed)}); re-selecting")
         return None
     return picks
+
+
+def _package(
+    job_dir: Path,
+    picks: list[ClipPick],
+    words: list[Word],
+    llm: LLMBackend,
+    settings: Settings,
+    log: Callable[[str], None],
+) -> list[ClipPick]:
+    """Packaged picks: cached in package.json, keyed by the exact picks it was made from, so a
+    re-run neither re-calls Claude nor reuses packaging for different picks. A failed pass
+    keeps the selection-time packaging and is retried on the next run."""
+    ppath = job_dir / "package.json"
+    dump = [p.model_dump(mode="json") for p in picks]
+    digest = hashlib.sha1(json.dumps(dump, sort_keys=True).encode()).hexdigest()
+    key = {"schema": PACKAGE_SCHEMA, "select_model": settings.select_model, "picks": digest}
+    if ppath.exists():
+        try:
+            data = json.loads(ppath.read_text(encoding="utf-8"))
+            if data["key"] == key:
+                log("[5/6] package: skipped (cached)")
+                return [ClipPick.model_validate(d) for d in data["picks"]]
+        except (ValueError, TypeError, KeyError):
+            log("warning: package.json is corrupt; re-running packaging")
+    log("[5/6] package: started")
+    raw: list[dict] = []
+    packaged = package_clips(picks, words, llm, settings, raw_sink=raw)
+    atomic_write_text(job_dir / "package_raw.json", json.dumps(raw, indent=2, ensure_ascii=False))
+    if packaged is picks:
+        log("warning: packaging pass failed; using the selection-time packaging")
+        return picks
+    atomic_write_text(
+        ppath,
+        json.dumps(
+            {"key": key, "picks": [p.model_dump(mode="json") for p in packaged]},
+            indent=2,
+            ensure_ascii=False,
+        ),
+    )
+    fixes = sum(len(p.caption_fixes) for p in packaged)
+    log(f"[5/6] package: done ({len(packaged)} clips, {fixes} caption fixes)")
+    return packaged
 
 
 def _signals(
@@ -251,11 +297,13 @@ def run_job(
         )
         log(f"[5/6] select: done ({len(picks)} clips)")
 
+    words = transcript.words()
+    picks = _package(job_dir, picks, words, llm, settings, log)
+
     log(f"[6/6] render: started ({len(picks)} clips)")
     out_dir = settings.output_dir / job_id
     work_dir = job_dir / "render"
     detector = _face_detector(settings, log)
-    words = transcript.words()
     # Segment-interpolated word times are contiguous (no gaps), so protecting them from cuts
     # would remove no dead air at all; only real word timings (DTW / whisper) are protected.
     protect = transcript.timing != "segment"
@@ -269,7 +317,7 @@ def run_job(
                 src,
                 wav,
                 pick,
-                words,
+                apply_caption_fixes(words, pick.caption_fixes),
                 work_dir,
                 dst,
                 settings,

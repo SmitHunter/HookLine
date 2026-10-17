@@ -465,9 +465,12 @@ def first_words_match(first_words: str, spoken: str) -> float:
     return SequenceMatcher(None, want, got, autojunk=False).ratio()
 
 
-def _check_opening(words: list[Word] | None, first_words: str, seam: float | None) -> CheckResult:
+def _check_opening(
+    words: list[Word] | None, first_words: str, seam: float | None, declared: bool = False
+) -> CheckResult:
     """Q6: speech by 0.5 s, and the opening (after a cold-open seam, where the declared first
-    sentence begins) matches `first_words` in order."""
+    sentence begins) matches `first_words` in order. `declared` marks Claude's own first_words
+    (`declared_first_words`), not the start the boundary code moved to."""
     thr = f"speech <= {SPEECH_START_MAX:g}s, first_words match >= {FIRST_WORDS_MIN:.0%}"
     if words is None:
         return CheckResult("Q6", False, None, thr, "no caption_words in sidecar (re-render)")
@@ -477,7 +480,8 @@ def _check_opening(words: list[Word] | None, first_words: str, seam: float | Non
     main = [w for w in words if seam is None or w.start >= seam - 0.05]
     match = first_words_match(first_words, " ".join(w.text for w in main))
     ok = start <= SPEECH_START_MAX and match >= FIRST_WORDS_MIN
-    detail = f"speech at {start:.2f}s; first_words match {match:.0%}"
+    label = "declared first_words" if declared else "first_words"
+    detail = f"speech at {start:.2f}s; {label} match {match:.0%}"
     if seam is not None:
         detail += f" after the seam at {seam:.2f}s"
     if not first_words.strip():
@@ -562,7 +566,12 @@ def audit_clip(
         _check_safe_zone([*cap_grey, *hook_grey]),
         _check_face(face_samples, layouts, steps),
         _check_hook(hooks, hook_heights, duration),
-        _check_opening(words, sidecar.get("first_words") or "", sidecar.get("seam")),
+        _check_opening(
+            words,
+            sidecar.get("declared_first_words") or sidecar.get("first_words") or "",
+            sidecar.get("seam"),
+            declared=bool(sidecar.get("declared_first_words")),
+        ),
         _check_pacing(sidecar, duration),
         _check_encode(_probe(mp4)),
     ]

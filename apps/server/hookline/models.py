@@ -74,6 +74,16 @@ Verdict = Literal["post", "maybe", "skip"]
 CommentRisk = Literal["low", "medium", "high"]
 
 
+class CaptionFix(BaseModel):
+    """A 1:1 caption word replacement from the packaging pass: the source word at
+    [start, end] whose transcript text was `original` is captioned as `text`."""
+
+    start: float
+    end: float
+    original: str
+    text: str
+
+
 class ClipPick(BaseModel):
     start: float
     end: float
@@ -93,11 +103,23 @@ class ClipPick(BaseModel):
     search_title: str = ""
     category: str = ""
     comment_risk: CommentRisk | None = None
+    # Fix wave C: Claude's own first_words (Q6 checks the clip against them), interior source
+    # ranges cut out of the main span (dropped asides), and caption fixes from packaging.
+    declared_first_words: str = ""
+    drops: list[tuple[float, float]] = []
+    caption_fixes: list[CaptionFix] = []
 
     @property
     def duration(self) -> float:
         return sum(e - s for s, e in self.segments())
 
     def segments(self) -> list[tuple[float, float]]:
-        main = (self.start, self.end)
-        return [self.cold_open, main] if self.cold_open else [main]
+        """The cold open (if any), then the main span with every drop cut out of it."""
+        main: list[tuple[float, float]] = []
+        cursor = self.start
+        for a, b in sorted(self.drops):
+            if cursor < a and b < self.end:
+                main.append((cursor, a))
+                cursor = b
+        main.append((cursor, self.end))
+        return [self.cold_open, *main] if self.cold_open else main

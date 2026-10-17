@@ -5,9 +5,23 @@ import pytest
 
 from hookline.media.ffmpeg import probe_duration, probe_size
 from hookline.models import Segment, Transcript, Word
+from hookline.pipeline import package as package_mod
+from hookline.pipeline import run as run_mod
 from hookline.pipeline.ingest import job_id_for
 from hookline.pipeline.run import NoClipsSelectedError, run_job
 from tests.test_select import raw
+
+
+@pytest.fixture(autouse=True)
+def _no_packaging(monkeypatch):
+    """The packaging pass is its own LLM call; tests here queue only selection payloads, so
+    it is a pass-through unless a test restores it (`real_packaging`)."""
+    monkeypatch.setattr(run_mod, "package_clips", lambda picks, *a, **k: picks)
+
+
+@pytest.fixture
+def real_packaging(monkeypatch):
+    monkeypatch.setattr(run_mod, "package_clips", package_mod.package_clips)
 
 
 class FakeTranscriber:
@@ -186,7 +200,7 @@ def test_picks_cache_key_mismatch_reselects(fixture_video, fake_llm, settings_tm
     job = s.workspace_dir / job_id_for(str(fixture_video))
     saved = json.loads((job / "picks.json").read_text(encoding="utf-8"))
     assert saved["key"] == {
-        "schema": 3,
+        "schema": 4,
         "clips": 1,
         "select_model": s.select_model,
         "min_clip_s": s.min_clip_s,
@@ -489,7 +503,53 @@ def test_run_job_passes_loud_seconds_to_render(fixture_video, fake_llm, settings
     assert seen == [set(range(20, 25))]
 
 
-def test_picks_schema_is_3_for_sentence_lines_and_cold_open_words(settings):
+def test_picks_schema_is_4_for_drop_lines_and_declared_first_words(settings):
     from hookline.pipeline.run import PICKS_SCHEMA, _picks_key
 
-    assert PICKS_SCHEMA == 3 and _picks_key(settings, {})["schema"] == 3
+    assert PICKS_SCHEMA == 4 and _picks_key(settings, {})["schema"] == 4
+
+
+def test_packaging_pass_runs_once_and_fixes_captions(
+    fixture_video, fake_llm, settings_tmp, real_packaging
+):
+    s = settings_tmp.model_copy(update={"clips": 1, "vertical": False})
+    answer = {
+        "clip": 1,
+        "hook_text": "Kitchen keys at nineteen",
+        "title": "Keys at nineteen",
+        "post_caption": "Handed the keys at nineteen. Trust or a test?",
+        "hashtags": ["linecook", "kitchenlife", "chefstories"],
+        "search_title": "Line Cook Handed the Kitchen Keys at 19",
+        "verdict": "post",
+        "caption_fixes": [{"index": 1, "text": "sails"}],
+    }
+    fake_llm.queue(make_payload_for(150, 1, 21), {"clips": [answer]})
+    t = FakeTranscriber(duration=150)
+    (clip,) = run_job(str(fixture_video), s, fake_llm, t)
+    side = json.loads(clip.with_suffix(".json").read_text(encoding="utf-8"))
+    assert side["hook_text"] == "Kitchen keys at nineteen"
+    assert side["search_title"] == "Line Cook Handed the Kitchen Keys at 19"
+    (fix,) = side["caption_fixes"]
+    assert (fix["original"], fix["text"], fix["start"]) == ("says", "sails", 30.75)
+    texts = [w[2] for w in side["caption_words"]]
+    assert texts[:2] == ["line10", "sails"] and texts.count("says") == 6
+    job = s.workspace_dir / job_id_for(str(fixture_video))
+    assert (job / "package.json").exists() and (job / "package_raw.json").exists()
+    run_job(str(fixture_video), s, fake_llm, t)  # cached: neither selection nor packaging
+    assert len(fake_llm.calls) == 2
+
+
+def test_failed_packaging_keeps_selection_copy_and_retries_next_run(
+    fixture_video, fake_llm, settings_tmp, real_packaging
+):
+    from hookline.llm import LLMError
+
+    s = settings_tmp.model_copy(update={"clips": 1, "vertical": False, "captions": False})
+    payload = make_payload_for(150, 1, 21)
+    fake_llm.queue(payload, LLMError("down"), LLMError("down"))
+    logs: list[str] = []
+    (clip,) = run_job(str(fixture_video), s, fake_llm, FakeTranscriber(duration=150), logs.append)
+    side = json.loads(clip.with_suffix(".json").read_text(encoding="utf-8"))
+    assert side["hook_text"] == payload["clips"][0]["hook_text"] and side["caption_fixes"] == []
+    job = s.workspace_dir / job_id_for(str(fixture_video))
+    assert not (job / "package.json").exists()

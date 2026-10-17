@@ -293,6 +293,15 @@ def test_first_words_match_after_trimmed_filler_opener(good_mp4, tmp_path):
     assert _by_id(audit_clip(good_mp4, side, _ass(tmp_path)))["Q6"].ok
 
 
+def test_q6_compares_against_the_declared_first_words(good_mp4, tmp_path):
+    # real case: the opener guard moved the start and first_words followed it, so Q6 passed
+    side = _sidecar(declared_first_words="Nobody saw it coming.")
+    by = _by_id(audit_clip(good_mp4, side, _ass(tmp_path)))
+    assert not by["Q6"].ok and "declared" in by["Q6"].detail
+    side = _sidecar(first_words="Nobody saw it coming.", declared_first_words=FIRST)
+    assert _by_id(audit_clip(good_mp4, side, _ass(tmp_path)))["Q6"].ok
+
+
 def test_first_words_checked_after_the_cold_open_seam(good_mp4, tmp_path):
     side = _sidecar(first_words="Then something big happens.", seam=2.5)
     assert _by_id(audit_clip(good_mp4, side, _ass(tmp_path)))["Q6"].ok
