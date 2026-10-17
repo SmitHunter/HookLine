@@ -756,19 +756,75 @@ def test_track_close_up_jitter_inside_the_guard_margin_holds_still():
     assert len(vals) == 1
 
 
-def test_track_close_up_too_wide_for_the_margin_stays_inside_the_crop():
-    # wave D supersedes the wave B "no containment for tight close-ups" rule: a face too wide
-    # to jitter freely is still kept 8% inside the crop (or centred when wider than that)
+def test_track_close_up_that_fits_the_margin_stays_inside_it():
+    # a face that just fits inside the crop with the 8% margins is kept there by the guard
     kfs = [(0.0, 0.5)] + [(i * 0.5, 0.5 + (0.03 if i % 2 else -0.03)) for i in range(1, 16)]
     from hookline.media.reframe import _median3
 
     med = _median3([x for _, x in kfs])  # the guard follows the outlier-filtered position
-    for face_w in (0.24, 0.26):
+    for face_w in (0.2, 0.22):
         expr = track_x_expr(kfs, in_w=1280, crop_w=404, face_w=face_w)
         for (t, _), x in zip(kfs, med, strict=True):
             left = evaluate(expr, t=t)
             assert left + 0.08 * 404 - 1e-6 <= (x - face_w / 2) * 1280
             assert (x + face_w / 2) * 1280 <= left + 404 - 0.08 * 404 + 1e-6
+
+
+def test_track_close_up_wider_than_the_margin_keeps_the_deadband_with_containment():
+    # review round 1: a face wider than the guard room is not guarded (no 1:1 jitter following,
+    # no zoom hold); the deadband/EMA path only moves the crop as far as keeping it inside
+    from hookline.media.reframe import _median3, track_guard_spans
+
+    kfs = [(0.0, 0.5)] + [(i * 0.5, 0.5 + (0.03 if i % 2 else -0.03)) for i in range(1, 16)]
+    med = _median3([x for _, x in kfs])
+    face_w = 0.3  # 384 px of a 404 px crop
+    expr = track_x_expr(kfs, in_w=1280, crop_w=404, face_w=face_w)
+    lefts = [evaluate(expr, t=t) for t, _ in kfs]
+    core = 0.8 * face_w  # the face core: the detector box without ears/cheek edges
+    for left, x in zip(lefts, med, strict=True):
+        assert left - 1e-6 <= (x - core / 2) * 1280  # the face core stays inside the crop
+        assert (x + core / 2) * 1280 <= left + 404 + 1e-6
+    face_moves = max(abs(b - a) for a, b in pairwise(med)) * 1280  # 76.8 px
+    assert max(abs(b - a) for a, b in pairwise(lefts)) < face_moves * 0.5  # not 1:1
+    assert track_guard_spans(kfs, 1280, 404, face_w) == []
+
+
+def test_whole_scene_webcam_close_up_caps_the_zoom_and_keeps_steps():
+    # a full-screen webcam face ~0.8 of the crop width: the zoom is capped so the face still
+    # fits with the margin, the scene is never guarded, and its cut steps survive
+    from hookline.media.reframe import guard_zoom, track_guard_spans
+
+    in_w, in_h, cw = 1920, 1080, 606
+    fw = 0.8 * cw / in_w
+    kfs = [(i * 0.25, 0.5 + (0.004 if i % 2 else -0.004)) for i in range(40)]
+    lay = SceneLayout(
+        start=0, end=10, kind="FACE_TRACK", track_x=kfs, track_w=[fw] * 40, face_w=fw,
+        face_box=(0.25, 0.5), head_top=0.0,
+    )  # fmt: skip
+    plan = plan_zoom(lay, in_w, in_h)
+    top = plan.zoom_level(ZOOM_PUNCH)
+    assert top * 0.8 <= 1 - 2 * 0.08 + 1e-6  # the face fits the visible crop with margins
+    assert track_guard_spans(kfs, in_w, cw, fw, [fw] * 40, zoom_top=top) == []
+    steps = [(0.0, 1.0), (2.0, ZOOM_IN), (5.0, 1.0), (7.0, ZOOM_PUNCH)]
+    held, lays = guard_zoom([plan], in_w, in_h, steps, cut_times=[2.0, 5.0])
+    assert held == steps and lays[0].shift_steps == []
+
+
+def _lean_layout() -> SceneLayout:
+    xs = [0.5] * 8 + [0.6, 0.7, 0.75, 0.75, 0.75, 0.75, 0.7, 0.6] + [0.5] * 8
+    return SceneLayout(
+        start=0, end=6, kind="FACE_TRACK", track_x=[(i * 0.25, x) for i, x in enumerate(xs)],
+        face_w=0.13, face_box=(0.3, 0.3), head_top=0.15,
+    )  # fmt: skip
+
+
+def test_track_guard_width_ignores_one_stray_wide_detection():
+    from hookline.media.reframe import track_guard_spans
+
+    kfs = [(i * 0.25, 0.5) for i in range(20)]
+    widths = [0.13] * 20
+    widths[9] = 0.4  # one oversize box (a hand in front of the face)
+    assert track_guard_spans(kfs, 1920, 486, 0.13, widths) == []
 
 
 def test_zoom_schedule_punch_not_moved_onto_a_cut_before_min_step():
@@ -957,10 +1013,14 @@ def test_track_lead_biases_the_crop_toward_the_gaze_within_containment():
     right = track_x_expr(kfs, in_w=in_w, crop_w=cw, face_w=0.1, lead=0.08)
     assert evaluate(left, 1.0) == pytest.approx(centre - 0.08 * cw, abs=0.5)  # room on the left
     assert evaluate(right, 1.0) == pytest.approx(centre + 0.08 * cw, abs=0.5)
-    # a close-up too wide for the full lead keeps the face 8% inside the crop
-    wide = track_x_expr(kfs, in_w=in_w, crop_w=cw, face_w=0.2, lead=-0.08)
-    assert _inside(evaluate(wide, 1.0), cw, 0.5, 0.2, in_w, 0.08)
-    assert evaluate(wide, 1.0) < centre  # still leans the way she looks
+    # the widest guarded face still takes the lead and stays 8% inside
+    snug = track_x_expr(kfs, in_w=in_w, crop_w=cw, face_w=0.17, lead=-0.08)
+    assert _inside(evaluate(snug, 1.0), cw, 0.5, 0.17, in_w, 0.08)
+    assert evaluate(snug, 1.0) < centre  # leans the way she looks
+    # a tight close-up (wider than the guard room) keeps its face core inside the crop
+    wide = track_x_expr(kfs, in_w=in_w, crop_w=cw, face_w=0.24, lead=-0.08)
+    assert _inside(evaluate(wide, 1.0), cw, 0.5, 0.24 * 0.8, in_w, 0.0)
+    assert evaluate(wide, 1.0) < centre
     # the lead alone never engages the guard (no zoom hold for a steady, well-framed face)
     assert track_guard_spans(kfs, in_w, cw, 0.2, lead=-0.08) == []
 
@@ -980,16 +1040,66 @@ def test_scene_filter_holds_zoom_at_base_while_the_guard_is_active():
 
 
 def test_scene_filter_face_track_guard_holds_the_zoom():
-    xs = [0.5] * 8 + [0.6, 0.7, 0.75, 0.75, 0.7, 0.6] + [0.5] * 8
-    lay = SceneLayout(
-        start=0, end=6, kind="FACE_TRACK", track_x=[(i * 0.25, x) for i, x in enumerate(xs)],
-        face_w=0.13, face_box=(0.3, 0.3), head_top=0.15,
-    )  # fmt: skip
-    steps = [(0.0, 1.0), (1.0, ZOOM_IN), (5.0, 1.0)]
-    chain = scene_filter(lay, 1920, 864, "a", "b", zoom_steps=steps)
+    from hookline.media.reframe import guard_zoom
+
+    lay = _lean_layout()
+    steps = [(0.0, 1.0), (0.5, ZOOM_IN), (5.5, 1.0)]
+    held, lays = guard_zoom([lay], 1920, 864, steps, cut_times=[])
+    chain = scene_filter(lays[0], 1920, 864, "a", "b", zoom_steps=held)
     s = chain.split("scale=w='trunc(1080*(", 1)[1].split(")/2)*2'", 1)[0].replace("\\,", ",")
-    assert evaluate(s, 1.5) > 1.0  # zoomed before the lean
+    assert evaluate(s, 1.2) > 1.0  # zoomed before the lean
     assert evaluate(s, 2.9) == pytest.approx(1.0)  # held at base during it
+    # a zoom-in within CUT_QUIET before the hold joins it: no in-then-out pumping
+    near, _ = guard_zoom([lay], 1920, 864, [(0.0, 1.0), (1.2, ZOOM_IN)], cut_times=[])
+    assert (1.2, ZOOM_IN) not in near and evaluate(zoom_expr(near), 2.9) == 1.0
+
+
+def test_guard_zoom_keeps_a_framing_change_at_a_cut_inside_a_span():
+    # review round 1: a cut inside a guard span still changes the framing instantly, either
+    # with a zoom step that keeps the face inside the margin or a shift toward the centre
+    from hookline.media.reframe import guard_zoom, track_guard_spans
+
+    lay = _lean_layout()
+    rel = lay.track_x
+    spans = track_guard_spans(rel, 1920, 486, 0.13, zoom_top=1.12)
+    (a, b), *_ = spans
+    cut = round((a + b) / 2, 3)
+    steps = [(0.0, 1.0), (1.0, ZOOM_IN), (cut, 1.0), (5.5, ZOOM_IN)]
+    held, lays = guard_zoom([lay], 1920, 864, steps, cut_times=[cut])
+    zoom_at_cut = [v for t, v in held if t == cut]
+    shifts = [t for t, _ in lays[0].shift_steps]
+    assert zoom_at_cut or cut in shifts
+    if zoom_at_cut:
+        before = [v for t, v in held if t < cut][-1]
+        assert zoom_at_cut[0] != before
+    # the return to the schedule never lands within CUT_QUIET of the cut
+    for t, _ in held:
+        if cut < t < cut + 1.0 - 1e-9:
+            raise AssertionError((t, held))
+
+
+def test_guard_zoom_return_step_moves_onto_a_nearby_cut():
+    from hookline.media.reframe import guard_zoom, track_guard_spans
+
+    lay = _lean_layout()
+    (_, b), *_ = track_guard_spans(lay.track_x, 1920, 486, 0.13, zoom_top=1.12)
+    cut = round(b + 0.5, 3)
+    steps = [(0.0, 1.0), (1.0, ZOOM_IN), (cut, 1.0)]
+    held, _ = guard_zoom([lay], 1920, 864, steps, cut_times=[cut])
+    assert all(not (b - 1e-9 <= t < cut) for t, _ in held), held  # no return 0.5 s before it
+
+
+def test_scene_filter_applies_shift_steps_instantly_at_cuts():
+    lay = SceneLayout(
+        start=0, end=6, kind="FACE_TRACK", track_x=[(0, 0.5), (6, 0.5)], face_w=0.1,
+        shift_steps=[(2.0, 0.04), (4.0, 0.0)],
+    )  # fmt: skip
+    chain = scene_filter(lay, 1920, 864, "a", "b", zoom_steps=[(0.0, 1.0)], cut_times=[2.0])
+    x = chain.split("crop=", 1)[1].split(":", 3)[2].replace("\\,", ",")
+    base = 960 - 243
+    assert evaluate(x, 1.9) == pytest.approx(base)
+    assert evaluate(x, 2.0) == pytest.approx(base + 0.04 * 486, abs=0.5)  # instant at the cut
+    assert evaluate(x, 5.0) == pytest.approx(base)
 
 
 def test_zoom_expr_steps_at_cuts_are_instant():

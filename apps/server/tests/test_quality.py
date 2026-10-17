@@ -420,3 +420,13 @@ def test_face_check_uses_the_schedule_levels_not_the_rendered_zooms():
     old = {"zoom_steps": [[0.0, 1.0], [2.0, 1.12]]}  # pre-wave-D sidecars recorded levels
     assert zoom_levels(old) == [[0.0, 1.0], [2.0, 1.12]]
     assert zoom_levels({}) == []
+
+
+def test_q7_counts_guard_shift_steps_and_reads_the_guarded_zoom_steps():
+    from hookline.quality import _check_pacing
+
+    lay = {"start": 0.0, "end": 20.0, "kind": "FACE_TRACK", "shift_steps": [[9.0, 0.04]]}
+    side = {"cut_times": [], "layout": [lay], "zoom_steps": [[0.0, 1.0], [4.5, 1.072]]}
+    held = _check_pacing({**side, "layout": [{**lay, "shift_steps": []}]}, 13.0)
+    assert not held.ok and held.value == pytest.approx(8.5)  # a guard hold, honestly reported
+    assert _check_pacing(side, 13.0).ok  # the shift at 9.0 is a framing change

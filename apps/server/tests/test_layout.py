@@ -253,7 +253,7 @@ def test_plan_layouts_override_and_crop_pass_through(tmp_path):
     assert det.frames == []  # override needs no detection
 
 
-def test_plan_layouts_failed_scene_falls_back_to_fit_blur(tmp_path, monkeypatch):
+def test_plan_layouts_failed_scene_falls_back_to_fit_blur(tmp_path, monkeypatch, caplog):
     from hookline.media.ffmpeg import FFmpegError
     from hookline.pipeline import layout
 
@@ -275,8 +275,12 @@ def test_plan_layouts_failed_scene_falls_back_to_fit_blur(tmp_path, monkeypatch)
 
     monkeypatch.setattr(layout, "sample_frames", flaky)
     face = Face(x=0.4, y=0.2, w=0.2, h=0.4, score=0.9)
-    layouts = plan_layouts(video, _RecordingDetector([face]))
+    with caplog.at_level("WARNING"):
+        layouts = plan_layouts(video, _RecordingDetector([face]))
     assert [s.kind for s in layouts] == ["FIT_BLUR", "FACE_TRACK"]
+    # never silent: the warning names the video, the scene and the fallback layout
+    (msg,) = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert "cut.mp4" in msg and "0.00-3.00" in msg and "FIT_BLUR" in msg and "no frame" in msg
 
 
 @pytest.mark.integration

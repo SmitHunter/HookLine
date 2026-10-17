@@ -33,6 +33,8 @@ from hookline.media.reframe import (
     combine_crop,
     detect_crop,
     detect_overlay_bands,
+    face_offset,
+    guard_zoom,
     plan_zoom,
     reframe_graph,
     rendered_zoom_steps,
@@ -43,7 +45,13 @@ from hookline.models import ClipPick, Word
 from hookline.pipeline.boundaries import refine_boundaries
 from hookline.pipeline.deadair import keep_ranges, remap_words, snap_ranges
 from hookline.pipeline.layout import SceneLayout, plan_layouts
-from hookline.pipeline.timing import VOICE_MARGIN_DB, refine_word_ends, snap_onsets, tail_end
+from hookline.pipeline.timing import (
+    protected_words,
+    refine_word_ends,
+    snap_onsets,
+    tail_end,
+    voice_threshold,
+)
 from hookline.vision.faces import Crop, FaceDetector
 
 INTERMEDIATE_QUALITY = ["-preset", "veryfast", "-crf", "12"]
@@ -235,40 +243,37 @@ def render_clip(
     silences = detect_silences(wav, lo, hi, settings.silence_db)
     # word ends/onsets from the audio (DTW gives single-token words a synthetic 0.15 s end)
     env = energy_envelope(wav, lo, hi + 1)
-    voice_db = settings.silence_db - VOICE_MARGIN_DB
-    near = [w for w in words if w.end > lo and w.start < hi]
-    near = snap_onsets(refine_word_ends(near, env, voice_db), env, voice_db)
+    voice_db = voice_threshold(env, settings.silence_db)  # from the local noise floor
+    raw = [w for w in words if w.end > lo and w.start < hi]
+    near = snap_onsets(refine_word_ends(raw, env, voice_db), env, voice_db)
     refined = refine_boundaries(pick, near, silences, loud_seconds=loud_seconds)
     fps = probe_fps(src)
     # Frame-grid bounds make the cut timeline exact, so remapped caption times stay in sync.
-    keep = snap_ranges(
-        _with_tail(
-            keep_ranges(
-                refined.segments(),
-                silences,
-                settings.max_pause_s,
-                settings.dead_air_pad_s,
-                words=near if protect_words else None,
-            ),
-            near,
-            env,
-            voice_db,
-        ),
-        fps,
+    untailed = keep_ranges(
+        refined.segments(),
+        silences,
+        settings.max_pause_s,
+        settings.dead_air_pad_s,
+        # dead air trusts a refined word end only so far past the transcript's
+        words=protected_words(raw, near) if protect_words else None,
     )
+    keep = snap_ranges(_with_tail(untailed, near, env, voice_db), fps)
+    # words starting in the tail (no audible onset: see `tail_end`) are not captioned
+    spoken = [w for w in near if w.start < untailed[-1][1] - 1e-6] if untailed else near
 
     inter = cut_segments(
         src, keep, work_dir / f"{name}.mkv", "libx264", quality=INTERMEDIATE_QUALITY, fps=fps
     )
     loudness = measure_loudness(inter, COMPRESSOR)
-    kept_s = sum(e - s for s, e in keep)
-    audio_args = ["-af", f"{loudnorm_filter(loudness)},{audio_fades(kept_s)}"] if loudness else []
+    duration = probe_duration(inter)
+    audio_args: list[str] = []
+    if loudness is not None:  # the clip has audio
+        audio_args = ["-af", f"{loudnorm_filter(loudness)},{audio_fades(duration)}"]
     letterbox = detect_crop(inter)
     size = probe_size(inter)
     crop, bands = letterbox, None
 
-    duration = probe_duration(inter)
-    out_words = remap_words(near, keep)
+    out_words = remap_words(spoken, keep)
     cuts = cut_times_for(keep)
     layouts: list[SceneLayout] = []
     steps: list[tuple[float, float]] = []
@@ -285,6 +290,12 @@ def render_clip(
             boundaries=[w.end for w in out_words if w.text.rstrip().endswith(_SENTENCE_END)],
             changes=[lay.start for lay in layouts[1:]],  # no beat step next to a camera change
         )
+        # the edge guard's holds/shifts, once: the graph and the sidecar get the same steps
+        steps, layouts = guard_zoom(layouts, in_w, in_h, steps, cuts)
+        layouts = [
+            lay.model_copy(update={"face_dx": face_offset(lay, in_w, in_h, steps)})
+            for lay in layouts
+        ]
         graph = reframe_graph(layouts, in_w, in_h, crop=crop, zoom_steps=steps, cut_times=cuts)
     else:
         graph = _horizontal_graph(crop)
@@ -334,13 +345,16 @@ def render_clip(
     inter.unlink(missing_ok=True)
 
     kept = sum(e - s for s, e in keep)
+    segments = [list(sg) for sg in refined.segments()]
+    if segments and keep and keep[-1][1] > segments[-1][1]:
+        segments[-1][1] = keep[-1][1]  # the end tail is part of the clip's span
     return {
-        "segments": [list(s) for s in refined.segments()],
+        "segments": segments,
         "layout": [lay.model_dump(mode="json") for lay in layouts],
         "keep_ranges": [list(k) for k in keep],
-        "removed_s": round(max(refined.duration - kept, 0.0), 3),
+        "removed_s": round(max(sum(b - a for a, b in segments) - kept, 0.0), 3),
         "cut_times": cuts,
-        # as rendered (each scene's zoom plan applied); `zoom_levels` keeps the schedule
+        # as rendered (guard holds applied, each scene's zoom plan); `zoom_levels` the levels
         "zoom_steps": [list(st) for st in rendered_zoom_steps(layouts, steps)] if layouts else [],
         "zoom_levels": [list(st) for st in steps],
         "overlay_bands": list(bands) if bands else None,

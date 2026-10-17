@@ -10,12 +10,25 @@ import numpy as np
 from hookline.media.audio import Envelope
 from hookline.models import Word
 
-__all__ = ["VOICE_MARGIN_DB", "Envelope", "refine_word_ends", "snap_onsets", "tail_end"]
+__all__ = [
+    "Envelope",
+    "protected_words",
+    "refine_word_ends",
+    "snap_onsets",
+    "tail_end",
+    "voice_threshold",
+]
 
-# Voice threshold: this far below the dead-air silence threshold (-32 -> -44 dB). Speech on the
-# podcast sits around -30 dB and dips under -32 inside words; room tone is under -55 dB.
+# Voice threshold (`voice_threshold`): FLOOR_MARGIN_DB over the envelope's FLOOR_QUANTILE (the
+# local noise floor), kept between VOICE_MARGIN_DB below the dead-air silence threshold
+# (-32 -> -44 dB on a clean source: speech sits around -30 dB and dips under -32 inside words)
+# and that silence threshold itself (a noisy source's bed must never count as voice).
+FLOOR_QUANTILE = 10
+FLOOR_MARGIN_DB = 9.0
 VOICE_MARGIN_DB = 12.0
-MAX_WORD_S = 1.5  # a word end is never extended past this long after its start
+MAX_WORD_S = 1.5  # a word end is never extended past this long after its start ...
+MAX_EXTEND_S = 0.6  # ... nor more than this past its transcribed end without an energy fall
+PROTECT_S = 0.3  # dead-air protection trusts a refined end at most this past the transcript's
 MIN_QUIET_S = 0.05  # a dip must last this long to count as silence (stops bridge)
 MIN_VOICED_S = 0.03  # ... and a rise must stay voiced this long to count as an onset
 PAUSE_S = 0.2  # a word this long after the previous one's end follows a pause
@@ -53,13 +66,42 @@ def _quiet_from(env: Envelope, start: float, limit: float, threshold_db: float) 
     return env.time(run_start) if run and run_start is not None else None
 
 
+def voice_threshold(env: Envelope, silence_db: float) -> float:
+    """dB above which the envelope counts as voice: the local noise floor (its FLOOR_QUANTILE
+    percentile) + FLOOR_MARGIN_DB, within [silence_db - VOICE_MARGIN_DB, silence_db]."""
+    if not len(env.db):
+        return silence_db - VOICE_MARGIN_DB
+    floor = float(np.percentile(env.db, FLOOR_QUANTILE))
+    return min(max(floor + FLOOR_MARGIN_DB, silence_db - VOICE_MARGIN_DB), silence_db)
+
+
+def protected_words(raw: list[Word], refined: list[Word]) -> list[Word]:
+    """`refined` words (same order as `raw`) whose ends trust the refinement at most
+    PROTECT_S past the transcript's end: what dead-air cutting keeps out of its cuts."""
+    return [
+        r.model_copy(update={"end": min(r.end, round(w.end + PROTECT_S, 3))})
+        for w, r in zip(raw, refined, strict=True)
+    ]
+
+
+def _rise_from(env: Envelope, start: float, threshold_db: float) -> float:
+    """Time of the first frame from `start` that stays at or above `threshold_db` for
+    MIN_VOICED_S (an audible onset); infinity when there is none in the envelope."""
+    voiced = _frames(env, MIN_VOICED_S)
+    for k in range(env.index(start), len(env.db)):
+        if (env.db[k : k + voiced] >= threshold_db).all():
+            return env.time(k)
+    return np.inf
+
+
 def refine_word_ends(
     words: list[Word], env: Envelope, threshold_db: float, max_word_s: float = MAX_WORD_S
 ) -> list[Word]:
     """Each word's end moved later to where the energy falls below `threshold_db` for
     MIN_QUIET_S (shorter dips, e.g. stop consonants, are bridged), never past the next
-    word's start nor `max_word_s` after its own start. Ends only ever grow; words outside
-    the envelope are untouched."""
+    word's start nor `max_word_s` after its own start; with no such fall in reach, at most
+    MAX_EXTEND_S past its transcribed end. Ends only ever grow; words outside the envelope
+    are untouched."""
     out = list(words)
     for i, word in enumerate(words):
         limit = word.start + max_word_s
@@ -68,7 +110,7 @@ def refine_word_ends(
         if word.end >= limit or not _covers(env, word.end):
             continue
         quiet = _quiet_from(env, word.end, limit, threshold_db)
-        end = limit if quiet is None else quiet
+        end = min(limit, word.end + MAX_EXTEND_S) if quiet is None else quiet
         if end > word.end:
             out[i] = word.model_copy(update={"end": round(end, 3)})
     return out
@@ -118,8 +160,14 @@ def tail_end(
 ) -> float:
     """Clip end (source s) after the last word (ending `last_end`) for a current end `end`:
     a little (TAIL_PAD_S) into the first silence after the word, within `max_tail` of it and
-    TAIL_GUARD_S short of `next_start`; with no silence in reach, the quietest point there.
-    Never earlier than `end`."""
+    TAIL_GUARD_S short of the next word; with no silence in reach, the quietest point there.
+    A transcript `next_start` inside the last word's continuing sound (no audible onset before
+    the energy falls: DTW misplaced it) is replaced by the next audible onset after that
+    fall. Never earlier than `end`."""
+    if _covers(env, last_end):
+        fall = _quiet_from(env, last_end, last_end + max_tail, threshold_db)
+        if fall is not None and next_start < fall:
+            next_start = _rise_from(env, fall, threshold_db)
     hi = min(last_end + max_tail, next_start - TAIL_GUARD_S)
     if hi <= end or not _covers(env, last_end):
         return end

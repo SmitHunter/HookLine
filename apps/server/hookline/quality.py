@@ -493,11 +493,15 @@ def _check_opening(words: list[Word] | None, first_words: str, seam: float | Non
 
 
 def _check_pacing(side: dict, duration: float) -> CheckResult:
-    """Q7: longest stretch without a cut, zoom step or scene (layout) change."""
+    """Q7: longest stretch without a cut, zoom step (as rendered, edge-guard holds applied),
+    edge-guard crop shift or scene (layout) change."""
     thr = f"framing change every <= {PACE_MAX_GAP:g}s"
     changes = {float(t) for t in side.get("cut_times") or []}
     changes |= {float(st[0]) for st in side.get("zoom_steps") or []}
     changes |= {float(lay["start"]) for lay in side.get("layout") or []}
+    changes |= {
+        float(st[0]) for lay in side.get("layout") or [] for st in lay.get("shift_steps") or []
+    }
     pts = sorted({0.0, duration} | {t for t in changes if 0 < t < duration})
     gap, at = max((b - a, a) for a, b in pairwise(pts))
     detail = f"longest {gap:.1f}s from {at:.1f}s"

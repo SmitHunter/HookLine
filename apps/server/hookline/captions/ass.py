@@ -314,13 +314,14 @@ def _windows(has_hook: bool, duration: float, seam: float | None) -> tuple[float
 
 
 def _early(
-    groups: list[list[Word]], holds: list[float], windows: tuple[float, float, float]
+    starts: list[float], holds: list[float], windows: tuple[float, float, float]
 ) -> list[bool]:
-    """Per group: on screen with the hook or the EARLIER tag, so it uses the early line."""
+    """Per page (appearing at `starts`, see `_page_starts`; leaving at `holds`): on screen
+    with the hook or the EARLIER tag, so it uses the early line."""
     hook_end, tag_start, tag_end = windows
     return [
-        g[0].start < hook_end or (tag_end > tag_start and g[0].start < tag_end and h > tag_start)
-        for g, h in zip(groups, holds, strict=True)
+        s < hook_end or (tag_end > tag_start and s < tag_end and h > tag_start)
+        for s, h in zip(starts, holds, strict=True)
     ]
 
 
@@ -339,7 +340,8 @@ def early_until(
     cuts = _breaks(breaks, seam)
     groups = group_words(_at_breaks(_normalise(words), cuts), breaks=cuts)
     holds = _hold_ends(groups, duration, seam, breaks)
-    shown = [h for h, early in zip(holds, _early(groups, holds, windows), strict=True) if early]
+    starts = _page_starts(groups, cuts)
+    shown = [h for h, early in zip(holds, _early(starts, holds, windows), strict=True) if early]
     return max([HOOK_S, windows[2], *shown])
 
 
@@ -382,7 +384,7 @@ def build_ass(
     groups = group_words(_at_breaks(_normalise(words), cuts), breaks=cuts)
     holds = _hold_ends(groups, duration, seam, breaks)
     shown = _page_starts(groups, cuts)
-    pages = zip(groups, shown, holds, _early(groups, holds, windows), strict=True)
+    pages = zip(groups, shown, holds, _early(shown, holds, windows), strict=True)
     for group, page_start, hold_end, early in pages:
         texts = [word.text.upper() for word in group]
         # A single over-long word that cannot fit even at the minimum size keeps that size.
@@ -411,9 +413,9 @@ def face_rects(layout: SceneLayout, zoom: float = 1.0) -> list[tuple[float, floa
     hairline/upper forehead, where text is acceptable short-form practice; the core (eyes,
     nose, mouth, chin) is what captions and hooks must stay off. Placement here and the Q4b
     audit both use the core, so they agree. The layout stores only the face's (y, h); tracking
-    and split crops centre the face horizontally (a FACE_TRACK crop's gaze `lead` moves the
-    face the other way by that share of the width), and a detector box is about FACE_W_PER_H
-    as wide as tall, so x is estimated from that."""
+    and split crops centre the face horizontally (a FACE_TRACK scene records the rendered
+    face's median offset from the crop centre, `face_dx`: gaze lead and guard), and a detector
+    box is about FACE_W_PER_H as wide as tall, so x is estimated from that."""
     face = _face_px(layout)
     if face is None:
         return []
@@ -422,7 +424,9 @@ def face_rects(layout: SceneLayout, zoom: float = 1.0) -> list[tuple[float, floa
     half_w = (bottom - top) / 2 * FACE_W_PER_H
     core_top = top + FACE_CORE_TOP * (bottom - top)
     panels = (0, SPLIT_PANEL_H) if layout.kind == "SPLIT" else (0,)
-    cx = OUT_W / 2 - (layout.lead * OUT_W if layout.kind == "FACE_TRACK" else 0.0)
+    cx = OUT_W / 2
+    if layout.kind == "FACE_TRACK" and layout.face_dx is not None:
+        cx += layout.face_dx * OUT_W * layout.zoom_level(zoom)  # zooms scale about the centre
     return [(cx - half_w, core_top + p, cx + half_w, bottom + p) for p in panels]
 
 

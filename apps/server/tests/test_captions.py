@@ -651,3 +651,22 @@ def test_caption_font_is_larger_than_the_hook_and_stays_inside_q4(tmp_path):
             from hookline.quality import line_heights
 
             assert len(line_heights(_render(tmp_path, text, 0.5), dense=0.4)) == 1  # one line
+
+
+def test_hook_line_choice_uses_the_page_start():
+    # a page whose word starts 0.03 s after the hook ends appears 2 frames earlier, while the
+    # hook is still up: it must use the early (hook-clear) line
+    ass = build_ass([w(3.03, 3.4, "after")], "Hook", 6, caption_y=900, caption_y_late=600)
+    (cap,) = [e for e in _events(ass) if ",Cap," in e]
+    assert "\\pos(474,900)" in cap
+
+
+def test_face_rects_use_the_measured_face_offset_and_zoom():
+    lay = SceneLayout(
+        start=0, end=4, kind="FACE_TRACK", face_box=(0.3, 0.2), face_dx=0.1, lead=-0.08
+    )
+    ((x0, _, x1, _),) = face_rects(lay, 1.0)
+    assert (x0 + x1) / 2 == pytest.approx(540 + 0.1 * 1080)
+    zoomed = lay.model_copy(update={"zoom_cap": 1.12})
+    ((z0, _, z1, _),) = face_rects(zoomed, 1.2)
+    assert (z0 + z1) / 2 == pytest.approx(540 + 0.1 * 1080 * 1.12)

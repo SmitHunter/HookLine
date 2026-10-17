@@ -115,9 +115,66 @@ def test_tail_end_snaps_past_the_last_word_into_silence():
 
 
 def test_tail_end_never_reaches_the_next_word_nor_shortens():
-    env = _env([(1.0, 2.6)])  # voiced straight on: no silence within 0.35 s
+    env = _env([(1.0, 2.15), (2.2, 2.6)])  # the next word's onset is audible at 2.2
     end = tail_end(2.0, 2.0, 2.2, env, THR)
     assert end <= 2.2 - 0.05 + 1e-9
     assert tail_end(2.0, 2.3, 10.0, _env([(1.0, 2.0)]), THR) == 2.3  # already past: kept
     capped = tail_end(2.0, 2.0, 10.0, _env([(1.0, 3.0)]), THR)
     assert capped <= 2.35 + 1e-9  # no silence in reach: at most 0.35 s past the last word
+
+
+# --- wave D review round 1: noisy sources, bounded extensions, audible next-word onsets ----
+
+
+def _noisy(spans: list[tuple[float, float]], bed: float = -38.0, length: float = 6.0) -> Envelope:
+    env = _env(spans, length)
+    db = np.where(env.db < -20, bed, env.db)
+    return Envelope(t0=env.t0, hop=env.hop, db=db)
+
+
+def test_voice_threshold_follows_the_local_noise_floor():
+    from hookline.pipeline.timing import voice_threshold
+
+    assert voice_threshold(_env([(1.0, 2.0)]), -32.0) == pytest.approx(-44.0)  # clean: -32 - 12
+    assert voice_threshold(_noisy([(1.0, 2.0)]), -32.0) == pytest.approx(-32.0)  # -38 + 9, capped
+    mid = _noisy([(1.0, 2.0)], bed=-50.0)
+    assert voice_threshold(mid, -32.0) == pytest.approx(-41.0)  # floor + 9
+
+
+def test_noise_bed_between_words_still_ends_words_and_snaps_onsets():
+    from hookline.pipeline.timing import voice_threshold
+
+    env = _noisy([(1.0, 1.42), (2.0, 2.6)])  # a -38 dB bed between the words
+    thr = voice_threshold(env, -32.0)
+    words = [_w(1.0, 1.15, "one"), _w(2.15, 2.3, "two")]
+    ends = refine_word_ends(words, env, thr)
+    assert ends[0].end == pytest.approx(1.42, abs=0.011)  # not stretched to the next word
+    onsets = snap_onsets(ends, env, thr)
+    assert onsets[1].start == pytest.approx(2.0, abs=0.011)
+    assert tail_end(2.6, 2.6, 10.0, env, thr) == pytest.approx(2.68, abs=0.011)
+
+
+def test_refine_word_ends_without_an_energy_fall_extends_at_most_0_6_s():
+    env = _env([(0.0, 5.0)])
+    (out,) = refine_word_ends([_w(1.0, 1.15)], env, THR)
+    assert out.end == pytest.approx(1.75)
+    later = refine_word_ends([_w(1.0, 1.15), _w(3.0, 3.2)], _env([(1.0, 2.2)]), THR)
+    assert later[0].end == pytest.approx(2.2, abs=0.011)  # a real fall 1.05 s later counts
+
+
+def test_protected_words_cap_the_refined_end():
+    from hookline.pipeline.timing import protected_words
+
+    raw = [_w(1.0, 1.15, "a"), _w(2.0, 2.15, "b")]
+    refined = [_w(1.0, 1.75, "a"), _w(2.0, 2.3, "b")]
+    out = protected_words(raw, refined)
+    assert [w.end for w in out] == pytest.approx([1.45, 2.3])
+
+
+def test_tail_ignores_a_next_word_start_without_an_audible_onset():
+    # clip 01: DTW put "I" at 362.74 inside the sound of "alone." (voiced to ~362.87)
+    env = _env([(1.0, 2.25)])
+    assert tail_end(2.0, 2.0, 2.1, env, THR) == pytest.approx(2.33, abs=0.011)
+    # ... but an audible onset of the next word still stops it
+    heard = _env([(1.0, 2.05), (2.15, 2.6)])
+    assert tail_end(2.0, 2.0, 2.15, heard, THR) <= 2.10 + 1e-9

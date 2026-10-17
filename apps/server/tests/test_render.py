@@ -481,3 +481,86 @@ def test_render_clip_extends_the_last_range_by_the_tail(
     (last_end, end, next_start) = seen[0]
     assert last_end <= end <= next_start  # the fixture's sine is voiced up to the next word
     assert extras["keep_ranges"][-1][1] == pytest.approx(end + 0.3, abs=1 / 25)
+
+
+# --- wave D review round 1 ------------------------------------------------------------------
+
+
+def test_render_clip_sidecar_zoom_steps_are_the_rendered_guarded_steps(
+    fixture_video, fixture_wav, fixture_words, sample_pick, settings, tmp_path, monkeypatch
+):
+    from hookline.media.reframe import rendered_zoom_steps
+    from hookline.pipeline import render as render_mod
+    from hookline.pipeline.layout import SceneLayout
+
+    def lean_plan(video, detector, facecam_override=None, crop=None):
+        end = probe_duration(video)
+        n = int(end / 0.25)
+        xs = [0.5 + 0.3 * (i % 40 >= 20) for i in range(n)]  # leans to 0.8 and back
+        kfs = [(i * 0.25, x) for i, x in enumerate(xs)]
+        return [
+            SceneLayout(
+                start=0,
+                end=end,
+                kind="FACE_TRACK",
+                track_x=kfs,
+                face_w=0.12,
+                face_box=(0.3, 0.3),
+                head_top=0.15,
+            )
+        ]
+
+    graphs = []
+    real_graph = render_mod.reframe_graph
+
+    def spy(layouts, *a, **k):
+        graphs.append((layouts, k["zoom_steps"]))
+        return real_graph(layouts, *a, **k)
+
+    monkeypatch.setattr(render_mod, "plan_layouts", lean_plan)
+    monkeypatch.setattr(render_mod, "reframe_graph", spy)
+    s = settings.model_copy(update={"captions": False})
+    extras = render_clip(
+        fixture_video, fixture_wav, sample_pick, fixture_words, tmp_path, tmp_path / "08-g.mp4",
+        s, NoFaces(),
+    )  # fmt: skip
+    ((layouts, rendered_steps),) = graphs
+    assert extras["zoom_levels"] == [list(st) for st in rendered_steps]
+    assert extras["zoom_steps"] == [list(st) for st in rendered_zoom_steps(layouts, rendered_steps)]
+    assert extras["layout"][0]["face_dx"] is not None
+
+
+def test_render_clip_fades_use_the_probed_duration_and_sidecar_includes_the_tail(
+    fixture_video,
+    fixture_wav,
+    fixture_words,
+    sample_pick,
+    settings,
+    tmp_path,
+    monkeypatch,
+    final_argvs,
+):
+    from hookline.pipeline import render as render_mod
+
+    probed = []
+    real_probe = render_mod.probe_duration
+
+    def spy_probe(path):
+        d = real_probe(path)
+        if str(path).endswith(".mkv"):
+            probed.append(d)
+        return d
+
+    monkeypatch.setattr(render_mod, "probe_duration", spy_probe)
+    monkeypatch.setattr(render_mod, "tail_end", lambda last, end, nxt, env, thr: end + 0.3)
+    s = settings.model_copy(update={"vertical": False, "captions": False})
+    extras = render_clip(
+        fixture_video, fixture_wav, sample_pick, fixture_words, tmp_path, tmp_path / "09-f.mp4",
+        s, None,
+    )  # fmt: skip
+    af = final_argvs[0][final_argvs[0].index("-af") + 1]
+    assert f"afade=t=out:st={probed[0] - 0.12:.3f}:d=0.12" in af
+    keep, segs = extras["keep_ranges"], extras["segments"]
+    assert segs[-1][1] == pytest.approx(keep[-1][1])  # the tail is part of the clip's span
+    kept = sum(e - st for st, e in keep)
+    assert extras["removed_s"] == pytest.approx(sum(e - st for st, e in segs) - kept, abs=0.002)

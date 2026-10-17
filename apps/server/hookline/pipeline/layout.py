@@ -1,5 +1,6 @@
 """Per-scene 9:16 layout choice: STACKED facecam, FACE_TRACK, SPLIT, or FIT_BLUR."""
 
+import logging
 import math
 import statistics
 from pathlib import Path
@@ -12,6 +13,7 @@ from hookline.media.ffmpeg import FFmpegError, probe_duration, probe_size
 from hookline.vision.faces import Crop, Face, sample_frames
 
 LayoutKind = Literal["STACKED", "FACE_TRACK", "SPLIT", "FIT_BLUR"]
+log = logging.getLogger(__name__)
 Box = tuple[float, float, float, float]  # normalized x, y, w, h
 
 MIN_SCORE = 0.6
@@ -50,6 +52,11 @@ class SceneLayout(BaseModel):
     track_x: list[tuple[float, float]] = []
     track_w: list[float] = []  # face width per track_x keyframe, normalized (edge guard)
     lead: float = 0.0  # gaze lead room: signed share of crop width the crop shifts (+ right)
+    # Edge-guard framing changes (reframe.guard_zoom): (output s, signed share of crop width)
+    # sideways crop offsets, instant at cuts; and the rendered face centre's median offset from
+    # the crop centre (share of crop width, + right), for caption placement and the audit.
+    shift_steps: list[tuple[float, float]] = []
+    face_dx: float | None = None
     split_x: tuple[float, float] | None = None
     face_box: tuple[float, float] | None = None  # median face (y, h), normalized; captions
     face_w: float | None = None  # median face width (FACE_TRACK), normalized to source width
@@ -292,7 +299,12 @@ def plan_layouts(
         try:
             frames = sample_frames(video, times, crop=crop)
             samples = [(t, detector.detect(f)) for t, f in zip(times, frames, strict=True)]
-        except FFmpegError:
-            samples = []  # unreadable scene: fall back to FIT_BLUR rather than abort the plan
+        except FFmpegError as e:
+            # unreadable scene: fall back to FIT_BLUR rather than abort the plan, never silently
+            log.warning(
+                "face sampling failed for %s scene %.2f-%.2f s (%s); the scene uses FIT_BLUR",
+                video.name, start, end, (str(e).splitlines() or ["error"])[0],
+            )  # fmt: skip
+            samples = []
         layouts.append(classify_scene(samples, start, end, src_h=src_h))
     return layouts
