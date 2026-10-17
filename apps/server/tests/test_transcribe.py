@@ -334,3 +334,21 @@ def test_cleaning_is_idempotent():
     once = words_to_transcript(words, "en", 6.0, timing="dtw")
     twice = words_to_transcript(once.words(), "en", 6.0, timing="dtw")
     assert once.words() == twice.words()
+
+
+def test_dedupe_removes_collapsed_copy_after_normal_phrase():
+    from hookline.transcribe.clean import dedupe_segments
+
+    run = ["We", "were", "a", "little", "older."]
+    words = [_w(t, 1815.70 + i * 0.34, 1816.0 + i * 0.34) for i, t in enumerate(run)]
+    words += [_w(t, 1817.40, 1817.45) for t in run]
+    words += [_w("Then", 1817.40, 1817.45)]
+    out = dedupe_segments(words)
+    assert [w.text for w in out] == [*run, "Then"]
+
+
+def test_dedupe_collapsed_rule_needs_matching_text():
+    from hookline.transcribe.clean import dedupe_segments
+
+    words = [_w("a", 1.0), _w("b", 1.3), _w("c", 5.0, 5.05), _w("d", 5.0, 5.05)]
+    assert len(dedupe_segments(words)) == 4

@@ -6,6 +6,7 @@ from hookline.models import Word
 
 _MIN_RUN, _MAX_RUN = 2, 12
 _NEAR_START_S = 0.1
+_COLLAPSED_S = 0.02
 _MAX_STEP_S = 0.6
 _SAME_START_S = 0.01
 _MIN_WORD_S = 0.08
@@ -20,7 +21,11 @@ def _is_repeat(prev: list[Word], run: list[Word]) -> bool:
         return False
     if not any(_norm(w.text) for w in run):
         return False
-    return all(abs(a.start - b.start) <= _NEAR_START_S for a, b in zip(prev, run, strict=True))
+    if all(abs(a.start - b.start) <= _NEAR_START_S for a, b in zip(prev, run, strict=True)):
+        return True
+    # collapsed DTW tail: every word of the copy starts at one instant (impossible for speech)
+    starts = [w.start for w in run]
+    return max(starts) - min(starts) <= _COLLAPSED_S
 
 
 def dedupe_segments(words: list[Word]) -> list[Word]:
