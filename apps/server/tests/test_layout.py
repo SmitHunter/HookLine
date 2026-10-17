@@ -67,6 +67,33 @@ def test_facecam_needs_sixty_percent_of_samples():
     assert classify_scene(samples, 0, 10).kind == "STACKED"
 
 
+def test_large_off_centre_face_is_face_track_not_stacked():
+    big = Face(x=0.05, y=0.05, w=0.12, h=0.25, score=0.9)  # in corner region, but too tall
+    assert classify_scene([(t, [big]) for t in range(10)], 0, 10).kind == "FACE_TRACK"
+
+
+def test_mid_size_off_centre_face_is_face_track_not_stacked():
+    # Just Chatting webcam, streamer sat back and off-centre: cx 0.2, cy 0.25, h 0.18.
+    mid = Face(x=0.15, y=0.16, w=0.10, h=0.18, score=0.9)
+    assert classify_scene([(t, [mid]) for t in range(10)], 0, 10).kind == "FACE_TRACK"
+
+
+def test_facecam_height_ceiling_is_exclusive():
+    just_under = Face(x=0.78, y=0.05, w=0.08, h=0.149, score=0.9)
+    at_ceiling = Face(x=0.78, y=0.05, w=0.08, h=0.15, score=0.9)
+    assert classify_scene([(t, [just_under]) for t in range(10)], 0, 10).kind == "STACKED"
+    assert classify_scene([(t, [at_ceiling]) for t in range(10)], 0, 10).kind == "FACE_TRACK"
+
+
+def test_facecam_box_area_must_be_under_a_fifth():
+    # h=0.14 passes the height ceiling, but grown box 0.6 x 0.364 = 0.218 >= 0.20.
+    wide = Face(x=0.75, y=0.05, w=0.20, h=0.14, score=0.9)
+    assert classify_scene([(t, [wide]) for t in range(10)], 0, 10).kind == "FACE_TRACK"
+    # w=0.18: 0.54 x 0.364 = 0.197 < 0.20 -> still a facecam.
+    ok = Face(x=0.75, y=0.05, w=0.18, h=0.14, score=0.9)
+    assert classify_scene([(t, [ok]) for t in range(10)], 0, 10).kind == "STACKED"
+
+
 def test_centre_face_small_is_not_facecam():
     small_centre = Face(x=0.45, y=0.45, w=0.08, h=0.14, score=0.9)
     assert classify_scene([(t, [small_centre]) for t in range(10)], 0, 10).kind == "FACE_TRACK"
@@ -175,6 +202,32 @@ def test_plan_layouts_override_and_crop_pass_through(tmp_path):
     layouts = plan_layouts(video, det, facecam_override=(0.7, 0, 0.3, 0.3))
     assert [(s.kind, s.facecam) for s in layouts] == [("STACKED", (0.7, 0, 0.3, 0.3))]
     assert det.frames == []  # override needs no detection
+
+
+def test_plan_layouts_failed_scene_falls_back_to_fit_blur(tmp_path, monkeypatch):
+    from hookline.media.ffmpeg import FFmpegError
+    from hookline.pipeline import layout
+
+    video = tmp_path / "cut.mp4"
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+         "-f", "lavfi", "-i", "color=c=black:size=320x180:rate=25:duration=3",
+         "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=25:duration=3",
+         "-filter_complex", "[0:v][1:v]concat=n=2:v=1[v]", "-map", "[v]",
+         "-pix_fmt", "yuv420p", str(video)],
+        check=True,
+    )  # fmt: skip
+    real = layout.sample_frames
+
+    def flaky(v, times, *a, **k):
+        if times[0] < 3.0:
+            raise FFmpegError("no frame")
+        return real(v, times, *a, **k)
+
+    monkeypatch.setattr(layout, "sample_frames", flaky)
+    face = Face(x=0.4, y=0.2, w=0.2, h=0.4, score=0.9)
+    layouts = plan_layouts(video, _RecordingDetector([face]))
+    assert [s.kind for s in layouts] == ["FIT_BLUR", "FACE_TRACK"]
 
 
 @pytest.mark.integration

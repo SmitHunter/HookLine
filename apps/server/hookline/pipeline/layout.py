@@ -7,14 +7,15 @@ from typing import Literal, Protocol
 import numpy as np
 from pydantic import BaseModel
 
-from hookline.media.ffmpeg import probe_duration
+from hookline.media.ffmpeg import FFmpegError, probe_duration
 from hookline.vision.faces import Crop, Face, sample_frames
 
 LayoutKind = Literal["STACKED", "FACE_TRACK", "SPLIT", "FIT_BLUR"]
 Box = tuple[float, float, float, float]  # normalized x, y, w, h
 
 MIN_SCORE = 0.6
-CAM_MAX_H = 0.22
+CAM_MAX_H = 0.15
+CAM_MAX_AREA = 0.20  # grown facecam box (normalized w*h); larger = a webcam shot, not a cam
 CAM_MIN_SHARE = 0.6
 CAM_MAX_STD = 0.03
 CAM_GROW_W = 3.0
@@ -60,12 +61,13 @@ def _facecam(samples: list[list[Face]]) -> Box | None:
     cxs, cys = [f.cx for f in cams], [f.cy for f in cams]
     if statistics.pstdev(cxs) >= CAM_MAX_STD or statistics.pstdev(cys) >= CAM_MAX_STD:
         return None
-    return _grow_inside(
+    box = _grow_inside(
         statistics.median(cxs),
         statistics.median(cys),
         statistics.median(f.w for f in cams) * CAM_GROW_W,
         statistics.median(f.h for f in cams) * CAM_GROW_H,
     )
+    return box if box[2] * box[3] < CAM_MAX_AREA else None
 
 
 def classify_scene(
@@ -133,7 +135,10 @@ def plan_layouts(
             layouts.append(classify_scene([], start, end, facecam_override))
             continue
         times = _sample_times(start, end, sample_every)
-        frames = sample_frames(video, times, crop=crop)
-        samples = [(t, detector.detect(f)) for t, f in zip(times, frames, strict=True)]
+        try:
+            frames = sample_frames(video, times, crop=crop)
+            samples = [(t, detector.detect(f)) for t, f in zip(times, frames, strict=True)]
+        except FFmpegError:
+            samples = []  # unreadable scene: fall back to FIT_BLUR rather than abort the plan
         layouts.append(classify_scene(samples, start, end))
     return layouts
