@@ -49,9 +49,10 @@ FACE_TARGET = 0.22
 MAX_UPSCALE = 2.5
 MAX_ZOOM = 1.4
 MAX_BASE = 1.25
+MIN_STEP_RANGE = 0.1  # the base leaves at least this much zoom above it for the steps
 HEADROOM = 0.04  # the head top (face top - half a face height) stays this share below the top
-# A scene whose zoom levels the headroom flattens (top <= base + FLAT_ZOOM) shifts its crop
-# sideways by STEP_SHIFT of the crop width at each step instead (FACE_TRACK).
+# A FACE_TRACK scene whose zoom levels the headroom flattens (top <= base + FLAT_ZOOM) shifts
+# its crop sideways by STEP_SHIFT of the crop width at each step instead (never over the face).
 FLAT_ZOOM = 0.03
 STEP_SHIFT = 0.04
 _CAP_STEP = 0.005
@@ -326,17 +327,35 @@ def _fill(w: int, h: int, flags: str = "") -> str:
     return f"scale={w}:{h}:force_original_aspect_ratio=increase{flags},crop={w}:{h}"
 
 
+def _median3(xs: list[float]) -> list[float]:
+    """Median of each value and its neighbours. The first and last use Tukey's end-point
+    rule, the median of the end value, its neighbour's median and the line through the next
+    two medians extrapolated to the end: a stray value at either end is ignored too, while a
+    real move that ends the scene (a lean) is still followed."""
+    n = len(xs)
+    if n < 3:
+        return list(xs)
+
+    def mid(a: float, b: float, c: float) -> float:
+        return sorted((a, b, c))[1]
+
+    med = [xs[0]] + [mid(*xs[i - 1 : i + 2]) for i in range(1, n - 1)] + [xs[-1]]
+    first = mid(xs[0], med[1], 3 * med[1] - 2 * med[2])
+    med[-1] = mid(xs[-1], med[-2], 3 * med[-2] - 2 * med[-3])
+    med[0] = first
+    return med
+
+
 def _smooth(
     keyframes: list[tuple[float, float]], allow: float | None = None
 ) -> list[tuple[float, float]]:
     """EMA (alpha 0.3) chasing a deadbanded target over the median-of-3 of consecutive raw
-    values (a single stray detection, e.g. another face for one sample, is ignored): the
-    target jumps to that value only when it differs by more than 0.05; the output eases toward
-    the target every step. With `allow`, the output never lags more than that behind it (the
-    face stays in the crop when it moves fast, e.g. a lean)."""
+    values (`_median3`: a single stray detection, e.g. another face for one sample, is
+    ignored): the target jumps to that value only when it differs by more than 0.05; the
+    output eases toward the target every step. With `allow`, the output never lags more than
+    that behind it (the face stays in the crop when it moves fast, e.g. a lean)."""
     pts = sorted(keyframes)
-    xs = [x for _, x in pts]
-    med = [sorted((xs[max(i - 1, 0)], x, xs[min(i + 1, len(xs) - 1)]))[1] for i, x in enumerate(xs)]
+    med = _median3([x for _, x in pts])
     out: list[tuple[float, float]] = []
     target = smoothed = 0.0
     for i, ((t, _), x) in enumerate(zip(pts, med, strict=True)):
@@ -381,13 +400,20 @@ def track_x_expr(
     edge (against the median-of-3 position; never tighter than half the deadband, so jitter
     stays smoothed). A face too wide for that (a tight close-up) is not contained: the
     deadband alone holds the crop still. Commas are NOT escaped."""
+    pts = _track_lefts(keyframes, in_w, crop_w, face_w)
+    if not pts:
+        return _fmt(max(in_w - crop_w, 0) / 2)
+    return _pwl_expr(pts)
+
+
+def _track_lefts(
+    keyframes: list[tuple[float, float]], in_w: int, crop_w: int, face_w: float | None
+) -> list[tuple[float, float]]:
+    """(t, crop left px) points of `track_x_expr`."""
     hi = max(in_w - crop_w, 0)
     room = crop_w / 2 - (face_w or 0.0) * in_w / 2 - TRACK_MARGIN * crop_w
     allow = max(room / in_w, TRACK_DEADBAND / 2) if room > 0 else None
-    pts = [(t, min(max(s * in_w - crop_w / 2, 0.0), hi)) for t, s in _smooth(keyframes, allow)]
-    if not pts:
-        return _fmt(hi / 2)
-    return _pwl_expr(pts)
+    return [(t, min(max(s * in_w - crop_w / 2, 0.0), hi)) for t, s in _smooth(keyframes, allow)]
 
 
 def _fill_gap(a: float, b: float, max_gap: float, boundaries: Sequence[float]) -> list[float]:
@@ -636,12 +662,10 @@ def scene_filter(
 def _shifted(
     x: str, layout: SceneLayout, steps: Sequence[Sequence[float]], in_w: int, cw: int
 ) -> str:
-    """Crop-left expression `x` plus a sideways shift that alternates 0 / STEP_SHIFT of the
-    crop width at every zoom step (eased like a zoom step), towards the side with more room
-    (from the median track position), clamped to the frame."""
-    xs = sorted(v for _, v in layout.track_x) or [0.5]
-    sign = -1 if xs[len(xs) // 2] > 0.5 else 1
-    shift = sign * STEP_SHIFT * cw
+    """Crop-left expression `x` plus a sideways shift that alternates 0 / `step_shift` (signed)
+    of the crop width at every zoom step, eased by smoothstep over ZOOM_EASE s both ways (a
+    pixel offset is never ZOOM_PUNCH, so PUNCH_RELEASE never applies), clamped to the frame."""
+    shift = layout.step_shift * cw
     alt = [(float(t), shift if i % 2 else 0.0) for i, (t, _) in enumerate(steps)]
     off = zoom_expr(alt, offset=layout.start, length=layout.end - layout.start)
     return f"min(max(({x})+({off}),0),{_fmt(max(in_w - cw, 0))})"
@@ -682,25 +706,55 @@ def _headroom(layout: SceneLayout, in_w: int, in_h: int) -> tuple[float, float] 
     return 1.0, min(max(fc, 0.0), ph)
 
 
+def _shift_sign(layout: SceneLayout, in_w: int, in_h: int) -> int:
+    """Direction (+1 crop right, -1 left, 0 none) of a FACE_TRACK scene's step shift: the face
+    moves towards the crop centre (a crop pinned at a frame edge holds its face off-centre
+    towards that edge), else, centred, towards the side with more room (median track
+    position). 0 when the shift would move the crop over any part of the face core (`face_w`)
+    at any track point (only what the unshifted crop showed counts), or can't move it at all."""
+    cw = _track_w(in_w, in_h)
+    hi = max(in_w - cw, 0)
+    pts = _track_lefts(layout.track_x, in_w, cw, layout.face_w)
+    if not pts:
+        return 0
+    med = _median3([x for _, x in sorted(layout.track_x)])
+    i = len(pts) // 2
+    off = med[i] * in_w - (pts[i][1] + cw / 2)  # face centre from crop centre, px
+    if abs(off) > 1:
+        sign = 1 if off > 0 else -1
+    else:
+        sign = -1 if sorted(med)[len(med) // 2] > 0.5 else 1
+    half = (layout.face_w or 0.0) * in_w / 2
+    moved = False
+    for (_, left), x in zip(pts, med, strict=True):
+        new = min(max(left + sign * STEP_SHIFT * cw, 0.0), hi)
+        lo_px, hi_px = max(x * in_w - half, left), min(x * in_w + half, left + cw)
+        if new > lo_px + 1e-6 or hi_px > new + cw + 1e-6:
+            return 0
+        moved = moved or abs(new - left) >= 1
+    return sign if moved else 0
+
+
 def plan_zoom(layout: SceneLayout, in_w: int, in_h: int) -> SceneLayout:
     """The scene with its zoom plan (base_zoom, zoom_cap, zoom_anchor) filled in:
 
     - soft source (upscale > UPSCALE_SOFT): every level, punches included, <= ZOOM_IN;
     - small FACE_TRACK face (< SMALL_FACE of the output height) on a sharper source (upscale
       <= UPSCALE_SOFT; soft sources get none): a base zoom toward FACE_TARGET, at most
-      MAX_BASE, with the step levels compressed into [base, MAX_ZOOM] and total upscale
-      <= MAX_UPSCALE;
+      MAX_BASE and leaving MIN_STEP_RANGE above it for the steps, with the step levels
+      compressed into [base, MAX_ZOOM] and total upscale <= MAX_UPSCALE;
     - headroom: the anchor row (and if need be a lower cap) keeps the head top >= HEADROOM of
       the panel height below its top at every level (`_headroom`);
-    - a scene whose levels end up (nearly) flat (top level <= base + FLAT_ZOOM) gets
-      `step_shift`: its steps shift the crop sideways instead, so cuts still change framing."""
+    - a FACE_TRACK scene whose levels end up (nearly) flat (top level <= base + FLAT_ZOOM)
+      gets a signed `step_shift` (`_shift_sign`; none when it would trim the face): its steps
+      shift the crop sideways instead, so cuts still change framing."""
     up = scene_upscale(layout, in_w, in_h)
     cap: float | None = ZOOM_IN if up > UPSCALE_SOFT else None
     base = 1.0
     face_h = layout.face_box[1] if layout.face_box else 0.0
     if _kind(layout) == "FACE_TRACK" and 0 < face_h < SMALL_FACE and up <= UPSCALE_SOFT:
         room = min(MAX_ZOOM, MAX_UPSCALE / up)
-        base = max(1.0, min(FACE_TARGET / face_h, MAX_BASE, room))
+        base = max(1.0, min(FACE_TARGET / face_h, MAX_BASE, room - MIN_STEP_RANGE))
         if base > 1.0:
             cap = room
     plan = layout.model_copy(update={"base_zoom": math.floor(base * 1e4) / 1e4, "zoom_cap": cap})
@@ -718,8 +772,12 @@ def plan_zoom(layout: SceneLayout, in_w: int, in_h: int) -> SceneLayout:
             "zoom_anchor": anchor / ph,
         }
     )
-    if plan.zoom_level(ZOOM_TOP) <= plan.zoom_level(1.0) + FLAT_ZOOM:
-        plan = plan.model_copy(update={"step_shift": STEP_SHIFT})
+    if (
+        _kind(layout) == "FACE_TRACK"
+        and plan.zoom_level(ZOOM_TOP) <= plan.zoom_level(1.0) + FLAT_ZOOM
+        and (sign := _shift_sign(layout, in_w, in_h))
+    ):
+        plan = plan.model_copy(update={"step_shift": sign * STEP_SHIFT})
     return plan
 
 

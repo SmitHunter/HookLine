@@ -85,7 +85,8 @@ def test_track_expression_clamped_and_deadbanded():
 
 
 def test_track_expression_clamps_edges_and_interpolates():
-    expr = track_x_expr([(0, 0.0), (1, 1.0), (2, 1.0), (3, 1.0)], in_w=1920, crop_w=607)
+    kfs = [(-1, 0.0), (0, 0.0), (1, 1.0), (2, 1.0), (3, 1.0)]  # a lone first 0.0 is a stray
+    expr = track_x_expr(kfs, in_w=1920, crop_w=607)
     assert evaluate(expr, t=0) == pytest.approx(0)
     for t in (0, 0.5, 1, 1.5, 2, 2.5, 3, 10):
         assert 0 <= evaluate(expr, t=t) <= 1920 - 607
@@ -735,6 +736,13 @@ def test_track_ignores_a_single_outlier_sample():
         expr = track_x_expr(kfs, in_w=1280, crop_w=404, face_w=face_w)
         for t in (2.5, 3.0, 3.25, 3.5, 4.0, 6.0):
             assert evaluate(expr, t=t) == pytest.approx(evaluate(expr, t=0))
+    # ... nor at the first or last sample, where the median window would clamp to itself
+    rest = [(i * 0.5, 0.4) for i in range(1, 12)]
+    for kfs in ([(0.0, 0.8), *rest], [(0.0, 0.4), *rest, (6.0, 0.8)]):
+        for face_w in (None, 0.1):
+            expr = track_x_expr(kfs, in_w=1280, crop_w=404, face_w=face_w)
+            for t, _ in kfs:
+                assert evaluate(expr, t=t) == pytest.approx(0.4 * 1280 - 202), (kfs[0], t)
 
 
 def test_track_wide_close_up_face_keeps_the_deadband():
@@ -780,3 +788,61 @@ def test_plan_zoom_flat_headroom_scene_shifts_crop_at_each_step():
     assert "step_shift" in plan.model_dump()
     # a scene with room to zoom gets no shift
     assert plan_zoom(_SOFT_TRACK, 3840, 2160).step_shift == 0.0
+
+
+# --- wave B review round 2 --------------------------------------------------------------
+
+
+@pytest.mark.parametrize("size", [(1706, 960), (1752, 986), (1800, 1012)])
+def test_plan_zoom_small_face_base_leaves_step_range(size):
+    # ~1.9-2.0x upscale: MAX_UPSCALE leaves ~1.25-1.3 total zoom; the base must not eat it all
+    small = SceneLayout(
+        start=0, end=4, kind="FACE_TRACK", track_x=[(0, 0.5)], face_box=(0.4, 0.15),
+        head_top=0.3,
+    )  # fmt: skip
+    plan = plan_zoom(small, *size)
+    up = scene_upscale(plan, *size)
+    assert 1.9 < up <= 2.0
+    levels = [plan.zoom_level(s) for s in (1.0, ZOOM_IN, ZOOM_PUNCH)]
+    assert plan.base_zoom > 1.0
+    assert levels[-1] - levels[0] >= 0.1 - 1e-3  # steps keep >= 0.1 above the base
+    assert levels == sorted(set(levels)) and levels[-1] * up <= 2.5 + 1e-9
+    assert plan.step_shift == 0.0
+
+
+def _shift_x(plan, size, steps):
+    chain = scene_filter(plan, *size, "a", "b", zoom_steps=steps)
+    return chain.split("crop=", 1)[1].split(":", 3)[2].replace("\\,", ",")
+
+
+@pytest.mark.parametrize(
+    ("track", "face_w"), [(0.1, 0.2), (0.9, 0.2), (0.5, 0.3), (0.05, 0.08), (0.95, 0.08)]
+)
+def test_step_shift_never_trims_the_face(track, face_w):
+    # crop pinned at a frame edge (track 0.1/0.9), or a face too wide to shift past: the shift
+    # must never move the crop over the face; when it shifts, the face moves towards the centre
+    lay = _FLAT.model_copy(update={"track_x": [(0, track), (6, track)], "face_w": face_w})
+    size, cw = (3840, 2160), 1214
+    plan = plan_zoom(lay, *size)
+    assert plan.zoom_level(ZOOM_PUNCH) <= plan.zoom_level(1.0) + 0.03
+    steps = [(0.0, 1.0), (2.0, ZOOM_IN), (4.0, 1.0)]
+    x = _shift_x(plan, size, steps)
+    fc = track * size[0]
+    rest = evaluate(x, 1.0)
+    for t in (1.0, 2.1, 3.0, 4.1, 5.0):
+        left = evaluate(x, t)
+        assert left <= fc - face_w * size[0] / 2 + 1e-6 or left <= 0
+        assert fc + face_w * size[0] / 2 <= left + cw + 1e-6 or left >= size[0] - cw
+        # never further off-centre than unshifted
+        assert abs(fc - (left + cw / 2)) <= abs(fc - (rest + cw / 2)) + 1e-6 or left == rest
+    if evaluate(x, 3.0) == pytest.approx(rest):
+        assert plan.step_shift == 0.0  # the sidecar records only a shift that happens
+
+
+def test_step_shift_only_recorded_where_rendered():
+    split = SceneLayout(
+        start=0, end=6, kind="SPLIT", split_x=(0.3, 0.7), face_box=(0.3, 0.69), head_top=0.05
+    )
+    plan = plan_zoom(split, 3840, 2160)
+    assert plan.zoom_level(ZOOM_PUNCH) <= plan.zoom_level(1.0) + 0.03  # flat, like _FLAT
+    assert plan.step_shift == 0.0  # SPLIT never renders a shift
