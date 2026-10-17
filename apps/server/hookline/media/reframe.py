@@ -20,7 +20,7 @@ BLUR = "boxblur=20:2"
 MIN_SCENE = 1 / 30
 
 # Pacing zooms: alternate 1.0 / 1.12 at cuts and at least every 4.5 s; punch to 1.2 on
-# emphasis beats. Steps ease linearly over 0.2 s; a punch holds 1.2 s and releases over 0.3 s.
+# emphasis beats. Steps ease (smoothstep) over 0.2 s; a punch holds 1.2 s and releases over 0.3 s.
 ZOOM_IN = 1.12
 ZOOM_PUNCH = 1.2
 ZOOM_EASE = 0.2
@@ -98,9 +98,10 @@ def _smooth(keyframes: list[tuple[float, float]]) -> list[tuple[float, float]]:
     return out
 
 
-def _pwl_expr(pts: list[tuple[float, float]]) -> str:
-    """Piecewise-linear ffmpeg expression in `t` through (t, value) points, held constant
-    before the first and after the last. Commas are NOT escaped."""
+def _pwl_expr(pts: list[tuple[float, float]], smooth: bool = False) -> str:
+    """Piecewise ffmpeg expression in `t` through (t, value) points, held constant before the
+    first and after the last. Segments are linear, or smoothstep (u^2 (3 - 2u)) when `smooth`.
+    Commas are NOT escaped."""
     expr = _fmt(pts[-1][1])
     for (t0, x0), (t1, x1) in reversed(list(pairwise(pts))):
         dt = _fmt(t1 - t0)
@@ -108,6 +109,9 @@ def _pwl_expr(pts: list[tuple[float, float]]) -> str:
             continue  # degenerate segment: would divide by zero once formatted
         if _fmt(x1 - x0) == "0":
             seg = _fmt(x0)
+        elif smooth:
+            u = f"((t-{_fmt(t0)})/{dt})"
+            seg = f"{_fmt(x0)}+({_fmt(x1 - x0)})*{u}*{u}*(3-2*{u})"
         else:
             seg = f"{_fmt(x0)}+({_fmt(x1 - x0)})*(t-{_fmt(t0)})/{dt}"
         expr = f"if(lt(t,{_fmt(t1)}),{seg},{expr})"
@@ -157,13 +161,18 @@ def zoom_schedule(
     punch_len = ZOOM_EASE + PUNCH_HOLD
     punches: list[float] = []
     for e in sorted(emphasis_times):
-        if 0 < e < duration and (not punches or e >= punches[-1] + punch_len + ZOOM_MIN_STEP):
+        if ZOOM_MIN_STEP <= e < duration and (
+            not punches or e >= punches[-1] + punch_len + ZOOM_MIN_STEP
+        ):
             punches.append(e)
     busy = [(p - ZOOM_MIN_STEP, p + punch_len + ZOOM_MIN_STEP) for p in punches]
     cuts: list[float] = []
     for c in sorted(cut_times):
         if not ZOOM_MIN_STEP <= c <= duration - ZOOM_MIN_STEP:
             continue
+        # A cut inside a punch window is swallowed: the punch already changes the framing
+        # there, and a second step within 0.5 s would read as a stutter. The cut itself is
+        # still a framing change (and stays in the sidecar's cut_times).
         if any(lo < c < hi for lo, hi in busy) or (cuts and c - cuts[-1] < ZOOM_MIN_STEP):
             continue
         cuts.append(c)
@@ -179,14 +188,14 @@ def zoom_schedule(
         if kind == "toggle":
             base = ZOOM_IN if base == 1.0 else 1.0
         steps.append((round(t, 3), ZOOM_PUNCH if kind == "punch" else base))
-    return steps
+    return [st for st in steps if st[0] < duration]  # e.g. a release past the end
 
 
 def zoom_expr(
     steps: Sequence[Sequence[float]], offset: float = 0.0, length: float | None = None
 ) -> str:
     """Eased scale expression S(t) for `steps`, in scene time (`t` = output time - `offset`).
-    A step eases linearly from the previous scale over ZOOM_EASE s (PUNCH_RELEASE s when
+    A step eases (smoothstep) from the previous scale over ZOOM_EASE s (PUNCH_RELEASE s when
     leaving a punch). With `length`, only points that matter for [0, length] are emitted.
     Commas are NOT escaped."""
     if not steps:
@@ -202,7 +211,7 @@ def zoom_expr(
         pts = pts[first : last + 1]
     if len({_fmt(v) for _, v in pts}) == 1:
         return _fmt(pts[0][1])
-    return _pwl_expr(pts)
+    return _pwl_expr(pts, smooth=True)
 
 
 def _zoom(expr: str, w: int, h: int, ay: float | None = None) -> str:
@@ -229,7 +238,7 @@ def _fit_blur(label_in: str, label_out: str, in_w: int, in_h: int, zoom: str = "
     return (
         f"[{label_in}]split=2{bg}{fg};"
         f"{bg}{_fill(OUT_W, OUT_H)},{BLUR}{bgo};"
-        f"{fg}scale={OUT_W}:{fh}{_sharpen(OUT_W / in_w)}{_zoom(zoom, OUT_W, fh)}{fgo};"
+        f"{fg}scale={OUT_W}:{fh}{_zoom(zoom, OUT_W, fh)}{_sharpen(OUT_W / in_w)}{fgo};"
         f"{bgo}{fgo}overlay=(W-w)/2:(H-h)/2,setsar=1[{label_out}]"
     )
 
@@ -282,7 +291,8 @@ def scene_filter(
 
     `zoom_steps` (output time, from `zoom_schedule`) zoom the speaker panel after the layout:
     FACE_TRACK whole frame (anchored on the face centre), STACKED facecam panel, both SPLIT
-    panels, FIT_BLUR foreground. Panels upscaled more than SHARPEN_ABOVE are sharpened."""
+    panels, FIT_BLUR foreground. Panels upscaled more than SHARPEN_ABOVE are sharpened after
+    the zoom, so the final pixels are the sharpened ones."""
     kind = _kind(layout)
     zoom = (
         zoom_expr(zoom_steps, offset=layout.start, length=layout.end - layout.start)
@@ -297,8 +307,8 @@ def scene_filter(
         cam_up = max(OUT_W / cw, STACK_CAM_H / ch)
         return (
             f"[{label_in}]split=2{a}{b};"
-            f"{a}crop={cw}:{ch}:{cx}:{cy},{_fill(OUT_W, STACK_CAM_H)}{_sharpen(cam_up)}"
-            f"{_zoom(zoom, OUT_W, STACK_CAM_H)}{cam};"
+            f"{a}crop={cw}:{ch}:{cx}:{cy},{_fill(OUT_W, STACK_CAM_H)}"
+            f"{_zoom(zoom, OUT_W, STACK_CAM_H)}{_sharpen(cam_up)}{cam};"
             f"{b}crop={gw}:{gh}:{(in_w - gw) // 2}:{(in_h - gh) // 2},"
             f"scale={OUT_W}:{STACK_GAME_H}{_sharpen(OUT_W / gw)}{game};"
             f"{cam}{game}vstack,setsar=1[{label_out}]"
@@ -313,7 +323,7 @@ def scene_filter(
             ay = (fy + fh / 2) * OUT_H
         return (
             f"[{label_in}]crop={cw}:{_even(in_h)}:{x}:0,scale={OUT_W}:{OUT_H}"
-            f"{_sharpen(scene_upscale(layout, in_w, in_h))}{_zoom(zoom, OUT_W, OUT_H, ay)},"
+            f"{_zoom(zoom, OUT_W, OUT_H, ay)}{_sharpen(scene_upscale(layout, in_w, in_h))},"
             f"setsar=1[{label_out}]"
         )
     if kind == "SPLIT":
@@ -321,7 +331,7 @@ def scene_filter(
         sw, sh = _aspect_crop(in_w, in_h, OUT_W, SPLIT_H)
         y = (in_h - sh) // 2
         xs = [min(max(int(c * in_w - sw / 2), 0), in_w - sw) for c in layout.split_x]
-        post = f"{_sharpen(OUT_W / sw)}{_zoom(zoom, OUT_W, SPLIT_H)}"
+        post = f"{_zoom(zoom, OUT_W, SPLIT_H)}{_sharpen(OUT_W / sw)}"
         return (
             f"[{label_in}]split=2{a}{b};"
             f"{a}crop={sw}:{sh}:{xs[0]}:{y},scale={OUT_W}:{SPLIT_H}{post}[{label_out}_top];"

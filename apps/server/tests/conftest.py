@@ -302,7 +302,7 @@ def final_argvs(monkeypatch) -> FinalEncodeSpy:
 
     def spy(cmd):
         res = real(cmd)
-        if "-filter_complex" in cmd:
+        if "-filter_complex" in cmd or "-/filter_complex" in cmd:
             seen.append(cmd)
             seen.stderrs.append(res.stderr)
         return res

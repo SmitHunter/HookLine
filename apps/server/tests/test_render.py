@@ -1,17 +1,25 @@
 import json
+import os
 import subprocess
 from itertools import pairwise
+from pathlib import Path
+from unittest import mock
 
 import pytest
 
+from hookline.config import Settings
+from hookline.media import ffmpeg as ffmpeg_mod
 from hookline.media.ffmpeg import extract_audio, probe_duration, probe_size
-from hookline.models import Word
+from hookline.models import ClipPick, RubricScores, Transcript, Word
 from hookline.pipeline.render import cut_times_for, emphasis_times, render_clip
+from hookline.pipeline.run import _face_detector
 from tests.conftest import NoFaces
 from tests.test_pipeline import FakeTranscriber
 
 
 def _graph(cmd: list[str]) -> str:
+    if "-/filter_complex" in cmd:
+        return Path(cmd[cmd.index("-/filter_complex") + 1]).read_text(encoding="utf-8")
     return cmd[cmd.index("-filter_complex") + 1]
 
 
@@ -154,23 +162,21 @@ def _video_kbps(path) -> float:
     return int(res.stdout.strip()) / 1000
 
 
+_ZOOM_PICK = ClipPick(
+    start=30.0, end=55.0, cold_open=None, title="Zoom", hook_text="Wait for it",
+    reason="test", scores=RubricScores(
+        hook=0, context=0, payoff=0, emotion=0, length_fit=0, pacing=0, loop=0, safety=0
+    ),
+    edit_beats=["zoom: 'something' @ 40.0s"],
+)  # fmt: skip
+
+
 @pytest.fixture(scope="module")
 def zoom_render(fixture_video, fixture_wav, fixture_words, tmp_path_factory):
-    from hookline.config import Settings
-    from hookline.models import ClipPick, RubricScores
-
     d = tmp_path_factory.mktemp("zoom")
-    pick = ClipPick(
-        start=30.0, end=55.0, cold_open=None, title="Zoom", hook_text="Wait for it",
-        reason="test", scores=RubricScores(
-            hook=0, context=0, payoff=0, emotion=0, length_fit=0, pacing=0, loop=0, safety=0
-        ),
-        edit_beats=["zoom: 'something' @ 40.0s"],
-    )  # fmt: skip
-    s = Settings()
     dst = d / "05-z.mp4"
     extras = render_clip(
-        fixture_video, fixture_wav, pick, fixture_words, d / "r", dst, s, NoFaces()
+        fixture_video, fixture_wav, _ZOOM_PICK, fixture_words, d / "r", dst, Settings(), NoFaces()
     )
     return dst, extras
 
@@ -182,17 +188,53 @@ def test_render_clip_zoom_cadence(zoom_render):
     steps = extras["zoom_steps"]
     times = [t for t, _ in steps] + [kept]
     assert steps[0] == [0.0, 1.0] and max(b - a for a, b in pairwise(times)) <= 4.5 + 1e-6
+    assert all(t < kept for t, _ in steps)
     assert any(s == 1.2 for _, s in steps)  # the emphasis punch
     assert max(s for _, s in steps) <= 1.2
     assert probe_size(dst) == (1080, 1920)
     json.dumps(extras)
 
 
-@pytest.mark.xfail(
-    reason="CRF/CQP have no bitrate floor: the brief's exact rate-control values give ~2.9 Mb/s "
-    "on this low-detail 320x180 fixture (libx264 and AMF alike); needs a controller ruling",
-    strict=False,
-)
-def test_render_clip_bitrate_at_least_5mbps(zoom_render):
-    dst, _ = zoom_render
+_OLD_RATE_CONTROL = {  # pre-M2.5 values
+    "libx264": ["-preset", "veryfast", "-crf", "20"],
+    "h264_amf": ["-rc", "cqp", "-qp_i", "22", "-qp_p", "24", "-qp_b", "26"],
+    "h264_nvenc": ["-rc", "vbr", "-cq", "21", "-b:v", "0"],
+}
+
+
+def test_render_clip_bitrate_rises_vs_previous_settings(
+    zoom_render, fixture_video, fixture_wav, fixture_words, tmp_path
+):
+    dst_new, _ = zoom_render
+    dst_old = tmp_path / "06-old.mp4"
+    with mock.patch.dict(ffmpeg_mod._ENCODER_QUALITY_ARGS, _OLD_RATE_CONTROL):
+        render_clip(
+            fixture_video, fixture_wav, _ZOOM_PICK, fixture_words, tmp_path / "r", dst_old,
+            Settings(), NoFaces(),
+        )  # fmt: skip
+    assert _video_kbps(dst_new) > 1.1 * _video_kbps(dst_old)
+
+
+def _real_job() -> Path | None:
+    """A cached real podcast job (HOOKLINE_REAL_JOB, else the local workspace copy)."""
+    default = Path(__file__).parents[1] / "workspace" / "e87398ed46"
+    job = Path(os.environ.get("HOOKLINE_REAL_JOB", default))
+    needed = ("source.mp4", "audio.wav", "transcript.json")
+    return job if all((job / n).exists() for n in needed) else None
+
+
+@pytest.mark.skipif(_real_job() is None, reason="no cached real footage in this environment")
+def test_real_footage_bitrate_at_least_5mbps(tmp_path):
+    job = _real_job()
+    assert job is not None
+    transcript = Transcript.model_validate_json(
+        (job / "transcript.json").read_text(encoding="utf-8")
+    )
+    pick = _ZOOM_PICK.model_copy(update={"start": 1000.0, "end": 1015.0, "edit_beats": []})
+    s = Settings()
+    dst = tmp_path / "07-real.mp4"
+    render_clip(
+        job / "source.mp4", job / "audio.wav", pick, transcript.words(), tmp_path / "r", dst, s,
+        _face_detector(s, print),
+    )  # fmt: skip
     assert _video_kbps(dst) >= 5000

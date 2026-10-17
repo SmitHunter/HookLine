@@ -249,6 +249,13 @@ def test_zoom_schedule_drops_out_of_range_and_overlapping_punches():
     assert [t for t, s in steps if s == ZOOM_PUNCH] == [3.0]
 
 
+def test_zoom_schedule_early_punch_dropped_and_nothing_at_or_after_end():
+    assert [s for _, s in zoom_schedule(10.0, [], [0.3])].count(ZOOM_PUNCH) == 0
+    steps = zoom_schedule(10.0, [], [9.0])  # release would land at 10.4
+    assert (9.0, ZOOM_PUNCH) in steps and all(t < 10.0 for t, _ in steps)
+    assert all(t < 9.0 for t, _ in zoom_schedule(9.0, [], []))
+
+
 def test_zoom_schedule_prefers_sentence_boundaries():
     steps = zoom_schedule(9.0, [], [], boundaries=[3.9])
     assert [t for t, _ in steps][:2] == [0.0, 3.9]
@@ -262,6 +269,7 @@ def test_zoom_expr_eases_between_steps():
     expr = zoom_expr(steps)
     assert evaluate(expr, 1.0) == pytest.approx(1.0)
     assert evaluate(expr, 2.1) == pytest.approx(1.06)  # halfway through the 0.2 s ease
+    assert evaluate(expr, 2.05) == pytest.approx(1 + 0.12 * 0.15625)  # smoothstep
     assert evaluate(expr, 3.0) == pytest.approx(ZOOM_IN)
     assert evaluate(expr, 5.5) == pytest.approx(ZOOM_PUNCH)
     assert evaluate(expr, 6.55) == pytest.approx(1.1)  # 0.3 s release from the punch
@@ -282,6 +290,7 @@ _STEPS = [(0.0, 1.0), (1.5, ZOOM_IN), (3.0, 1.0)]
 def test_scene_filter_zoom_and_sharpen_per_kind():
     track = scene_filter(_LAYOUTS["FACE_TRACK"], 1280, 720, "a", "b", zoom_steps=_STEPS)
     assert track.count("eval=frame") == 1 and "unsharp=5:5:0.6:5:5:0.0" in track
+    assert track.index("unsharp") > track.index("eval=frame")  # sharpen final pixels
     stacked = scene_filter(_LAYOUTS["STACKED"], 1280, 720, "a", "b", zoom_steps=_STEPS)
     assert stacked.count("eval=frame") == 1  # facecam panel only
     assert stacked.index("eval=frame") < stacked.index("_cam]")
@@ -342,3 +351,33 @@ def test_rendered_face_track_zoom_changes_crop_on_static_source(tmp_path):
     assert np.abs(a - b).mean() > 0.5  # the crop region differs
     # centre-anchored zoom-in pushes the band edge away from the centre
     assert _top_edge(b[:, 100]) < _top_edge(a[:, 100]) - 10
+
+
+def _gray_frames(path, start: float, end: float) -> np.ndarray:
+    raw = subprocess.run(
+        ["ffmpeg", "-loglevel", "error", "-i", str(path), "-vf",
+         f"trim=start={start}:end={end}", "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+        check=True, capture_output=True,
+    ).stdout  # fmt: skip
+    return np.frombuffer(raw, np.uint8).reshape(-1, OUT_H, OUT_W).astype(int)
+
+
+def test_zoom_step_across_scene_boundary_has_no_jump(tmp_path):
+    static = tmp_path / "static.mp4"
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+         "color=c=yellow:s=1280x720:r=25:d=4,drawbox=x=0:y=100:w=1280:h=60:c=red:t=fill",
+         "-c:v", "libx264", "-pix_fmt", "yuv420p", str(static)],
+        check=True,
+    )  # fmt: skip
+    lays = [
+        SceneLayout(start=0, end=2, kind="FACE_TRACK", track_x=[(0, 0.5)]),
+        SceneLayout(start=2, end=4, kind="FACE_TRACK", track_x=[(2, 0.5)]),
+    ]
+    steps = [(0.0, 1.0), (1.9, ZOOM_IN)]  # eases over 1.9-2.1, across the cut at 2.0
+    out = _render(static, reframe_graph(lays, 1280, 720, zoom_steps=steps), tmp_path / "x.mp4")
+    edges = [_top_edge(f[:, 100]) for f in _gray_frames(out, 1.8, 2.32)]
+    moves = [b - a for a, b in pairwise(edges)]
+    assert edges[0] - edges[-1] > 60  # the band edge moved outward with the zoom
+    assert all(m <= 1 for m in moves)  # monotonic: scene 2 continues, never restarts
+    assert max(-m for m in moves) <= 30  # no jump at the scene boundary

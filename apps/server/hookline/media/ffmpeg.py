@@ -10,13 +10,28 @@ _ENCODER_PREFERENCE = ("h264_nvenc", "h264_amf", "libx264")
 # Rate control per encoder: without it hardware encoders default to very high bitrates
 # (h264_amf ~19 Mbps), producing huge clips from modest sources.
 _ENCODER_QUALITY_ARGS: dict[str, list[str]] = {
-    # CRF 18 capped at 10 Mb/s (VBV) keeps detail on upscaled faces without runaway sizes.
-    "libx264": ["-preset", "veryfast", "-crf", "18", "-maxrate", "10M", "-bufsize", "20M"],
+    # CRF 17 capped at 10 Mb/s (VBV) keeps detail on upscaled faces without runaway sizes.
+    "libx264": ["-preset", "veryfast", "-crf", "17", "-maxrate", "10M", "-bufsize", "20M"],
     # The requested QVBR mode (-rc qvbr / hqvbr) fails to initialise on this AMD driver (error 4),
     # so use constant-QP: quality-driven like CRF, bitrate scales with the content.
-    "h264_amf": ["-rc", "cqp", "-qp_i", "20", "-qp_p", "22", "-qp_b", "24"],
-    "h264_nvenc": ["-rc", "vbr", "-cq", "19", "-b:v", "0"],
+    "h264_amf": ["-rc", "cqp", "-qp_i", "18", "-qp_p", "20", "-qp_b", "22"],
+    "h264_nvenc": ["-rc", "vbr", "-cq", "18", "-b:v", "0"],
 }
+
+
+# Windows caps a whole command line at ~32K chars; graphs longer than this go via a script file.
+INLINE_GRAPH_MAX = 8000
+
+
+def filter_graph_args(graph: str, script: Path, force: bool = False) -> list[str]:
+    """`-filter_complex <graph>` inline, or (when longer than INLINE_GRAPH_MAX, or `force`)
+    `-/filter_complex <script>` with the graph written to `script` (ffmpeg >= 7 syntax)."""
+    if not force and len(graph) <= INLINE_GRAPH_MAX:
+        return ["-filter_complex", graph]
+    tmp = script.with_name(script.name + ".tmp")
+    tmp.write_text(graph, encoding="utf-8")
+    os.replace(tmp, script)
+    return ["-/filter_complex", str(script)]
 
 
 def encoder_args(encoder: str) -> list[str]:
@@ -206,9 +221,10 @@ def cut_segments(
     n = len(segments)
     inputs = "".join(f"[v{i}][a{i}]" if with_audio else f"[v{i}]" for i in range(n))
     outs = "[v][a]" if with_audio else "[v]"
+    script = dst.with_suffix(".graph.txt")
+    graph = ";".join(parts) + f";{inputs}concat=n={n}:v=1:a={int(with_audio)}{outs}"
     cmd += [
-        "-filter_complex",
-        ";".join(parts) + f";{inputs}concat=n={n}:v=1:a={int(with_audio)}{outs}",
+        *filter_graph_args(graph, script),
         "-map",
         "[v]",
         *(["-map", "[a]"] if with_audio else []),
@@ -218,6 +234,9 @@ def cut_segments(
         *(["-c:a", "pcm_s16le"] if with_audio else []),
     ]
     tmp = dst.with_suffix(f".tmp{dst.suffix}")
-    _run([*cmd, str(tmp)])
+    try:
+        _run([*cmd, str(tmp)])
+    finally:
+        script.unlink(missing_ok=True)
     os.replace(tmp, dst)
     return dst

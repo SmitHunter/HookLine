@@ -12,6 +12,7 @@ from hookline.media.ffmpeg import (
     _run,
     cut_segments,
     encoder_args,
+    filter_graph_args,
     pick_encoder,
     probe_duration,
     probe_fps,
@@ -163,7 +164,8 @@ def render_clip(
     _run(
         [
             "ffmpeg", "-hide_banner", "-y", "-i", str(inter),
-            "-filter_complex", graph,
+            # always a script: zoom/track expressions can outgrow the Windows command line
+            *filter_graph_args(graph, work_dir / f"{name}.graph.txt", force=True),
             "-map", out_label, "-map", "0:a?",
             *encoder_args(encoder or pick_encoder()), "-pix_fmt", "yuv420p",
             *audio_args,
