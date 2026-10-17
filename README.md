@@ -62,7 +62,9 @@ powershell -ExecutionPolicy Bypass -File scripts/build-whisper-vulkan.ps1
 
 Hookline then picks whisper.cpp automatically: when `HOOKLINE_WHISPER_CPP_BIN` and `HOOKLINE_WHISPER_CPP_MODEL` are unset, it looks for `<repo>/tools/bin/whisper-cli.exe` and `<repo>/tools/models/ggml-large-v3-turbo.bin` (`whisper-cli` on non-Windows) and uses them if they exist. To use a different build or model, set those two variables to your own paths. With neither the variables nor those files it falls back to faster-whisper. `hookline run` prints which backend it is using.
 
-Run `hookline doctor` to confirm the whisper.cpp row is OK.
+Run `hookline doctor` to confirm the whisper.cpp row is OK. Doctor also has a "GPU (whisper.cpp)" row: it runs `vulkaninfo --summary` (when installed) and lists the Vulkan devices, flagging "discrete GPU not visible — check driver" when no discrete GPU shows up.
+
+During transcription Hookline logs the Vulkan device whisper.cpp runs on and warns if it is an integrated GPU (`uma`), which usually means the discrete GPU's driver failed to load. whisper.cpp uses device 0 by default; set `HOOKLINE_WHISPER_DEVICE=<n>` to pick another one (passed as `-dev <n>`; the warning suggests the index of the first discrete device).
 
 | Backend | Hardware | Speed (`large-v3-turbo`) |
 |---|---|---|

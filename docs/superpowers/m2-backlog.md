@@ -28,15 +28,20 @@
 - h264_nvenc quality args are untested (no NVIDIA GPU here).
 
 ## New in M2 (from the real run and reviews)
-- False STACKED on wide multi-person shots: the podcast's wide table shot got a zoomed, soft facecam crop on top of the wide frame (seen in clips 01 and 04). Needs a size/aspect sanity check on the detected face box, or a multi-face veto.
-- Choppiness from many short keep ranges (clip 01 has 7, clip 03 has 10 in under a minute); add a minimum gap to cut and merge nearby cuts.
+- ~~False STACKED on wide multi-person shots~~ Fixed in the M2 final review: multi-face veto, 160 px minimum cam box, and small-face group shots go to FIT_BLUR. Original note: the podcast's wide table shot got a zoomed, soft facecam crop on top of the wide frame (seen in clips 01 and 04).
+- ~~Choppiness from many short keep ranges~~ Addressed in the M2 final review (max pause 0.6 s, pad 0.12 s, no kept piece under 1.5 s); re-check on the next real run. Original note: clip 01 has 7, clip 03 has 10 in under a minute.
 - VFR sources may drift by up to a frame per cut.
-- Horizontal + captions is untested.
+- Horizontal + captions test: the `--horizontal` path with captions burned in has no test.
 - One ffmpeg spawn per face sample; batch frame extraction.
 - Layout flicker on fast-cut gameplay is likely; add scene-layout hysteresis.
 - Twitch VOD real-world check: pending (no URL provided).
-- Transcription with DTW took about 41 min for the 1h+ podcast on the Vulkan GPU, far slower than the M1 estimate; measure and consider chunking or a lighter DTW preset.
-- The first hook title box overlaps the top of the head on tight FACE_TRACK crops; consider placing it higher or smaller.
+- Transcription took about 41 min for the 1h+ podcast because whisper.cpp ran on the integrated GPU (AMD Radeon(TM) Graphics, `uma: 1`): the RX 7800 XT driver had failed to load. DTW is not the cost. The run now logs the device and warns on `uma`; `HOOKLINE_WHISPER_DEVICE` selects a device and `hookline doctor` reports the GPU. Re-measure on the discrete GPU once its driver works.
+- ~~The first hook title box overlaps the top of the head on tight FACE_TRACK crops~~ Fixed in the M2 final review: `hook_y_for` moves the hook above the captions when the first scene's face reaches the hook band (STACKED: under the seam captions).
 - Source lower-third graphics are cropped mid-word in FACE_TRACK and STACKED crops.
 - Clip 03 uses a cold open, so keep_ranges are not monotonic (the opening line repeats later); intended, but the sidecar consumer should expect it.
-- `output/<job>/` accumulates old M1 clips alongside new ones when a job is re-run; clean the folder or version it.
+- clips.json manifest + stale output cleanup: `output/<job>/` accumulates old clips alongside new ones when a job is re-run; write a manifest of the current clips and remove outputs it no longer lists.
+- Hybrid per-clip DTW (fast full pass without DTW, DTW only over the picked clips) only if a discrete-GPU re-measure shows DTW costs more than 3x.
+- Chunked/resumable full-pass transcription, so a crash or driver fault mid-VOD does not lose the whole pass.
+- Overlay band detection (lower-thirds, Twitch widgets/alerts), so crops and caption placement avoid them.
+- Collapsed DTW word starts (several words sharing one start) → spread them evenly across the span instead of stacking caption words.
+- Mark the slow ffmpeg tests (`pytest -m slow`): the full suite takes over 6 minutes.
