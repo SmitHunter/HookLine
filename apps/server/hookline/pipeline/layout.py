@@ -1,16 +1,27 @@
 """Per-scene 9:16 layout choice: STACKED facecam, FACE_TRACK, SPLIT, or FIT_BLUR."""
 
+import logging
+import math
 import statistics
 from pathlib import Path
 from typing import Literal, Protocol
 
 import numpy as np
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from hookline.media.ffmpeg import FFmpegError, probe_duration, probe_size
+from hookline.pipeline.profile import (
+    BAR_CONTENT,
+    BAR_LIMIT,
+    LayoutProfile,
+    PxBox,
+    ring_visible,
+    static_edges,
+)
 from hookline.vision.faces import Crop, Face, sample_frames
 
 LayoutKind = Literal["STACKED", "FACE_TRACK", "SPLIT", "FIT_BLUR"]
+log = logging.getLogger(__name__)
 Box = tuple[float, float, float, float]  # normalized x, y, w, h
 
 MIN_SCORE = 0.6
@@ -28,6 +39,75 @@ CAM_VETO_MIN_H = 0.5  # ... "comparable" = at least half the cam face's height
 CAM_MIN_PX = 160  # grown cam box must be this many source pixels tall
 GROUP_MIN_SHARE = 0.5  # share of samples showing a small-face group -> wide shot (FIT_BLUR)
 GROUP_MAX_RATIO = 2.0  # faces within 2x height of the largest are "comparable"
+TRACK_HOLD_S = 3.0  # a face lost for up to this long: the crop holds its last good x ...
+TRACK_EASE_S = 1.0  # ... beyond it, eases to the scene's median face x over this long
+HAIR_SHARE = 0.5  # head top ~ face box top - half a face height (hair)
+HEAD_QUANTILE = 0.1  # the head top budgeted for: this low quantile of the samples (highest)
+ZOOM_TOP = 1.2  # the highest zoom step level (a punch); see reframe.ZOOM_PUNCH
+FACE_CORE_TOP = 0.2  # top share of a face box (hairline/forehead) outside the face core
+SAMPLE_EVERY = 0.25  # face samples every 0.25 s (4 fps): the tracking edge guard needs them
+# Gaze lead room: a FACE_TRACK crop shifts up to LEAD of its width toward where the subject
+# looks (median landmark yaw over the scene): none under YAW_DEAD, the full lead from YAW_FULL.
+LEAD = 0.08
+YAW_DEAD = 0.1
+YAW_FULL = 0.3
+# STACKED panels (1080 wide): the cam on top, the gameplay under it.
+STACK_W = 1080
+STACK_CAM_H = 760
+STACK_GAME_H = 1920 - STACK_CAM_H  # 1160
+# A stream profile's fixed STACKED template. The gameplay panel may shift up to
+# GAME_SHIFT_MAX of the frame width to keep the cam and its label out; else they're blurred.
+GAME_SHIFT_MAX = 0.25
+# Per-scene checks: samples every PROFILE_SAMPLE_S s; the cam shows in a scene when its border
+# matches in >= CAM_SHOWN of them. A pillarbox: dark side bars each >= PILLAR_MIN of the width,
+# within PILLAR_SYMMETRY of each other (a cutscene), outside the cam and its label.
+PROFILE_SAMPLE_S = 1.0
+CAM_SHOWN = 0.5
+PILLAR_MIN = 0.05
+PILLAR_SYMMETRY = 0.03
+PILLAR_W = 320
+# ... with a hard picture edge: on each side, in some sample, the PILLAR_EDGE columns inside it
+# average >= PILLAR_STEP gray over the PILLAR_EDGE columns of bar outside it (a vignette fades)
+PILLAR_EDGE = 3
+PILLAR_STEP = 20.0
+# Static overlays in the gameplay panel (`game_overlays`), from a scene's PILLAR_W samples
+# (>= OVERLAY_SAMPLES of them): static edges (profile.static_edges) joined over OVERLAY_JOIN
+# px, at least OVERLAY_MIN_PX of them, their box at most OVERLAY_MAX of the gameplay box and
+# clear of its edges by OVERLAY_EDGE px (the picture's own edge, a cut-off object).
+OVERLAY_SAMPLES = 4
+OVERLAY_JOIN = 2
+OVERLAY_MIN_PX = 12
+OVERLAY_MAX = 0.2
+OVERLAY_EDGE = 2
+# The cam hidden (BRB, a full-screen cutscene, a Just Chatting stretch with the overlay off):
+# a face at least JC_FACE_MIN of the frame tall in most samples is the streamer full frame
+# (`classify_scene`: FACE_TRACK / SPLIT); otherwise FIT_BLUR.
+JC_FACE_MIN = 0.12  # sit-back Just Chatting: a face 15-20% of the frame tall
+FIT_TRIM = 0.15  # an overlay at a fitted picture's side edge is cut off when it costs <= this
+# Full-cam reaction beats: the cam alone (whole, blurred background) for BEAT_S at the
+# strongest reaction peaks, starting BEAT_LEAD before the peak; at most MAX_BEATS per clip,
+# never before BEAT_AFTER (the hook title), BEAT_GAP clear of other switches (scene changes,
+# other beats, the clip's end), never across a cut.
+BEAT_S = 2.5
+BEAT_LEAD = 0.3
+MAX_BEATS = 2
+BEAT_AFTER = 3.0
+BEAT_GAP = 2.0
+# A beat never overlaps an `avoid` span (the EARLIER tag; [scare - 0.5 s, scare + 1 s]; a
+# gameplay spike): it moves to just after the span, the reaction continuing, when that is at
+# most BEAT_SHIFT_MAX after the peak; else that peak gets none.
+BEAT_SHIFT_MAX = 1.5
+# ... a scare's span: [scare - SCARE_PRE_S, scare + SCARE_POST_S] (the payoff is the gameplay);
+# a startled reaction word gets the same (render.startle_times)
+SCARE_PRE_S, SCARE_POST_S = 0.5, 1.0
+# A talked-over static / death screen (`signals.screen_runs`) inside a clip is covered by the
+# full cam (the streamer's reaction) instead of shown: each screen span on the output timeline
+# at least COVER_MIN_S long, padded COVER_PAD_S each side (an edge within COVER_JOIN_S of a
+# jump cut lands on it instead), spans within COVER_JOIN_S joined (and run on to a scene edge
+# that close), inside a scene with the profile's cam (`cam_covers`)
+COVER_MIN_S = 1.0
+COVER_PAD_S = 0.1
+COVER_JOIN_S = 0.5
 
 
 class SceneLayout(BaseModel):
@@ -36,8 +116,84 @@ class SceneLayout(BaseModel):
     kind: LayoutKind
     facecam: Box | None = None
     track_x: list[tuple[float, float]] = []
+    track_w: list[float] = []  # face width per track_x keyframe, normalized (edge guard)
+    lead: float = 0.0  # gaze lead room: signed share of crop width the crop shifts (+ right)
+    # Edge-guard framing changes (reframe.guard_zoom): (output s, signed share of crop width)
+    # sideways crop offsets, instant at cuts; and the rendered face centre's median offset from
+    # the crop centre (share of crop width, + right), for caption placement and the audit.
+    shift_steps: list[tuple[float, float]] = []
+    face_dx: float | None = None
+    # Per track keyframe the face's (top y, height, eye line y) normalized (eye
+    # None when unknown); the reframe snaps (output s, framing changes for Q7); the rendered
+    # face core per sample [output s, x0, top, x1, bottom, eye y] in output px (caption
+    # placement and Q4b); word gaps (output s) a snap prefers -- render-time only, not saved.
+    track_face: list[tuple[float, float, float | None]] = []
+    snaps: list[float] = []
+    face_px: list[list[float | None]] = []
+    gaps: list[tuple[float, float]] = Field(default=[], exclude=True)
+    cuts: list[float] = Field(default=[], exclude=True)  # output s: changes there are instant
     split_x: tuple[float, float] | None = None
     face_box: tuple[float, float] | None = None  # median face (y, h), normalized; captions
+    face_w: float | None = None  # median face width (FACE_TRACK), normalized to source width
+    head_top: float | None = None  # highest head top (HEAD_QUANTILE), normalized source y
+    # Zoom plan (reframe.plan_zoom): step level s shows as zoom_level(s); zooms keep the panel
+    # row zoom_anchor (normalized panel y; None = face centre / panel centre) fixed.
+    base_zoom: float = 1.0
+    zoom_cap: float | None = None
+    zoom_anchor: float | None = None
+    step_shift: float = 0.0  # flat-zoom FACE_TRACK: signed share of crop width steps shift by
+    # A stream profile's fixed STACKED template (`facecam` is then the cam panel's window):
+    # the cam's picture inside its border (full-cam beats), the head in it
+    # (top of hair to chin: cam-panel zoom, captions, Q4b), the gameplay panel's source region
+    # (`game_fit`: shown whole, letterboxed -- a pillarboxed cutscene) with the overlay parts in
+    # it blurred over (`patches`), and the full-cam reaction beats (output s). Normalized boxes.
+    cam_rect: Box | None = None
+    head_box: Box | None = None
+    game_box: Box | None = None
+    game_fit: bool = False
+    patches: list[Box] = []
+    cam_beats: list[tuple[float, float]] = []
+    # ... the full-cam covers over a static / death screen (output s; `plan_cam_covers`)
+    cam_covers: list[tuple[float, float]] = []
+    # ... whose full-cam picture plays the zoom steps (punches, pulses: a jump cut under a
+    # cover still gets its framing change); older renders held it still (the audit's Q7)
+    cover_zoom: bool = False
+    # Gamma lift of a near-black gameplay panel: (output s, gamma) keyframes, linear between,
+    # held before the first and after the last (`reframe.lift_keyframes`); [] = none
+    game_lift: list[tuple[float, float]] = []
+    fit_src: Box | None = Field(default=None, exclude=True)  # the pillarbox picture found
+    # Which panel the zoom steps zoom (`reframe.plan_zoom`): the speaker's (FACE_TRACK frame,
+    # cam panel, SPLIT panels, FIT_BLUR picture) or, in a template STACKED scene whose cam has
+    # no headroom for a visible punch, the gameplay panel ("game"); `zoom_level` is then the
+    # gameplay panel's zoom
+    zoom_panel: Literal["speaker", "game"] = "speaker"
+    # ... the cam panel's own (static) zoom then: the cam plan's base level, kept
+    cam_zoom: float = 1.0
+    # Static overlays inside the gameplay panel's box (a game's "REC" / "VIDRES" text, a HUD
+    # element), normalized source boxes: a gameplay punch never crops them (`plan_zoom`)
+    game_static: list[Box] = []
+
+    def zoom_level(self, s: float) -> float:
+        """Rendered zoom for schedule level `s` (1.0 / ZOOM_IN / ZOOM_TOP): base_zoom times
+        the step, the step part compressed (never clipped flat) so ZOOM_TOP lands on zoom_cap
+        when the full range would pass it; every distinct level stays distinct."""
+        k = 1.0
+        if self.zoom_cap is not None:
+            k = min(1.0, max(self.zoom_cap / self.base_zoom - 1.0, 0.0) / (ZOOM_TOP - 1.0))
+        return self.base_zoom * (1.0 + (s - 1.0) * k)
+
+    def zoom_y(self, y: float, s: float, panel_h: float) -> float:
+        """Where panel row `y` (px, unzoomed) lands at schedule level `s`: zooms scale about
+        the anchor row (zoom_anchor, else the face centre, else the panel centre)."""
+        a = self.anchor_px(panel_h)
+        return a + self.zoom_level(s) * (y - a)
+
+    def anchor_px(self, panel_h: float) -> float:
+        if self.zoom_anchor is not None:
+            return self.zoom_anchor * panel_h
+        if self.kind == "FACE_TRACK" and self.face_box is not None:
+            return (self.face_box[0] + self.face_box[1] / 2) * panel_h
+        return panel_h / 2
 
 
 class _Detector(Protocol):
@@ -139,19 +295,73 @@ def classify_scene(
             kind="SPLIT",
             split_x=(min(left, right), max(left, right)),
             face_box=_median_box(pair_boxes),
+            head_top=_quantile([y - HAIR_SHARE * h for y, h in pair_boxes], HEAD_QUANTILE),
         )
 
     largest = [(t, max(faces, key=lambda f: f.w * f.h)) for t, faces in kept if faces]
     if n and len(largest) >= TRACK_MIN_SHARE * n:
+        track = _track_keyframes(kept)
         return SceneLayout(
             start=start,
             end=end,
             kind="FACE_TRACK",
-            track_x=[(t, f.cx) for t, f in largest],
+            track_x=[(t, x) for t, x, *_ in track],
+            track_w=[w for _, _, w, *_ in track],
+            track_face=[(y, h, eye) for *_, y, h, eye in track],
+            lead=gaze_lead([f.yaw for _, f in largest]),
             face_box=_median_box([(f.y, f.h) for _, f in largest]),
+            face_w=statistics.median(f.w for _, f in largest),
+            head_top=_head_top([f for _, f in largest]),
         )
 
     return SceneLayout(start=start, end=end, kind="FIT_BLUR")
+
+
+def _quantile(values: list[float], q: float) -> float:
+    """Nearest-rank `q` quantile (q=0.1: a low value that ignores a stray outlier or two)."""
+    ordered = sorted(values)
+    return ordered[max(math.ceil(q * len(ordered)) - 1, 0)]
+
+
+def _head_top(faces: list[Face]) -> float:
+    return _quantile([f.y - HAIR_SHARE * f.h for f in faces], HEAD_QUANTILE)
+
+
+def gaze_lead(yaws: list[float | None]) -> float:
+    """Signed lead room (share of crop width; + = the crop shifts right) from the scene's
+    median face yaw: 0 below YAW_DEAD, ramping to LEAD at YAW_FULL. The median ignores a
+    stray estimate; one value per scene keeps the crop steady."""
+    known = [y for y in yaws if y is not None]
+    if not known:
+        return 0.0
+    yaw = statistics.median(known)
+    ramp = min(max((abs(yaw) - YAW_DEAD) / (YAW_FULL - YAW_DEAD), 0.0), 1.0)
+    return math.copysign(LEAD * ramp, yaw) if ramp else 0.0
+
+
+Keyframe = tuple[float, float, float, float, float, float | None]  # t, x, w, y, h, eye y
+
+
+def _track_keyframes(kept: list[tuple[float, list[Face]]]) -> list[Keyframe]:
+    """(t, centre x, width, top y, height, eye line y) of the largest face per sample. A
+    sample with no face (none passed MIN_SCORE) HOLDS the last good face rather than following
+    whatever else is in frame; after TRACK_HOLD_S without a face its x eases to the scene's
+    median face x over TRACK_EASE_S. Samples before the first face add nothing (the first x
+    holds back to the scene start), so the track only interpolates between valid samples and
+    hold points."""
+    xs = [max(faces, key=lambda f: f.w * f.h).cx for _, faces in kept if faces]
+    median = statistics.median(xs) if xs else 0.5
+    out: list[Keyframe] = []
+    last: Keyframe | None = None
+    for t, faces in sorted(kept, key=lambda s: s[0]):
+        if faces:
+            face = max(faces, key=lambda f: f.w * f.h)
+            last = (t, face.cx, face.w, face.y, face.h, face.eye_y)
+            out.append(last)
+        elif last is not None:
+            ease = min(max((t - last[0] - TRACK_HOLD_S) / TRACK_EASE_S, 0.0), 1.0)
+            out.append((t, last[1] + (median - last[1]) * ease, *last[2:]))
+    return out
 
 
 def _median_box(boxes: list[tuple[float, float]]) -> tuple[float, float]:
@@ -179,7 +389,7 @@ def plan_layouts(
     video: Path,
     detector: _Detector | None,
     facecam_override: Box | None = None,
-    sample_every: float = 1.0,
+    sample_every: float = SAMPLE_EVERY,
     crop: Crop | None = None,
 ) -> list[SceneLayout]:
     """One layout per scene. With no detector (and no override) the whole video is a single
@@ -199,7 +409,462 @@ def plan_layouts(
         try:
             frames = sample_frames(video, times, crop=crop)
             samples = [(t, detector.detect(f)) for t, f in zip(times, frames, strict=True)]
-        except FFmpegError:
-            samples = []  # unreadable scene: fall back to FIT_BLUR rather than abort the plan
+        except FFmpegError as e:
+            # unreadable scene: fall back to FIT_BLUR rather than abort the plan, never silently
+            log.warning(
+                "face sampling failed for %s scene %.2f-%.2f s (%s); the scene uses FIT_BLUR",
+                video.name, start, end, (str(e).splitlines() or ["error"])[0],
+            )  # fmt: skip
+            samples = []
         layouts.append(classify_scene(samples, start, end, src_h=src_h))
     return layouts
+
+
+# --- the fixed STACKED template of a stream profile ------------------------------------
+
+
+def _norm(box: PxBox, crop: Crop | None, size: tuple[int, int]) -> Box:
+    """A source-px (x0, y0, x1, y1) box as a normalized (x, y, w, h) box of `crop` (or the
+    full `size` frame), clipped to it."""
+    cw, ch, cx, cy = crop or (size[0], size[1], 0, 0)
+    x0 = min(max((box[0] - cx) / cw, 0.0), 1.0)
+    y0 = min(max((box[1] - cy) / ch, 0.0), 1.0)
+    x1 = min(max((box[2] - cx) / cw, 0.0), 1.0)
+    y1 = min(max((box[3] - cy) / ch, 0.0), 1.0)
+    return (x0, y0, x1 - x0, y1 - y0)
+
+
+def _overlap(a: Box, b: Box) -> Box | None:
+    x0, y0 = max(a[0], b[0]), max(a[1], b[1])
+    x1, y1 = min(a[0] + a[2], b[0] + b[2]), min(a[1] + a[3], b[1] + b[3])
+    return (x0, y0, x1 - x0, y1 - y0) if x1 > x0 + 1e-9 and y1 > y0 + 1e-9 else None
+
+
+def _cam_window(cam: Box, head: Box, aspect: float) -> Box:
+    """The largest `aspect` (w/h in normalized units) window inside `cam`: the cam's whole
+    width (only background above/below cropped; a wider cam: its whole height), centred on the
+    head, shifted to stay inside the cam."""
+    x, y, w, h = cam
+    hx, hy, hw, hh = head
+    if w / h <= aspect:
+        win_h = w / aspect
+        wy = min(max(hy + hh / 2 - win_h / 2, y), y + h - win_h)
+        return (x, wy, w, win_h)
+    win_w = h * aspect
+    wx = min(max(hx + hw / 2 - win_w / 2, x), x + w - win_w)
+    return (wx, y, win_w, h)
+
+
+def stack_template(
+    profile: LayoutProfile, crop: Crop | None, size: tuple[int, int], fit: Box | None = None
+) -> dict:
+    """SceneLayout fields of the profile's fixed STACKED template in `crop` space: the cam
+    panel window (`facecam`: the cam's whole width, background above/below cropped, the head
+    centred; never the border), `cam_rect`, `head_box`, `face_box` / `head_top` (zoom
+    headroom), and the gameplay panel (`game_box`): the full frame height centred on the
+    screen centre, shifted up to GAME_SHIFT_MAX of the width when that keeps the cam and its
+    label out, else those blurred over (`patches`); with `fit` (a pillarboxed scene's
+    picture) that picture whole, less the overlays at its side edges (when they take at most
+    FIT_TRIM of its width), the other overlay parts on it blurred."""
+    assert profile.cam is not None and profile.head is not None
+    cw, ch, _, _ = crop or (size[0], size[1], 0, 0)
+    cam = _norm(profile.cam, crop, size)
+    head = _norm(profile.head, crop, size)
+    # normalized units: a w/h ratio in pixels is (w * cw) / (h * ch)
+    window = _cam_window(cam, head, STACK_W / STACK_CAM_H * ch / cw)
+    keep_out = [_norm(b, crop, size) for b in profile.keep_out()]
+    fields: dict = {
+        "facecam": window,
+        "cam_rect": cam,
+        "head_box": head,
+        "head_top": head[1],
+        "game_fit": fit is not None,
+    }
+    if profile.face is not None:
+        face = _norm(profile.face, crop, size)
+        fields["face_box"] = (face[1], face[3])
+    if fit is not None:
+        box = _trim_fit(fit, keep_out)
+        fields["game_box"] = box
+        fields["patches"] = [p for b in keep_out if (p := _overlap(b, box)) is not None]
+        return fields
+    gh = 1.0
+    gw = STACK_W / STACK_GAME_H * ch / cw
+    if gw > 1.0:
+        gw, gh = 1.0, STACK_GAME_H / STACK_W * cw / ch
+    gy = (1.0 - gh) / 2
+    centre = (1.0 - gw) / 2
+
+    def clear(x: float) -> bool:
+        return all(_overlap((x, gy, gw, gh), b) is None for b in keep_out)
+
+    options = [centre]
+    for b in keep_out:
+        options += [b[0] + b[2], b[0] - gw]
+    ok = [
+        x
+        for x in options
+        if -1e-9 <= x <= 1.0 - gw + 1e-9 and abs(x - centre) <= GAME_SHIFT_MAX and clear(x)
+    ]
+    gx = min(max(min(ok, key=lambda x: abs(x - centre)) if ok else centre, 0.0), 1.0 - gw)
+    game = (gx, gy, gw, gh)
+    fields["game_box"] = game
+    fields["patches"] = [] if ok else [p for b in keep_out if (p := _overlap(b, game))]
+    return fields
+
+
+def _trim_fit(fit: Box, keep_out: list[Box]) -> Box:
+    """`fit` with the overlays touching its left / right edge cut off, each side only when
+    that costs at most FIT_TRIM of its width (else they stay, to be blurred)."""
+    x0, x1 = fit[0], fit[0] + fit[2]
+    left, right = x0, x1
+    for b in keep_out:
+        ov = _overlap(b, fit)
+        if ov is None:
+            continue
+        if ov[0] <= x0 + 1e-9:
+            left = max(left, ov[0] + ov[2])
+        elif ov[0] + ov[2] >= x1 - 1e-9:
+            right = min(right, ov[0])
+    if left - x0 > FIT_TRIM * fit[2]:
+        left = x0
+    if x1 - right > FIT_TRIM * fit[2]:
+        right = x1
+    return (left, fit[1], right - left, fit[3])
+
+
+def pillarbox(frames: np.ndarray, keep_out: list[Box]) -> Box | None:
+    """The picture of a pillarboxed scene (normalized (x, 0, w, 1)) from its gray (n, H, W)
+    samples, the `keep_out` boxes (cam, label) ignored: content columns (> BAR_CONTENT of a
+    column brighter than BAR_LIMIT in some sample) leave dark bars each >= PILLAR_MIN of the
+    width on BOTH sides, within PILLAR_SYMMETRY of each other. None otherwise."""
+    _, h, w = frames.shape
+    lit = frames > BAR_LIMIT
+    for x, y, bw, bh in keep_out:
+        lit[:, int(y * h) : math.ceil((y + bh) * h), int(x * w) : math.ceil((x + bw) * w)] = False
+    cols = np.flatnonzero((lit.mean(axis=1) > BAR_CONTENT).any(axis=0))
+    if not len(cols):
+        return None
+    left, right = int(cols[0]), w - 1 - int(cols[-1])
+    if min(left, right) < PILLAR_MIN * w or abs(left - right) > PILLAR_SYMMETRY * w:
+        return None
+    col_mean = frames.astype(np.float32).mean(axis=1)  # (n, W)
+    k = PILLAR_EDGE
+    lo, hi = left, w - right  # the picture's columns [lo, hi)
+    step_l = col_mean[:, lo : lo + k].mean(axis=1) - col_mean[:, max(lo - k, 0) : lo].mean(axis=1)
+    step_r = col_mean[:, hi - k : hi].mean(axis=1) - col_mean[:, hi : hi + k].mean(axis=1)
+    if step_l.max() < PILLAR_STEP or step_r.max() < PILLAR_STEP:
+        return None  # no hard edge: a dark scene fading to black at its sides
+    return (left / w, 0.0, (w - left - right) / w, 1.0)
+
+
+def game_overlays(frames: np.ndarray, game: Box, keep_out: list[Box]) -> list[Box]:
+    """Static overlays (normalized boxes) inside the gameplay box `game` from a scene's gray
+    (n, H, W) samples (`crop` space): static edges outside the `keep_out` boxes (cam, label;
+    blurred anyway), joined over OVERLAY_JOIN px into components of >= OVERLAY_MIN_PX edge
+    pixels, each box at most OVERLAY_MAX of the gameplay box and OVERLAY_EDGE px clear of its
+    edges. [] with fewer than OVERLAY_SAMPLES samples (too few to tell static from slow)."""
+    import cv2
+
+    n, h, w = frames.shape
+    if n < OVERLAY_SAMPLES:
+        return []
+    x0, y0 = max(int(game[0] * w), 0), max(int(game[1] * h), 0)
+    x1, y1 = min(math.ceil((game[0] + game[2]) * w), w), min(math.ceil((game[1] + game[3]) * h), h)
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        return []
+    edges = static_edges(frames, (x0, y0, x1, y1))
+    for bx, by, bw, bh in keep_out:
+        edges[
+            max(int(by * h) - y0, 0) : max(math.ceil((by + bh) * h) - y0, 0),
+            max(int(bx * w) - x0, 0) : max(math.ceil((bx + bw) * w) - x0, 0),
+        ] = False
+    k = 2 * OVERLAY_JOIN + 1
+    joined = cv2.dilate(edges.astype(np.uint8), np.ones((k, k), np.uint8))
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(joined, connectivity=8)
+    gw, gh = x1 - x0, y1 - y0
+    out = []
+    for c in range(1, count):
+        cx, cy, cw, ch, _ = (int(v) for v in stats[c])
+        if int(edges[labels == c].sum()) < OVERLAY_MIN_PX or cw * ch > OVERLAY_MAX * gw * gh:
+            continue
+        e = OVERLAY_EDGE
+        if cx < e or cy < e or cx + cw > gw - e or cy + ch > gh - e:
+            continue
+        out.append(((x0 + cx) / w, (y0 + cy) / h, cw / w, ch / h))
+    return sorted(out)
+
+
+def classify_profile_scene(
+    start: float,
+    end: float,
+    ring_frames: np.ndarray,
+    origin: tuple[int, int],
+    wide: np.ndarray,
+    profile: LayoutProfile,
+    crop: Crop | None,
+    prev_fit: Box | None = None,
+) -> SceneLayout:
+    """A scene of a profiled stream: the fixed STACKED template when the cam's border (or its
+    picture just inside it) shows in >= CAM_SHOWN of the `ring_frames` (gray crops of the
+    source at px `origin`), its
+    gameplay fitted when the `wide` samples (gray, `crop` space) are pillarboxed, its static
+    overlays noted (`game_overlays`: a gameplay punch keeps them whole); the cam
+    hidden (BRB, a full-screen cutscene): FIT_BLUR of the gameplay. Never FACE_TRACK: the
+    only face that matters is the streamer's, in the cam. A pillarbox picture within
+    PILLAR_SYMMETRY of the previous scene's (`prev_fit`) is taken as that one: one cutscene,
+    one framing."""
+    shown = sum(
+        ring_visible(f, profile.ring, origin) or ring_visible(f, profile.ring_in, origin)
+        for f in ring_frames
+    )
+    if not len(ring_frames) or shown < CAM_SHOWN * len(ring_frames):
+        return SceneLayout(start=start, end=end, kind="FIT_BLUR")
+    keep_out = [_norm(b, crop, profile.size) for b in profile.keep_out()]
+    fit = pillarbox(wide, keep_out)
+    near = fit is not None and prev_fit is not None
+    if near and all(abs(a - b) <= PILLAR_SYMMETRY for a, b in zip(fit, prev_fit, strict=True)):  # type: ignore[arg-type]
+        fit = prev_fit
+    tpl = stack_template(profile, crop, profile.size, fit=fit)
+    tpl["game_static"] = game_overlays(wide, tpl["game_box"], keep_out)
+    return SceneLayout(start=start, end=end, kind="STACKED", fit_src=fit, **tpl)
+
+
+def hidden_scene_layout(
+    samples: list[tuple[float, list[Face]]], start: float, end: float, src_h: int | None = None
+) -> SceneLayout:
+    """A profiled stream's scene with the cam hidden: the streamer full frame (Just Chatting,
+    the overlay off) when `classify_scene` tracks a face (FACE_TRACK / SPLIT) at least
+    JC_FACE_MIN of the frame tall (median); else FIT_BLUR (BRB, a cutscene, in-game faces)."""
+    lay = classify_scene(samples, start, end, src_h=src_h)
+    big = lay.face_box is not None and lay.face_box[1] >= JC_FACE_MIN
+    if lay.kind in ("FACE_TRACK", "SPLIT") and big:
+        return lay
+    return SceneLayout(start=start, end=end, kind="FIT_BLUR")
+
+
+def _gray(frames: list[np.ndarray]) -> np.ndarray:
+    return np.stack(
+        [
+            (f[..., 0] * 0.114 + f[..., 1] * 0.587 + f[..., 2] * 0.299).astype(np.uint8)
+            for f in frames
+        ]
+    )
+
+
+def _ring_box(profile: LayoutProfile) -> Crop:
+    """The even-aligned source-px crop (w, h, x, y) holding every border ring point."""
+    xs = [x for x, _, _ in [*profile.ring, *profile.ring_in]]
+    ys = [y for _, y, _ in [*profile.ring, *profile.ring_in]]
+    x0, y0 = min(xs) // 2 * 2, min(ys) // 2 * 2
+    return max((max(xs) + 2 - x0) // 2 * 2, 2), max((max(ys) + 2 - y0) // 2 * 2, 2), x0, y0
+
+
+def plan_profile_layouts(
+    video: Path,
+    profile: LayoutProfile,
+    crop: Crop | None = None,
+    sample_every: float = PROFILE_SAMPLE_S,
+    detector: _Detector | None = None,
+) -> list[SceneLayout]:
+    """One layout per scene of a profiled stream (`classify_profile_scene`), identical
+    neighbours merged: the cam is never re-detected, only checked for showing (its border)
+    and the gameplay for pillarboxing. A scene with the cam hidden is checked for the
+    streamer full frame with the `detector` (`hidden_scene_layout`: Just Chatting).
+    `video` has the profile's source size; `crop` is the letterbox / overlay crop the
+    reframe applies."""
+    rw, rh, rx, ry = _ring_box(profile)
+    layouts = []
+    for start, end in _scenes(video):
+        times = _sample_times(start, end, sample_every)
+        try:
+            ring = _gray(sample_frames(video, times, width=rw, crop=(rw, rh, rx, ry)))
+            wide = _gray(sample_frames(video, times, width=PILLAR_W, crop=crop))
+        except FFmpegError as e:
+            log.warning(
+                "profile checks failed for %s scene %.2f-%.2f s (%s); the scene keeps the "
+                "STACKED template", video.name, start, end, (str(e).splitlines() or ["error"])[0],
+            )  # fmt: skip
+            tpl = stack_template(profile, crop, profile.size)
+            layouts.append(SceneLayout(start=start, end=end, kind="STACKED", **tpl))
+            continue
+        prev = layouts[-1].fit_src if layouts else None
+        lay = classify_profile_scene(start, end, ring, (rx, ry), wide, profile, crop, prev)
+        if lay.kind == "FIT_BLUR" and detector is not None:
+            lay = _hidden_scene(video, detector, start, end, crop, profile)
+        layouts.append(lay)
+    return merge_same(layouts)
+
+
+def _hidden_scene(
+    video: Path,
+    detector: _Detector,
+    start: float,
+    end: float,
+    crop: Crop | None,
+    profile: LayoutProfile,
+) -> SceneLayout:
+    """`hidden_scene_layout` from face samples every SAMPLE_EVERY s (FIT_BLUR when they can't
+    be read)."""
+    times = _sample_times(start, end, SAMPLE_EVERY)
+    try:
+        frames = sample_frames(video, times, crop=crop)
+    except FFmpegError:
+        return SceneLayout(start=start, end=end, kind="FIT_BLUR")
+    samples = [(t, detector.detect(f)) for t, f in zip(times, frames, strict=True)]
+    src_h = crop[1] if crop else profile.size[1]
+    return hidden_scene_layout(samples, start, end, src_h=src_h)
+
+
+_GEOMETRY = ("kind", "facecam", "cam_rect", "head_box", "game_box", "game_fit", "patches")
+
+
+def merge_same(layouts: list[SceneLayout]) -> list[SceneLayout]:
+    """Consecutive scenes with the same kind and geometry joined into one: one framing, no
+    camera change (nor its instant zoom step) at a gameplay scene cut."""
+    out: list[SceneLayout] = []
+    for lay in layouts:
+        prev = out[-1] if out else None
+        tracked = lay.kind in ("FACE_TRACK", "SPLIT")  # per-scene tracks: never joined
+        if (
+            prev is not None
+            and not tracked
+            and all(getattr(prev, k) == getattr(lay, k) for k in _GEOMETRY)
+        ):
+            static = sorted({*prev.game_static, *lay.game_static})
+            out[-1] = prev.model_copy(update={"end": lay.end, "game_static": static})
+        else:
+            out.append(lay)
+    return out
+
+
+def plan_cam_beats(
+    peaks: list[tuple[float, float]],
+    layouts: list[SceneLayout],
+    cuts: list[float],
+    duration: float,
+    avoid: list[tuple[float, float]] | None = None,
+    startles: list[float] | None = None,
+) -> list[SceneLayout]:
+    """`layouts` with full-cam reaction beats (`cam_beats`, output s) at the strongest
+    `peaks` (output s, score): BEAT_S long from BEAT_LEAD before the peak, inside one
+    template STACKED scene (cam shown, gameplay cropped) at least BEAT_GAP from its inner
+    bounds, from BEAT_AFTER on and BEAT_GAP before the end, no cut inside, BEAT_GAP from
+    other beats; clear of the `avoid` spans (the EARLIER tag, scares, gameplay spikes) and of
+    [startle - SCARE_PRE_S, startle + SCARE_POST_S] round every startled reaction word
+    (`startles`, output s) but the peak's own -- moved just past them, at most BEAT_SHIFT_MAX
+    after the peak; at most MAX_BEATS. A beat keeps BEAT_GAP clear of the full-cam covers
+    (`cam_covers`) as of other beats."""
+    covers = [c for lay in layouts for c in lay.cam_covers]
+    chosen: list[tuple[int, float, float]] = []
+    for t, _ in sorted(peaks, key=lambda p: -p[1]):
+        if len(chosen) >= MAX_BEATS:
+            break
+        others = [(s - SCARE_PRE_S, s + SCARE_POST_S) for s in startles or [] if abs(s - t) > 1e-3]
+        others += [(p - BEAT_GAP, q + BEAT_GAP) for p, q in covers]  # the cam is up already
+        spans = sorted([*((p, q) for p, q in avoid or []), *others])
+        a = max(t - BEAT_LEAD, 0.0)
+        while (hit := next((q for p, q in spans if a < q and a + BEAT_S > p), None)) is not None:
+            a = hit  # the reaction after the scare / spike
+        a = round(a, 3)
+        b = round(a + BEAT_S, 3)
+        if a - t > BEAT_SHIFT_MAX + 1e-9:
+            continue
+        if a < BEAT_AFTER or b > duration - BEAT_GAP:
+            continue
+        i = next((k for k, lay in enumerate(layouts) if lay.start <= a < lay.end), None)
+        if i is None:
+            continue
+        lay = layouts[i]
+        if lay.kind != "STACKED" or lay.cam_rect is None or lay.game_fit:
+            continue
+        near_start = lay.start > 1e-6 and a - lay.start < BEAT_GAP
+        near_end = lay.end < duration - 1e-6 and lay.end - b < BEAT_GAP
+        if b > lay.end or near_start or near_end:
+            continue
+        if any(a + 1e-6 < c < b - 1e-6 for c in cuts):
+            continue
+        if any(a < q + BEAT_GAP and b > p - BEAT_GAP for _, p, q in chosen):
+            continue
+        chosen.append((i, a, b))
+    out = list(layouts)
+    for i, a, b in chosen:
+        out[i] = out[i].model_copy(update={"cam_beats": sorted([*out[i].cam_beats, (a, b)])})
+    return out
+
+
+def _joined(spans: list[tuple[float, float]], gap: float) -> list[tuple[float, float]]:
+    out: list[tuple[float, float]] = []
+    for a, b in sorted(spans):
+        if out and a <= out[-1][1] + gap:
+            out[-1] = (out[-1][0], max(out[-1][1], b))
+        else:
+            out.append((a, b))
+    return out
+
+
+def _snap_edge(t: float, padded: float, cuts: list[float]) -> float:
+    """A cover edge at `t` (padded to `padded`) on the cut nearest it within COVER_JOIN_S --
+    the switch to the cam and the jump cut land in one frame, never a cut under the padding
+    -- else `padded`."""
+    near = [c for c in cuts if abs(c - t) <= COVER_JOIN_S + 1e-9]
+    return min(near, key=lambda c: abs(c - t)) if near else padded
+
+
+def _outside(
+    spans: list[tuple[float, float]], avoid: list[tuple[float, float]]
+) -> list[tuple[float, float]]:
+    """The parts of `spans` outside every `avoid` span."""
+    out = []
+    for a, b in spans:
+        pieces = [(a, b)]
+        for x, y in avoid:
+            pieces = [
+                p for lo, hi in pieces for p in ((lo, min(hi, x)), (max(lo, y), hi)) if p[1] > p[0]
+            ]
+        out += pieces
+    return out
+
+
+def plan_cam_covers(
+    screens: list[tuple[float, float]],
+    layouts: list[SceneLayout],
+    duration: float,
+    cuts: list[float] | None = None,
+    avoid: list[tuple[float, float]] | None = None,
+) -> list[SceneLayout]:
+    """`layouts` with full-cam covers (`cam_covers`, output s) over the static / death
+    `screens` (output spans, split at cuts): spans within COVER_JOIN_S joined, each at least
+    COVER_MIN_S long, each edge on a jump cut (`cuts`, output s) within COVER_JOIN_S of it,
+    else padded COVER_PAD_S; clipped to every template STACKED scene (one with the profile's
+    cam: `cam_rect`) it overlaps and run on to that scene's edge when it ends within
+    COVER_JOIN_S of it; kept out of the `avoid` spans (the hook title and the EARLIER tag,
+    `ass.text_windows`: placed for the template, they would sit on the full cam's face), a
+    part left shorter than COVER_MIN_S dropped. Scenes without the cam keep the screen. A
+    scene given covers plays the zoom steps on its full-cam cover picture (`cover_zoom`)."""
+    cuts = sorted(cuts or [])
+    spans = [(a, b) for a, b in _joined(screens, COVER_JOIN_S) if b - a >= COVER_MIN_S - 1e-9]
+    out = []
+    for lay in layouts:
+        mine = []
+        if lay.kind == "STACKED" and lay.cam_rect is not None:
+            for a, b in spans:
+                lo = max(_snap_edge(a, a - COVER_PAD_S, cuts), lay.start, 0.0)
+                hi = min(_snap_edge(b, b + COVER_PAD_S, cuts), lay.end, duration)
+                if hi <= lo:
+                    continue
+                # run on to a scene edge that close -- never across a cut on the way
+                if lo - lay.start < COVER_JOIN_S and not any(lay.start < c <= lo for c in cuts):
+                    lo = lay.start
+                if lay.end - hi < COVER_JOIN_S and not any(hi <= c < lay.end for c in cuts):
+                    hi = lay.end
+                mine += [
+                    (round(x, 3), round(y, 3))
+                    for x, y in _outside([(lo, hi)], avoid or [])
+                    if y - x >= COVER_MIN_S - 1e-9
+                ]
+        if mine:
+            covers = _joined([*lay.cam_covers, *mine], 0.0)
+            lay = lay.model_copy(update={"cam_covers": covers, "cover_zoom": True})
+        out.append(lay)
+    return out

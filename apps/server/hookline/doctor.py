@@ -1,5 +1,6 @@
 import importlib.util
 import os
+import re
 import shutil
 import subprocess
 from collections.abc import Callable
@@ -36,6 +37,36 @@ def _ffmpeg_output(run: Callable, *args: str) -> str:
 def _lists(output: str, name: str) -> bool:
     """True when a `-filters`/`-encoders` table row has `name` as its second column."""
     return any(line.split()[1:2] == [name] for line in output.splitlines())
+
+
+# renders pass their filter graph as a file (`-/filter_complex`), new in ffmpeg 7.0
+MIN_FFMPEG_MAJOR = 7
+
+
+def ffmpeg_major(version_output: str) -> tuple[int | None, str]:
+    """(major release, version string) from `ffmpeg -version`; major None for a git build
+    ("N-118000-g...") or an unreadable banner."""
+    m = re.search(r"ffmpeg version (\S+)", version_output)
+    if not m:
+        return None, ""
+    version = m.group(1)
+    major = re.match(r"n?(\d+)\.", version)
+    return (int(major.group(1)) if major else None), version
+
+
+def _ffmpeg_check(ffmpeg: str | None, run: Callable) -> Check:
+    if not ffmpeg:
+        return Check("ffmpeg", False, True, "not found on PATH")
+    major, version = ffmpeg_major(_ffmpeg_output(run, "-version"))
+    if major is not None and major < MIN_FFMPEG_MAJOR:
+        return Check(
+            "ffmpeg",
+            False,
+            True,
+            f"ffmpeg {version} at {ffmpeg} is too old: Hookline needs ffmpeg "
+            f"{MIN_FFMPEG_MAJOR} or newer (filter scripts via -/filter_complex)",
+        )
+    return Check("ffmpeg", True, True, f"{ffmpeg} ({version or 'version unknown'})")
 
 
 def parse_vulkaninfo(summary: str) -> list[tuple[str, str]]:
@@ -92,7 +123,7 @@ def run_doctor(
 ) -> list[Check]:
     checks: list[Check] = []
     ffmpeg = which("ffmpeg")
-    checks.append(Check("ffmpeg", bool(ffmpeg), True, ffmpeg or "not found on PATH"))
+    checks.append(_ffmpeg_check(ffmpeg, run))
 
     has_libass = False
     if ffmpeg:

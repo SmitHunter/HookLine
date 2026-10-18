@@ -5,7 +5,7 @@ import pytest
 
 from hookline import assets
 from hookline.media.ffmpeg import FFmpegError
-from hookline.vision.faces import Face, FaceDetector, sample_frames
+from hookline.vision.faces import Face, FaceDetector, face_yaw, sample_frames
 
 
 def test_face_is_normalized_record():
@@ -70,3 +70,45 @@ def test_detector_handles_changing_frame_sizes(synthetic_stream):
     (small,) = sample_frames(synthetic_stream, [1.0], width=640)
     a, b = det.detect(big), det.detect(small)
     assert a and b and abs(a[0].x - b[0].x) < 0.02
+
+
+# --- yaw from landmarks, batched sampling ---------------------------------------------------------
+
+
+def test_face_yaw_from_eyes_and_nose():
+    assert face_yaw((100, 50), (140, 50), (120, 70)) == pytest.approx(0.0)
+    assert face_yaw((100, 50), (140, 50), (130, 70)) == pytest.approx(0.25)  # nose right
+    assert face_yaw((100, 50), (140, 50), (106, 70)) == pytest.approx(-0.35)  # nose left
+    assert face_yaw((100, 50), (100.5, 50), (120, 70)) is None  # eyes on top of each other
+
+
+def test_face_defaults_to_no_yaw():
+    assert Face(x=0.1, y=0.2, w=0.3, h=0.4, score=0.9).yaw is None
+
+
+def test_sample_frames_batch_matches_single_seeks(fixture_video):
+    times = [0.25 * k + 0.125 for k in range(20)]
+    batch = sample_frames(fixture_video, times, width=160)
+    assert len(batch) == len(times)
+    for t, frame in zip(times[::6], batch[::6], strict=True):
+        (single,) = sample_frames(fixture_video, [t], width=160)
+        assert np.abs(frame.astype(int) - single.astype(int)).mean() < 2.0
+
+
+def test_sample_frames_batch_past_end_raises(fixture_video):
+    with pytest.raises(FFmpegError):
+        sample_frames(fixture_video, [0.5 * k for k in range(8)] + [10_000.0])
+
+
+def test_sample_frames_many_times_in_one_scene(fixture_video):
+    # 4 fps over 40 s: one select sum of 160 terms overflows ffmpeg's expression parser
+    times = [0.25 * k + 0.125 for k in range(160)]
+    frames = sample_frames(fixture_video, times, width=64)
+    assert len(frames) == 160 and all(f.shape == (36, 64, 3) for f in frames)
+
+
+@pytest.mark.integration
+def test_detector_reports_yaw_from_landmarks(synthetic_stream):
+    (frame,) = sample_frames(synthetic_stream, [1.0])
+    faces = FaceDetector(assets.ensure_yunet()).detect(frame)
+    assert faces and faces[0].yaw is not None and -1.0 < faces[0].yaw < 1.0

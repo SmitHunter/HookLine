@@ -216,7 +216,7 @@ def test_plan_layouts_without_cuts_is_one_scene(tmp_path):
     assert len(layouts) == 1
     assert layouts[0].start == 0 and layouts[0].end == pytest.approx(4.0, abs=0.1)
     assert layouts[0].kind == "FIT_BLUR"
-    assert len(det.frames) == 4  # one sample per second
+    assert len(det.frames) == 16  # four samples per second (the edge guard needs >= 4 fps)
     assert det.frames[0].shape == (360, 640, 3)
 
 
@@ -253,7 +253,7 @@ def test_plan_layouts_override_and_crop_pass_through(tmp_path):
     assert det.frames == []  # override needs no detection
 
 
-def test_plan_layouts_failed_scene_falls_back_to_fit_blur(tmp_path, monkeypatch):
+def test_plan_layouts_failed_scene_falls_back_to_fit_blur(tmp_path, monkeypatch, caplog):
     from hookline.media.ffmpeg import FFmpegError
     from hookline.pipeline import layout
 
@@ -275,8 +275,12 @@ def test_plan_layouts_failed_scene_falls_back_to_fit_blur(tmp_path, monkeypatch)
 
     monkeypatch.setattr(layout, "sample_frames", flaky)
     face = Face(x=0.4, y=0.2, w=0.2, h=0.4, score=0.9)
-    layouts = plan_layouts(video, _RecordingDetector([face]))
+    with caplog.at_level("WARNING"):
+        layouts = plan_layouts(video, _RecordingDetector([face]))
     assert [s.kind for s in layouts] == ["FIT_BLUR", "FACE_TRACK"]
+    # never silent: the warning names the video, the scene and the fallback layout
+    (msg,) = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert "cut.mp4" in msg and "0.00-3.00" in msg and "FIT_BLUR" in msg and "no frame" in msg
 
 
 @pytest.mark.integration
@@ -294,3 +298,114 @@ def test_plan_layouts_without_detector_is_fit_blur(fixture_video):
     layouts = plan_layouts(fixture_video, None)
     assert [lay.kind for lay in layouts] == ["FIT_BLUR"]
     assert layouts[0].start == 0 and layouts[0].end == pytest.approx(150, abs=0.1)
+
+
+# --- tracking holds through face gaps; head top; zoom plan fields ---------------------------------
+
+
+def _face_at(cx: float, y: float = 0.2, h: float = 0.4, score: float = 0.9) -> Face:
+    return Face(x=cx - 0.1, y=y, w=0.2, h=h, score=score)
+
+
+def test_track_holds_last_good_x_through_a_short_face_gap():
+    # face at 0.3 until 2.0 s, gone for 1.5 s (only a low-score "body" at 0.7), back at 0.6
+    samples = []
+    for i in range(13):
+        t = i * 0.5
+        if t <= 2.0:
+            faces = [_face_at(0.3)]
+        elif t < 4.0:
+            faces = [_face_at(0.7, score=0.4)]
+        else:
+            faces = [_face_at(0.6)]
+        samples.append((t, faces))
+    s = classify_scene(samples, 0, 6.5)
+    assert s.kind == "FACE_TRACK"
+    track = dict(s.track_x)
+    for t in (2.5, 3.0, 3.5):  # held, not re-centred and not following the body
+        assert track[t] == pytest.approx(0.3)
+    assert track[4.0] == pytest.approx(0.6)
+
+
+def test_track_long_face_gap_eases_to_median_x():
+    # face at 0.3 for 0-2 s, gone 3-12 s, at 0.9 from 13 s: median of the valid x is 0.9
+    samples = [(float(t), [_face_at(0.3)] if t < 3 else []) for t in range(13)]
+    samples += [(float(t), [_face_at(0.9)]) for t in range(13, 20)]
+    s = classify_scene(samples, 0, 20)
+    track = dict(s.track_x)
+    assert track[3.0] == pytest.approx(0.3) and track[5.0] == pytest.approx(0.3)  # <= 3 s: hold
+    assert track[6.0] == pytest.approx(0.9)  # 4 s without a face: eased to the median x
+    assert track[12.0] == pytest.approx(0.9)
+
+
+def test_track_leading_gap_adds_no_keyframes():
+    samples = [(float(t), [] if t < 3 else [_face_at(0.4)]) for t in range(8)]
+    s = classify_scene(samples, 0, 8)
+    assert [t for t, _ in s.track_x] == [3.0, 4.0, 5.0, 6.0, 7.0]
+
+
+def test_face_track_records_face_width_and_highest_head_top():
+    samples = [(float(t), [_face_at(0.5, y=0.3, h=0.4)]) for t in range(9)]
+    samples.append((9.0, [_face_at(0.5, y=0.1, h=0.4)]))  # one high sample of ten
+    s = classify_scene(samples, 0, 10)
+    assert s.face_w == pytest.approx(0.2)
+    assert s.head_top == pytest.approx(0.1 - 0.2)  # 10% quantile of ten = the highest one
+
+
+def test_zoom_level_maps_steps_through_base_and_cap():
+    lay = SceneLayout(start=0, end=1, kind="FACE_TRACK")
+    assert [lay.zoom_level(s) for s in (1.0, 1.12, 1.2)] == pytest.approx([1.0, 1.12, 1.2])
+    capped = lay.model_copy(update={"zoom_cap": 1.12})
+    levels = [capped.zoom_level(s) for s in (1.0, 1.12, 1.2)]
+    assert levels[0] == 1.0 and levels[2] == pytest.approx(1.12) and 1.0 < levels[1] < 1.12
+    based = lay.model_copy(update={"base_zoom": 1.25, "zoom_cap": 1.4})
+    assert based.zoom_level(1.0) == pytest.approx(1.25) and based.zoom_level(1.2) == pytest.approx(
+        1.4
+    )
+
+
+# --- per-sample face widths, gaze lead ------------------------------------------------------------
+
+
+def test_track_records_face_width_per_keyframe():
+    samples = [
+        (t * 0.25, [Face(x=0.4, y=0.2, w=0.1 + 0.01 * t, h=0.4, score=0.9)]) for t in range(6)
+    ]
+    samples.insert(3, (0.6, []))  # a gap holds the last width too
+    s = classify_scene(samples, 0, 2)
+    assert len(s.track_w) == len(s.track_x)
+    assert s.track_w == pytest.approx([0.1, 0.11, 0.12, 0.12, 0.13, 0.14, 0.15])
+
+
+@pytest.mark.parametrize(
+    ("yaws", "lead"),
+    [
+        ([-0.4] * 10, -0.08),  # looking frame-left: room on the left
+        ([0.4] * 10, 0.08),
+        ([0.03] * 10, 0.0),  # facing the camera: centred
+        ([None] * 10, 0.0),  # no landmarks
+        ([-0.4] * 9 + [0.9], -0.08),  # one stray estimate does not flip it
+    ],
+)
+def test_face_track_gaze_lead_from_median_yaw(yaws, lead):
+    samples = [
+        (t * 0.25, [Face(x=0.4, y=0.2, w=0.2, h=0.4, score=0.9, yaw=y)]) for t, y in enumerate(yaws)
+    ]
+    s = classify_scene(samples, 0, 3)
+    assert s.lead == pytest.approx(lead)
+
+
+# --- per-sample face rows (caption placement over time) -------------------------------------------
+
+
+def test_face_track_records_each_samples_face_row_and_eye_line():
+    samples = [
+        (t * 0.25, [Face(x=0.4, y=0.2 + 0.02 * t, w=0.2, h=0.4, score=0.9, eye_y=0.35 + 0.02 * t)])
+        for t in range(6)
+    ]
+    samples.insert(3, (0.6, []))  # a lost face holds the last row
+    s = classify_scene(samples, 0.0, 2.0)
+    assert len(s.track_face) == len(s.track_x)
+    assert s.track_face[0] == pytest.approx((0.2, 0.4, 0.35))
+    assert s.track_face[3] == pytest.approx(s.track_face[2])
+    assert Face(x=0, y=0, w=1, h=1, score=1).eye_y is None

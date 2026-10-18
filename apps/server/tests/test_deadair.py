@@ -102,16 +102,87 @@ def test_silence_split_by_word_only_cuts_long_pieces():
 
 
 def test_remap_keeps_word_clipped_to_a_sliver():
-    out = remap_words([w(1.0, 1.5, "didn't")], [(0.0, 1.013)])
+    # 40 ms of a 60 ms word kept (over half, over one 30 fps frame): stretched to 50 ms
+    out = remap_words([w(1.0, 1.06, "didn't")], [(0.0, 1.04)])
     assert len(out) == 1 and out[0].end - out[0].start == pytest.approx(0.05)
-    assert out[0].end <= 1.013 + 1e-9
+    assert out[0].end <= 1.04 + 1e-9
 
 
 def test_remap_sliver_at_range_start_extends_forward_within_range():
-    out = remap_words([w(0.5, 1.007, "x")], [(1.0, 2.0)])
+    out = remap_words([w(0.98, 1.04, "x")], [(1.0, 2.0)])
     assert (out[0].start, out[0].end) == pytest.approx((0.0, 0.05))
+
+
+@pytest.mark.parametrize(
+    ("word", "keep"),
+    [
+        ((28.0, 28.5, "alone."), [(20.0, 28.1), (30.0, 35.0)]),  # end of a range: 20% kept
+        ((29.6, 30.2, "up."), [(20.0, 28.0), (30.0, 35.0)]),  # start of a range: 33% kept
+    ],
+)
+def test_remap_drops_an_edge_word_when_under_half_of_it_survives(word, keep):
+    # real case: "alone." / "up." from dropped lines flashed as captions at the jump cut
+    out = remap_words([w(*word), w(25.0, 25.4, "kept"), w(31.0, 31.3, "too")], keep)
+    assert [x.text for x in out] == ["kept", "too"]
+
+
+def test_remap_keeps_an_edge_word_when_half_or_more_survives():
+    (out,) = remap_words([w(1.0, 1.4, "most")], [(0.0, 1.2)])  # exactly half
+    assert (out.start, out.end) == pytest.approx((1.0, 1.2))
+    (out,) = remap_words([w(0.9, 1.3, "most")], [(1.0, 2.0)])  # 75%
+    assert (out.start, out.end) == pytest.approx((0.0, 0.3))
+
+
+@pytest.mark.parametrize(
+    ("word", "fps"),
+    [((1.0, 1.5), None), ((1.0, 1.5), 30.0), ((0.5, 1.007), None), ((1.0, 1.5), 60.0)],
+)
+def test_remap_drops_a_word_clipped_to_under_one_frame(word, fps):
+    # real case: "order." kept for 3 ms at a cold-open seam showed as a 0.05 s sliver
+    keep = [(0.0, 1.013)] if word[0] == 1.0 else [(1.0, 2.0)]
+    assert remap_words([w(*word, "order.")], keep, fps) == []
+
+
+def test_remap_one_frame_threshold_follows_the_fps():
+    # 25 ms kept: under a 30 fps frame (33 ms) but over a 60 fps frame (17 ms)
+    # (of a 40 ms word: over half survives, so only the frame rule decides)
+    keep = [(0.0, 1.025)]
+    assert remap_words([w(1.0, 1.04, "x")], keep, 30.0) == []
+    (out,) = remap_words([w(1.0, 1.04, "x")], keep, 60.0)
+    assert out.end - out.start == pytest.approx(0.05)
 
 
 def test_remap_does_not_stretch_uncut_short_words():
     out = remap_words([w(1.0, 1.02, "a")], [(0.0, 2.0)])
     assert out[0].end - out[0].start == pytest.approx(0.02)
+
+
+def test_snap_ranges_never_merges_an_explicit_drop():
+    keep = [(1.0, 2.0), (2.12, 3.0), (3.04, 4.0)]
+    assert snap_ranges(keep, 25, keep_gaps=[(2.0, 2.12)]) == [(1.0, 2.0), (2.12, 4.0)]
+
+
+def test_remap_judges_survival_on_the_protected_span_not_an_inflated_refined_end():
+    # transcript word 10.00-10.10; audio refinement stretched its end to 11.2; dead air only
+    # protected 10.00-10.40 (transcript end + 0.3 s) and cut at 10.52: the word is fully kept
+    word = w(10.0, 11.2, "kept.")
+    keep = [(9.0, 10.52), (12.0, 13.0)]
+    assert remap_words([word], keep) == []  # judged on the inflated span: 43% survives
+    (out,) = remap_words([word], keep, judge_ends=[10.4])
+    assert (out.start, out.end) == pytest.approx((1.0, 1.52))
+    # a dropped line's word is still dropped when its protected span is mostly cut
+    assert remap_words([w(10.3, 11.2, "up.")], keep, judge_ends=[10.9]) == []
+
+
+def test_cut_gaps_removes_extra_gaps_from_the_keep_ranges():
+    from hookline.pipeline.deadair import cut_gaps
+
+    keep = [(10.0, 20.0), (21.0, 40.0)]
+    assert cut_gaps(keep, [(12.4, 19.6)]) == [(10.0, 12.4), (19.6, 20.0), (21.0, 40.0)]
+    assert cut_gaps(keep, [(19.0, 22.0), (30.0, 31.0)]) == [
+        (10.0, 19.0),
+        (22.0, 30.0),
+        (31.0, 40.0),
+    ]
+    assert cut_gaps(keep, []) == keep
+    assert cut_gaps(keep, [(19.98, 20.5)]) == [(10.0, 19.98), (21.0, 40.0)]

@@ -11,6 +11,14 @@ from hookline.models import ClipPick, RubricScores, Segment, Sentence, Transcrip
 from hookline.transcript_text import split_sentences
 
 
+@pytest.fixture(autouse=True)
+def _few_profile_samples(monkeypatch: pytest.MonkeyPatch) -> None:
+    """run_job's VOD layout profile seeks once per sample: a handful is enough for tests."""
+    from hookline.pipeline import profile
+
+    monkeypatch.setattr(profile, "PROFILE_SAMPLES", 8)
+
+
 @pytest.fixture(scope="session")
 def fixture_video(tmp_path_factory: pytest.TempPathFactory) -> Path:
     d = tmp_path_factory.mktemp("my clips 🎮")
@@ -229,3 +237,103 @@ def synthetic_stream(tmp_path_factory: pytest.TempPathFactory) -> Path:
         check=True,
     )  # fmt: skip
     return out
+
+
+def _speechlike_video(
+    dst: Path, lufs: float, duration: int = 20, steady: bool = False, spikes: bool = False
+) -> Path:
+    """320x180 video whose audio is gated pink-noise bursts plus a 200 Hz tone (speech-like loudness range), scaled so its integrated loudness is `lufs`. `spikes` adds 6 ms
+    full-scale 800 Hz clicks every 0.43 s (plosive-like transients: crest factor ~18 dB)."""
+    from hookline.media.loudness import measure_loudness
+
+    raw = dst.with_suffix(".raw.wav")
+    noise_amp = 0.0 if steady else 0.5
+    # Speech-like: 4 s loud, 3 s at -16 dB (LRA survives loudness's 3 s window). Steady: a
+    # slow gentle swell (LRA must be nonzero or loudnorm refuses linear mode).
+    gate = "0.65+0.35*sin(2*PI*t/9)" if steady else "if(lt(mod(t,7),4),1,0.15)"
+    click = r"aevalsrc='sin(2*PI*800*t)*lt(mod(t\,0.43)\,0.006)'"
+    spike_in = ["-f", "lavfi", "-i", f"{click}:s=48000:d={duration}"] if spikes else []
+    mix = "[s];[s][2:a]amix=inputs=2:normalize=0[a]" if spikes else "[a]"
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+         "-f", "lavfi", "-i", f"anoisesrc=color=pink:seed=7:amplitude={noise_amp}:sample_rate=48000:duration={duration}",
+         "-f", "lavfi", "-i", f"sine=frequency=200:sample_rate=48000:duration={duration}",
+         *spike_in,
+         "-filter_complex",
+         f"[0:a][1:a]amix=inputs=2:normalize=0,volume='{gate}':eval=frame{mix}",
+         "-map", "[a]", "-c:a", "pcm_s16le", str(raw)],
+        check=True,
+    )  # fmt: skip
+    gain = lufs - measure_loudness(raw).i
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+         "-f", "lavfi", "-i", f"testsrc2=size=320x180:rate=25:duration={duration}",
+         "-i", str(raw), "-af", f"volume={gain:.3f}dB",
+         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "256k",
+         "-shortest", str(dst)],
+        check=True,
+    )  # fmt: skip
+    raw.unlink()
+    return dst
+
+
+@pytest.fixture(scope="session")
+def quiet_speech_video(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """20 s clip at about -30 LUFS (what the M2 audit found in real clips)."""
+    return _speechlike_video(tmp_path_factory.mktemp("loud") / "quiet.mp4", -30.0)
+
+
+@pytest.fixture(scope="session")
+def steady_quiet_video(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """20 s low-crest clip (steady tone, LRA ~0) at about -30 LUFS: loudnorm can go linear."""
+    return _speechlike_video(tmp_path_factory.mktemp("loud") / "steady.mp4", -30.0, steady=True)
+
+
+@pytest.fixture(scope="session")
+def high_crest_video(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """20 s speech-like clip at about -32 LUFS with ~18 dB crest factor: loudnorm's limiter
+    must take several dB off the peaks (real job e87398ed46 clip 04 landed at -15.0)."""
+    return _speechlike_video(tmp_path_factory.mktemp("loud") / "crest.mp4", -32.0, spikes=True)
+
+
+@pytest.fixture(scope="session")
+def near_silent_video(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """20 s clip at about -60 LUFS (game audio only / room tone)."""
+    return _speechlike_video(tmp_path_factory.mktemp("loud") / "silent.mp4", -60.0)
+
+
+class NoFaces:
+    def detect(self, bgr):
+        return []
+
+
+class FinalEncodeSpy(list):
+    """argv of each render ffmpeg call that has a filter graph (the final encode)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.stderrs: list[str] = []
+
+
+@pytest.fixture
+def final_argvs(monkeypatch) -> FinalEncodeSpy:
+    from hookline.pipeline import render as render_mod
+
+    seen = FinalEncodeSpy()
+    real = render_mod._run
+
+    def spy(cmd):
+        if "-/filter_complex" in cmd:  # the script is removed after the encode: inline it
+            i = cmd.index("-/filter_complex")
+            text = Path(cmd[i + 1]).read_text(encoding="utf-8")
+            recorded = [*cmd[:i], "-filter_complex", text, *cmd[i + 2 :]]
+        else:
+            recorded = cmd
+        res = real(cmd)
+        if "-filter_complex" in recorded:
+            seen.append(recorded)
+            seen.stderrs.append(res.stderr)
+        return res
+
+    monkeypatch.setattr(render_mod, "_run", spy)
+    return seen

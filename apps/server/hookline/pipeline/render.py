@@ -1,36 +1,662 @@
 """Per-clip render: refine boundaries, drop dead air, reframe to 9:16 and burn captions."""
 
+import hashlib
+import logging
+import math
 import os
+import re
+import subprocess
+from itertools import pairwise
 from pathlib import Path
 
-from hookline.captions.ass import build_ass, caption_y_for, hook_y_for
+import numpy as np
+
+from hookline.captions.ass import (
+    SEAM_TAG_S,
+    build_ass,
+    caption_words,
+    caption_y_for,
+    early_until,
+    face_samples,
+    hook_y_for,
+    text_windows,
+)
 from hookline.config import Settings
 from hookline.fsutil import atomic_write_text
-from hookline.media.audio import detect_silences
+from hookline.media.audio import (
+    ENVELOPE_RATE,
+    Envelope,
+    detect_silences,
+    digital_zero_runs,
+    energy_envelope,
+    pcm_span,
+    seam_jump_db,
+)
 from hookline.media.ffmpeg import (
+    SPLICE_FADE_S,
     _run,
     cut_segments,
     encoder_args,
+    filter_graph_args,
     pick_encoder,
     probe_duration,
     probe_fps,
     probe_size,
 )
-from hookline.media.reframe import detect_crop, reframe_graph
+from hookline.media.loudness import ensure_true_peak, plan_loudness
+from hookline.media.reframe import (
+    LIFT_FPS,
+    box_hits_bands,
+    box_to_crop,
+    combine_crop,
+    detect_crop,
+    detect_overlay_bands,
+    face_offset,
+    face_track_px,
+    guard_zoom,
+    lift_keyframes,
+    plan_zoom,
+    reframe_graph,
+    rendered_zoom_steps,
+    scene_snaps,
+    stacked_face_px,
+    zoom_schedule,
+)
 from hookline.media.subtitles import fonts_dir, subtitles_filter
 from hookline.models import ClipPick, Word
-from hookline.pipeline.boundaries import refine_boundaries
-from hookline.pipeline.deadair import keep_ranges, remap_words, snap_ranges
-from hookline.pipeline.layout import SceneLayout, plan_layouts
-from hookline.vision.faces import FaceDetector
+from hookline.pipeline.boundaries import cover_first_word, refine_boundaries
+from hookline.pipeline.deadair import cut_gaps, keep_ranges, remap_words, snap_ranges
+from hookline.pipeline.layout import (
+    SCARE_POST_S,
+    SCARE_PRE_S,
+    SceneLayout,
+    plan_cam_beats,
+    plan_cam_covers,
+    plan_layouts,
+    plan_profile_layouts,
+)
+from hookline.pipeline.profile import LayoutProfile
+from hookline.pipeline.timing import (
+    anchor_words,
+    cause_onset,
+    clamp_word_ends,
+    last_voiced,
+    pre_roll,
+    protected_words,
+    refine_word_ends,
+    snap_onsets,
+    snap_splices,
+    tail_end,
+    uncaptioned_speech,
+    voice_threshold,
+)
+from hookline.vision.faces import Crop, FaceDetector
 
 INTERMEDIATE_QUALITY = ["-preset", "veryfast", "-crf", "12"]
 MAX_HORIZONTAL_W = 1920
+_ZOOM_BEAT_RE = re.compile(r"^\s*zoom\s*:.*@\s*(\d+(?:\.\d+)?)\s*s?\s*$", re.IGNORECASE)
+_SENTENCE_END = (".", "!", "?")
+CAM_EDGE_LO, CAM_EDGE_HI = 0.02, 0.98  # a cam box this close to a cropped edge was cut by it
+SEAM_FLASH = (0.35, 0.6, 0.35)  # white opacity of the 3 frames around the cold-open seam
+SEAM_SLACK_S = 0.1  # frame snapping may move a cold-open range bound by up to a frame
+FADE_IN_S, FADE_OUT_S = 0.02, 0.2  # audio fades at the clip's start and end (no clicks)
+# ... the end fade shortens to this at least to spare the last word; on a bed too noisy for
+# the end tail the clip still runs this long past the last word (`min_tail`), so a loud game
+# bed fades out instead of stopping dead
+MIN_FADE_OUT_S = 0.15
+# Room tone: a pink-noise bed this loud (dBFS RMS) under clips whose cut exposes digital
+# silence (a source noise gate's exact zeros) at least ZERO_RUN_S long; too quiet to move
+# the loudness. PINK_RMS_DB: anoisesrc pink noise at amplitude 1 (measured).
+ROOM_TONE_DB = -62.0
+PINK_RMS_DB = -14.3
+ZERO_RUN_S = 0.2
+CUT_SLIVER_S = 0.08  # a caption word this short next to a cut is a splice remnant: not shown
+CUT_SLIVER_NEAR_S = 0.2  # ... its mid-point this close to the cut (further on: a real word)
+MIX_RATE = 48000  # the room-tone mix runs at the encode's rate (see render_clip)
+# Reaction peaks (full-cam beats): a word whose loudest frame is REACT_DB over the clip's
+# median word, or REACT_NEAR_DB when it starts within SCARE_NEAR_S after a scare (a game
+# transient); scored by that lift, plus SCARE_BONUS after a scare.
+REACT_DB = 8.0
+REACT_NEAR_DB = 4.0
+SCARE_NEAR_S = 2.0
+SCARE_BONUS = 4.0
+# ... levels from voice-like frames only (a game bang under a word is no reaction); in a clip
+# of shouting (its median word a shout) a word at least REACT_LOUD_DB (source dBFS) within
+# REACT_TOP_DB of the clip's loudest word is a peak too, scored REACT_DB + its excess
+REACT_LOUD_DB = -16.0
+REACT_TOP_DB = 3.0
+# Beats stay out of [scare - SCARE_PRE_S, scare + SCARE_POST_S] (the payoff is the gameplay)
+# and the same round another startled reaction word: a peak word whose level jumps
+# >= STARTLE_DB within STARTLE_RISE_S of its start over the quietest of the STARTLE_BEFORE_S
+# before it, AND whose onset is within STARTLE_NEAR_S of a game transient (scare) or a
+# flash / motion spike (the game's sting and the shout land together; the cause is on screen
+# then). A sharp onset alone is any word after a pause: no startle.
+STARTLE_DB = 10.0
+STARTLE_RISE_S = 0.15
+STARTLE_BEFORE_S = 0.5
+STARTLE_NEAR_S = 0.3
+# A splice on loud audio (the short-term level within LOUD_SPLICE_WIN_S either side of the
+# join above LOUD_SPLICE_DB dBFS) fades over LOUD_SPLICE_FADE_S each side instead of the 8 ms
+# (`ffmpeg.SPLICE_FADE_S`): a loud game bed is not chopped
+LOUD_SPLICE_DB = -25.0
+LOUD_SPLICE_WIN_S = 0.05
+LOUD_SPLICE_FADE_S = 0.018
+
+log = logging.getLogger(__name__)
+
+
+def cut_times_for(keep: list[tuple[float, float]]) -> list[float]:
+    """Output-time cut points: the joins between consecutive keep ranges."""
+    out, t = [], 0.0
+    for start, end in keep[:-1]:
+        t += end - start
+        out.append(round(t, 3))
+    return out
+
+
+def seam_time(
+    keep: list[tuple[float, float]], cold_open: tuple[float, float] | None
+) -> float | None:
+    """Output time where the cold open ends: the length of the leading keep ranges that lie
+    inside the cold open's source span. None without a cold open, or when nothing of it is
+    kept or nothing follows it."""
+    if cold_open is None:
+        return None
+    lo, hi = cold_open[0] - SEAM_SLACK_S, cold_open[1] + SEAM_SLACK_S
+    t, n = 0.0, 0
+    for start, end in keep:
+        if not (lo <= start and end <= hi):
+            break
+        t += end - start
+        n += 1
+    return round(t, 3) if 0 < n < len(keep) else None
+
+
+def seam_join(keep: list[tuple[float, float]], cold_open: tuple[float, float] | None) -> int | None:
+    """Index of the keep range ending at the cold-open seam (`seam_time`), or None."""
+    if seam_time(keep, cold_open) is None:
+        return None
+    assert cold_open is not None
+    lo, hi = cold_open[0] - SEAM_SLACK_S, cold_open[1] + SEAM_SLACK_S
+    n = 0
+    while n < len(keep) and lo <= keep[n][0] and keep[n][1] <= hi:
+        n += 1
+    return n - 1
+
+
+SEAM_BRIGHT = 180.0  # frames around the seam this bright (mean grey) get a dark flash
+
+
+_LUMA_W, _LUMA_H = 64, 36
+
+
+def seam_luma(
+    path: Path,
+    seam: float,
+    fps: float,
+    regions: list[tuple[float, float, float, float]] | None = None,
+    crop: Crop | None = None,
+) -> float | None:
+    """Mean grey level (0-255) of the frames 2 either side of `seam` in `path`, over what the
+    flash is drawn on: the `crop` (w, h, x, y px) of the picture and, inside it, the
+    `regions` (normalized x, y, w, h: a STACKED clip's cam and gameplay panels) -- the whole
+    cropped picture without regions. None when the frames cannot be read."""
+    pre = f"crop={crop[0]}:{crop[1]}:{crop[2]}:{crop[3]}," if crop else ""
+    res = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-v", "error", "-ss", f"{max(seam - 2 / fps, 0):.3f}",
+         "-t", f"{4 / fps:.3f}", "-i", str(path), "-an",
+         "-vf", f"{pre}scale={_LUMA_W}:{_LUMA_H}:flags=area,format=gray",
+         "-f", "rawvideo", "-"],
+        check=False, capture_output=True,
+    )  # fmt: skip
+    size = _LUMA_W * _LUMA_H
+    if res.returncode != 0 or len(res.stdout) < size:
+        return None
+    frames = np.frombuffer(res.stdout[: len(res.stdout) // size * size], np.uint8)
+    frames = frames.reshape(-1, _LUMA_H, _LUMA_W)
+    if not regions:
+        return float(frames.mean())
+    shown = np.zeros((_LUMA_H, _LUMA_W), bool)
+    for x, y, w, h in regions:
+        c0, c1 = int(x * _LUMA_W), int(np.ceil((x + w) * _LUMA_W))
+        r0, r1 = int(y * _LUMA_H), int(np.ceil((y + h) * _LUMA_H))
+        shown[max(r0, 0) : min(r1, _LUMA_H), max(c0, 0) : min(c1, _LUMA_W)] = True
+    if not shown.any():
+        return float(frames.mean())
+    return float(frames[:, shown].mean())
+
+
+def _seam_regions(
+    layouts: list[SceneLayout], seam: float
+) -> list[tuple[float, float, float, float]] | None:
+    """What the vertical output shows of the picture at `seam`: a STACKED scene's cam window
+    and gameplay panel; None (the whole picture) otherwise."""
+    lay = next((x for x in layouts if x.start <= seam < x.end), None)
+    if lay is None or lay.kind != "STACKED":
+        return None
+    out = [b for b in (lay.facecam, lay.game_box) if b is not None]
+    return out or None
+
+
+def seam_source_db(wav: Path, t: float) -> float | None:
+    """The source's own rise at source time `t` (`seam_jump_db` of `wav` around it): what the
+    audit's Q-seam allows the output's rise at the seam that starts there."""
+    lo = max(t - 0.1, 0.0)
+    pcm = pcm_span(wav, lo, t + 0.1, ENVELOPE_RATE)
+    if not len(pcm):
+        return None
+    return round(seam_jump_db(pcm, ENVELOPE_RATE, t - lo), 2)
+
+
+def voiced_words(
+    wav: Path, words: list[Word], lo: float, hi: float, silence_db: float
+) -> list[Word]:
+    """`words` with those starting in [lo, hi) clamped to their voice as the render's captions
+    are (`timing.clamp_word_ends`, the same threshold from the local noise floor): a word DTW
+    held over a pause ends with its voice. The rest, and every word when the bed is too loud
+    to tell the voice (`timing.voice_threshold` None), as given. Order kept."""
+    inside = [i for i, w in enumerate(words) if lo <= w.start < hi]
+    if not inside:
+        return words
+    env = energy_envelope(wav, max(lo, 0.0), hi + 1)
+    thr = voice_threshold(env, silence_db)
+    if thr is None:
+        return words
+    clamped = clamp_word_ends([words[i] for i in inside], env, thr)
+    out = list(words)
+    for i, w in zip(inside, clamped, strict=True):
+        out[i] = w
+    return out
+
+
+def seam_flash(seam: float, fps: float, dark: bool = False) -> str:
+    """3-frame white flash centred on the frame at `seam`: fade in, 60% white, fade out; a
+    black one when `dark` (bright frames around the seam, SEAM_BRIGHT: white would not show)."""
+    color = "black" if dark else "white"
+    boxes = []
+    for k, alpha in zip((-1, 0, 1), SEAM_FLASH, strict=True):
+        a, b = seam + (k - 0.5) / fps, seam + (k + 0.5) / fps
+        boxes.append(
+            f"drawbox=x=0:y=0:w=iw:h=ih:color={color}@{alpha:g}:t=fill"
+            f":enable='between(t\\,{a:.4f}\\,{b:.4f})'"
+        )
+    return ",".join(boxes)
+
+
+def _to_output_time(t: float, keep: list[tuple[float, float]]) -> float | None:
+    offset = 0.0
+    for start, end in keep:
+        if start <= t < end:
+            return round(offset + t - start, 3)
+        offset += end - start
+    return None
+
+
+def emphasis_times(beats: list[str], keep: list[tuple[float, float]]) -> list[float]:
+    """Output times of `zoom: '<word>' @ <t>s` beats (absolute source seconds), mapped through
+    the keep ranges; beats in removed ranges, without a time, or of other kinds are dropped."""
+    out = []
+    for beat in beats:
+        m = _ZOOM_BEAT_RE.match(beat)
+        t = _to_output_time(float(m.group(1)), keep) if m else None
+        if t is not None:
+            out.append(t)
+    return out
+
+
+def audio_fades(duration: float, last_word_end: float | None = None) -> str:
+    """FADE_IN_S fade-in at the start and a FADE_OUT_S fade-out ending at `duration`, starting
+    no earlier than `last_word_end` (output s; the fade shortens, to MIN_FADE_OUT_S at least,
+    rather than dim the last word)."""
+    start = max(duration - FADE_OUT_S, 0.0)
+    if last_word_end is not None:
+        start = min(max(start, last_word_end), max(duration - MIN_FADE_OUT_S, 0.0))
+    return (
+        f"afade=t=in:st=0:d={FADE_IN_S:g},"
+        f"afade=t=out:st={start:.3f}:d={round(duration - start, 3):g}"
+    )
+
+
+def min_tail(
+    keep: list[tuple[float, float]], words: list[Word], min_s: float = MIN_FADE_OUT_S
+) -> list[tuple[float, float]]:
+    """`keep` with its last range running at least `min_s` past its last word (never into
+    the next word): the end fade's room when the bed is too noisy for the end tail."""
+    if not keep:
+        return keep
+    start, end = keep[-1]
+    last = max((w.end for w in words if start < w.end <= end + 1e-6), default=None)
+    if last is None or end - last >= min_s:
+        return keep
+    nxt = min((w.start for w in words if w.start >= end - 1e-6 and w.end > end), default=None)
+    new_end = last + min_s if nxt is None else min(last + min_s, max(nxt, end))
+    return [*keep[:-1], (start, round(max(new_end, end), 3))]
+
+
+def reaction_peaks(
+    words: list[Word],
+    env: Envelope,
+    keep: list[tuple[float, float]],
+    scares: list[float] | None = None,
+) -> list[tuple[float, float]]:
+    """(output s, score) of the streamer's reaction peaks among the spoken `words` (source
+    time): a word's loudest voice-like envelope frame (`Envelope.voice`, when known; a word
+    with none is no reaction) REACT_DB over the clip's median word, or REACT_NEAR_DB when it
+    starts within SCARE_NEAR_S after a `scares` time, or a loud shout (REACT_LOUD_DB, within
+    REACT_TOP_DB of the loudest word); time order."""
+    levels = []
+    for w in words:
+        i, j = env.index(w.start), max(env.index(w.end), env.index(w.start) + 1)
+        db = env.db[i:j]
+        if env.voice is not None and len(env.voice) == len(env.db):
+            db = db[env.voice[i:j]]
+        levels.append(float(db.max()) if len(db) else -100.0)
+    heard = [lv for lv in levels if lv > -100.0]
+    if not heard:
+        return []
+    median = sorted(heard)[len(heard) // 2]
+    top = max(heard)
+    out = []
+    for w, lv in zip(words, levels, strict=True):
+        if lv <= -100.0:
+            continue
+        lift = lv - median
+        near = any(0.0 <= w.start - s <= SCARE_NEAR_S for s in scares or [])
+        score = lift + (SCARE_BONUS if near else 0.0)
+        shout = lv >= REACT_LOUD_DB and lv >= top - REACT_TOP_DB
+        if shout:
+            score = max(score, REACT_DB + lv - REACT_LOUD_DB)
+        if lift >= REACT_DB or (near and lift >= REACT_NEAR_DB) or shout:
+            t = _to_output_time(w.start, keep)
+            if t is not None:
+                out.append((t, round(score, 3)))
+    return sorted(out)
+
+
+def startle_times(
+    words: list[Word],
+    env: Envelope,
+    keep: list[tuple[float, float]],
+    peaks: list[float],
+    scares: list[float] | None = None,
+    spikes: list[tuple[float, float]] | None = None,
+) -> list[float]:
+    """Output times among the reaction `peaks` (output s) whose word (source time) starts
+    with a sharp onset -- STARTLE_DB over the quietest frame of the STARTLE_BEFORE_S before
+    it, within STARTLE_RISE_S -- that coincides (within STARTLE_NEAR_S) with a game transient
+    (`scares`, source s) or a flash / motion spike (`spikes`, source spans)."""
+    near = STARTLE_NEAR_S
+    out = []
+    for w in words:
+        t = _to_output_time(w.start, keep)
+        if t is None or not any(abs(t - p) < 1e-3 for p in peaks):
+            continue
+        game = any(abs(w.start - s) <= near for s in scares or []) or any(
+            a - near <= w.start <= b + near for a, b in spikes or []
+        )
+        if not game:
+            continue
+        before = env.db[env.index(w.start - STARTLE_BEFORE_S) : env.index(w.start)]
+        rise = env.db[env.index(w.start) : env.index(w.start + STARTLE_RISE_S) + 1]
+        if len(before) and len(rise) and float(rise.max() - before.min()) >= STARTLE_DB:
+            out.append(t)
+    return out
+
+
+def beat_avoid(
+    seam: float | None,
+    scares: list[float],
+    spikes: list[tuple[float, float]],
+    keep: list[tuple[float, float]],
+) -> list[list[float]]:
+    """Output spans a full-cam beat stays out of: the EARLIER tag after the `seam`, each
+    scare (source s) from SCARE_PRE_S before to SCARE_POST_S after and the gameplay `spikes`
+    (source spans). Startled reaction words (`startle_times`) go to `plan_cam_beats` apart:
+    they keep other peaks' beats off them, never their own."""
+    out = [[seam, round(seam + SEAM_TAG_S, 3)]] if seam is not None else []
+    near = [(s - SCARE_PRE_S, s + SCARE_POST_S) for s in scares]
+    out += _to_output_spans([*near, *spikes], keep)
+    return sorted(out)
+
+
+def splice_fades(keep: list[tuple[float, float]], env: Envelope) -> list[float]:
+    """Per join of `keep` (source ranges): its splice fade -- LOUD_SPLICE_FADE_S when the
+    envelope's short-term level within LOUD_SPLICE_WIN_S before the cut or after it tops
+    LOUD_SPLICE_DB, else SPLICE_FADE_S."""
+    out = []
+    for (_, a), (b, _) in pairwise(keep):
+        pre = env.db[env.index(a - LOUD_SPLICE_WIN_S) : env.index(a)]
+        post = env.db[env.index(b) : env.index(b + LOUD_SPLICE_WIN_S)]
+        loud = any(len(x) and float(x.max()) > LOUD_SPLICE_DB for x in (pre, post))
+        out.append(LOUD_SPLICE_FADE_S if loud else SPLICE_FADE_S)
+    return out
+
+
+def game_lift(
+    path: Path,
+    layouts: list[SceneLayout],
+    crop: Crop | None,
+    cuts: list[float],
+) -> list[SceneLayout]:
+    """`layouts` with each template STACKED scene's gameplay lift (`game_lift`,
+    `reframe.lift_keyframes`) from the mean luma of its gameplay panel (`game_box`, the
+    blurred `patches` left out) in `path` at LIFT_FPS; unchanged when it cannot be read."""
+    if not any(lay.game_box is not None for lay in layouts):
+        return layouts
+    w, h = 128, 72
+    pre = f"crop={crop[0]}:{crop[1]}:{crop[2]}:{crop[3]}," if crop else ""
+    res = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-v", "error", "-i", str(path), "-an",
+         "-vf", f"{pre}fps={LIFT_FPS},scale={w}:{h}:flags=area,format=gray",
+         "-f", "rawvideo", "-"],
+        check=False, capture_output=True,
+    )  # fmt: skip
+    if res.returncode != 0 or len(res.stdout) < w * h:
+        log.warning("gameplay luma unreadable; no lift")
+        return layouts
+    frames = np.frombuffer(res.stdout[: len(res.stdout) // (w * h) * w * h], np.uint8)
+    frames = frames.reshape(-1, h, w)
+    out = []
+    for lay in layouts:
+        if lay.game_box is None:
+            out.append(lay)
+            continue
+        mask = np.zeros((h, w), bool)
+        x, y, bw, bh = lay.game_box
+        mask[int(y * h) : math.ceil((y + bh) * h), int(x * w) : math.ceil((x + bw) * w)] = True
+        for px, py, pw, ph in lay.patches:
+            mask[int(py * h) : math.ceil((py + ph) * h), int(px * w) : math.ceil((px + pw) * w)] = (
+                False
+            )
+        ks = [k for k in range(len(frames)) if lay.start <= k / LIFT_FPS < lay.end]
+        if not ks or not mask.any():
+            out.append(lay)
+            continue
+        luma = [float(frames[k][mask].mean()) for k in ks]
+        pts = lift_keyframes([k / LIFT_FPS for k in ks], luma, cuts)
+        out.append(lay.model_copy(update={"game_lift": pts}) if pts else lay)
+    return out
+
+
+def mix_format(path: Path) -> str:
+    """aformat pinning a room-tone mix input to float planar at MIX_RATE in `path`'s audio
+    channel layout: mono stays mono, stereo and wider sources (5.1, 7.1) mix in stereo."""
+    res = _run(
+        ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries",
+         "stream=channels", "-of", "csv=p=0", str(path)]
+    )  # fmt: skip
+    layout = "mono" if res.stdout.strip() == "1" else "stereo"
+    return f"aformat=sample_fmts=fltp:sample_rates={MIX_RATE}:channel_layouts={layout}"
+
+
+def room_tone(duration: float) -> str:
+    """lavfi source: `duration` s of pink noise at ROOM_TONE_DB RMS (a constant room-tone
+    bed; anoisesrc's pink noise at amplitude 1 measures PINK_RMS_DB)."""
+    amp = 10 ** ((ROOM_TONE_DB - PINK_RMS_DB) / 20)
+    return (
+        f"anoisesrc=color=pink:amplitude={amp:.6f}:sample_rate=48000:duration={duration:.3f}:seed=1"
+    )
+
+
+def drop_cut_slivers(
+    words: list[Word], cuts: list[float], min_s: float = CUT_SLIVER_S
+) -> list[Word]:
+    """`words` (output time) without those shorter than `min_s` next to a cut: the last word
+    before it or the first after it (by their mid-points), its mid-point within
+    CUT_SLIVER_NEAR_S of the cut -- the remnant of a word the splice cut through, a caption
+    flash. A short word further away is a real word and keeps its caption."""
+    drop: set[int] = set()
+    for c in cuts:
+        before = [i for i, w in enumerate(words) if (w.start + w.end) / 2 < c]
+        after = [i for i, w in enumerate(words) if (w.start + w.end) / 2 >= c]
+        for i in [*before[-1:], *after[:1]]:
+            w = words[i]
+            near = abs((w.start + w.end) / 2 - c) <= CUT_SLIVER_NEAR_S
+            if near and w.end - w.start < min_s:
+                drop.add(i)
+    return [w for i, w in enumerate(words) if i not in drop]
+
+
+def _word_gaps(words: list[Word]) -> list[tuple[float, float]]:
+    """Gaps (zero-length at touching boundaries) between consecutive words, output time."""
+    return [(round(a.end, 3), round(max(b.start, a.end), 3)) for a, b in pairwise(words)]
+
+
+def _to_output_spans(
+    spans: list[tuple[float, float]], keep: list[tuple[float, float]]
+) -> list[list[float]]:
+    """Source spans mapped onto the output timeline of the kept ranges (split at cuts)."""
+    out, offset = [], 0.0
+    for k0, k1 in keep:
+        for a, b in spans:
+            lo, hi = max(a, k0), min(b, k1)
+            if hi > lo:
+                out.append([round(offset + lo - k0, 3), round(offset + hi - k0, 3)])
+        offset += k1 - k0
+    return sorted(out)
+
+
+def _with_tail(
+    keep: list[tuple[float, float]], words: list[Word], env: Envelope, voice_db: float
+) -> list[tuple[float, float]]:
+    """`keep` with its last range ending a beat after the speech (`timing.tail_end`): into the
+    silence after the range's last voiced frame (the last word's end when the envelope has
+    none), at most MAX_TAIL_S past it, never into the next word -- earlier than the range's
+    end when the transcript's last word ran on over silence. The clip may then run up to
+    MAX_TAIL_S over max_clip_s."""
+    if not keep or not words:
+        return keep
+    start, end = keep[-1]
+    spoken = [w for w in words if w.start < end and w.end > start]
+    if not spoken:
+        return keep
+    last = max(w.end for w in spoken)
+    voiced = last_voiced(env, start, end, voice_db)
+    if voiced is not None:
+        last = voiced  # the speech ends there, whatever the transcript says
+    later = min((w for w in words if w.start >= end), key=lambda w: w.start, default=None)
+    nxt = (later.start, later.end) if later else (float("inf"), float("inf"))
+    new_end = tail_end(last, last, nxt[0], env, voice_db, next_end=nxt[1])
+    return [*keep[:-1], (start, round(new_end, 3))]
+
+
+def drop_lead_fragments(words: list[Word], lead: float) -> list[Word]:
+    """`words` (output time) without those ending inside a `lead` s pre-roll: the tail of the
+    previous sentence the pre-roll exposed, not a word of the clip."""
+    if lead <= 0:
+        return words
+    return [w for w in words if w.end > lead + 0.01]
+
+
+def _first_start(pick: ClipPick) -> float:
+    return pick.cold_open[0] if pick.cold_open else pick.start
+
+
+def _lead_ins(pick: ClipPick, env: Envelope, words: list[Word], fps: float) -> ClipPick:
+    """After a cold open, the main span's start (the seam) moved back onto the cause
+    of what follows (`timing.cause_onset`: a bang the cut would split -- a pop at the seam);
+    the clip's first start `timing.pre_roll`ed when its speech begins on frame 0. Logs."""
+    update: dict = {}
+    first = pick.cold_open
+    if first is not None:
+        if (c := cause_onset(env, pick.start, words)) is not None and c < pick.start:
+            update["start"] = c
+        lead = pre_roll(env, first[0], words, fps)
+        if lead < first[0]:
+            update["cold_open"] = (lead, first[1])
+    elif (lead := pre_roll(env, pick.start, words, fps)) < pick.start:
+        update["start"] = lead
+    if not update:
+        return pick
+
+    def grid(t: float) -> float:  # earlier onto the frame grid (keep bounds are snapped to it)
+        return round(int(t * fps + 1e-6) / fps, 6)
+
+    if "start" in update:
+        update["start"] = grid(update["start"])
+    if "cold_open" in update:
+        update["cold_open"] = (grid(update["cold_open"][0]), update["cold_open"][1])
+    log.info("lead-ins %s (was start %.3f, cold open %s)", update, pick.start, pick.cold_open)
+    return pick.model_copy(update=update)
 
 
 def _horizontal_graph(crop: tuple[int, int, int, int] | None) -> str:
     pre = f"crop={crop[0]}:{crop[1]}:{crop[2]}:{crop[3]}," if crop else ""
     return f"[0:v]{pre}scale='trunc(min({MAX_HORIZONTAL_W},iw)/2)*2':-2,setsar=1[vout]"
+
+
+def _plan_vertical(
+    inter: Path,
+    detector: FaceDetector | None,
+    settings: Settings,
+    size: tuple[int, int],
+    letterbox: Crop | None,
+    profile: LayoutProfile | None = None,
+) -> tuple[list[SceneLayout], Crop | None, tuple[int, int] | None]:
+    """(layouts, crop, overlay bands) for the vertical reframe. Burned-in lower-thirds/edge
+    overlays (would show cut mid-word) are cropped away unless disabled, refused by
+    `combine_crop`, or they'd cut into the facecam: an override box overlapping a band, or an
+    auto-detected STACKED cam touching the cropped edge (it continues into the band), keeps
+    the letterbox-only crop. The facecam override (full-frame fractions) is mapped into the
+    crop's space.
+
+    With a stream `profile` cam (and no --facecam override) every scene gets the profile's
+    fixed STACKED template (`plan_profile_layouts`); bands over the cam are kept."""
+    bands = detect_overlay_bands(inter, crop=letterbox) if settings.overlay_crop else None
+    crop = combine_crop(size, letterbox, bands)
+    if crop == letterbox:
+        bands = None  # none found, or removal refused (too much of the height)
+    if settings.facecam is None and profile is not None and profile.outer is not None:
+        x0, y0, x1, y1 = profile.outer
+        box = (x0 / size[0], y0 / size[1], (x1 - x0) / size[0], (y1 - y0) / size[1])
+        if bands and box_hits_bands(box, size, letterbox, bands):
+            log.info("profile facecam %s overlaps overlay bands %s; bands kept", box, bands)
+            crop, bands = letterbox, None
+        return plan_profile_layouts(inter, profile, crop=crop, detector=detector), crop, bands
+    cam = settings.facecam
+    if cam is not None and bands and box_hits_bands(cam, size, letterbox, bands):
+        log.info("facecam %s overlaps overlay bands %s; bands kept", cam, bands)
+        crop, bands = letterbox, None
+    override = box_to_crop(cam, size, crop) if cam is not None else None
+    if cam is not None and override is None:
+        log.warning(
+            "--facecam %s lies inside the letterbox bars, outside the picture; ignored", cam
+        )
+        cam = None
+    layouts = plan_layouts(inter, detector, override, crop=crop)
+    if bands and cam is None and any(_cam_on_cut(lay, bands) for lay in layouts):
+        log.info("facecam touches the overlay crop edge; re-planned without bands %s", bands)
+        crop, bands = letterbox, None
+        layouts = plan_layouts(inter, detector, None, crop=crop)
+    return layouts, crop, bands
+
+
+def _cam_on_cut(layout: SceneLayout, bands: tuple[int, int]) -> bool:
+    """A STACKED cam box touching an edge where an overlay band was cropped away."""
+    if layout.kind != "STACKED" or layout.facecam is None:
+        return False
+    _, y, _, h = layout.facecam
+    return (bands[1] > 0 and y + h >= CAM_EDGE_HI) or (bands[0] > 0 and y <= CAM_EDGE_LO)
 
 
 def render_clip(
@@ -44,16 +670,55 @@ def render_clip(
     detector: FaceDetector | None,
     protect_words: bool = True,
     encoder: str | None = None,
+    loud_seconds: set[int] | None = None,
+    idle_gaps: list[tuple[float, float]] | None = None,
+    profile: LayoutProfile | None = None,
+    scares: list[float] | None = None,
+    spikes: list[tuple[float, float]] | None = None,
+    screens: list[tuple[float, float]] | None = None,
 ) -> dict:
-    """Write the finished clip to `dst`; returns sidecar extras (layout, keep_ranges, removed_s).
+    """Write the finished clip to `dst`; returns sidecar extras (segments, layout, keep_ranges,
+    removed_s, cut_times, zoom_steps, zoom_levels, overlay_bands, seam, ass, ass_sha1,
+    caption_words). Cut and zoom times are on the output timeline; `zoom_steps` are the zooms
+    as rendered (each scene's plan applied), `zoom_levels` the schedule they come from. Zooms
+    are applied before captions, so captions never zoom (vertical only; empty when
+    horizontal). Each `layout` scene carries its zoom plan (`base_zoom`, `zoom_cap`,
+    `zoom_anchor`; see `reframe.plan_zoom`).
 
-    The intermediate cut (`work_dir/NN.mp4`, near-lossless libx264, deleted after success)
+    Word ends and post-pause onsets are refined against the audio envelope first
+    (`pipeline.timing`); the clip ends a beat after its last word (`_with_tail`, 0.4 s when the silence
+    allows, up to 0.45 s, so a clip may run that much over max_clip_s) and its audio fades in over 0.02 s and out
+    over 0.2 s (sparing the last word).
+    `overlay_bands` is the [top, bottom] px of burned-in overlay cropped away (vertical only),
+    or None. `seam` is the output time where a cold open ends (None without one); it gets a
+    3-frame 60% white flash and the "EARLIER…" tag. `ass`/`ass_sha1` name the burned caption file
+    in `work_dir` and its hash (None without captions). `caption_words` are the spoken words
+    on the output timeline, [start, end, text], so `hookline audit` needs no transcript.
+
+    The intermediate cut (`work_dir/NN.mkv`, near-lossless libx264 + PCM audio, deleted after success)
     and the ASS file live in `work_dir`. Video is lossily encoded once (the final encode);
-    audio once (the intermediate's AAC, copied into the final file).
+    audio once (AAC 192k, after compression, gain + peak limiting and two-pass
+    loudnorm to -14 LUFS; see `plan_loudness`).
 
     `protect_words` keeps dead-air cuts out of word spans; pass False for
     segment-interpolated word times, which tile the timeline with no gaps. `encoder` is the
-    final video encoder (resolved by `pick_encoder()` when None; pass it to avoid re-probing)."""
+    final video encoder (resolved by `pick_encoder()` when None; pass it to avoid re-probing).
+    `idle_gaps` (source seconds, `boundaries.idle_gaps`) are cut like dead air.
+
+    `profile` (the job's `profile.layout_profile`, computed once over the VOD)
+    gives the static black bars (no per-clip detection) and, for a stream with a facecam
+    overlay (unless `settings.facecam` overrides), the fixed STACKED template for every scene,
+    with up to two full-cam reaction beats at the streamer's reaction peaks (`scares`: the
+    VOD's scare times, source s; beats stay clear of them and of the gameplay `spikes`,
+    source spans: `beat_avoid`); the sidecar's `layout_profile` records its cam. The
+    sidecar records the same `scares` and `spikes` (`run.beat_spikes`) on the output timeline
+    (`scare_times`, `beat_spikes`: the audit's Q-beat) and the source's own rise at the seam
+    (`seam_source_db`: Q-seam).
+
+    `screens` (source spans: `signals.screen_runs`, the static / death screens a reaction is
+    talked over) are covered by the full cam in the template scenes (`cam_covers`); a near-
+    black gameplay panel is lifted (`game_lift`); splices on loud audio fade longer
+    (`splice_fades`)."""
     work_dir.mkdir(parents=True, exist_ok=True)
     dst.parent.mkdir(parents=True, exist_ok=True)
     name = dst.stem.split("-", 1)[0]
@@ -62,68 +727,271 @@ def render_clip(
     lo = max(0.0, min(s for s, _ in segs) - 1)
     hi = max(e for _, e in segs) + 1
     silences = detect_silences(wav, lo, hi, settings.silence_db)
-    near = [w for w in words if w.end > lo and w.start < hi]
-    refined = refine_boundaries(pick, near, silences)
+    # word ends/onsets from the audio (DTW gives single-token words a synthetic 0.15 s end)
+    env = energy_envelope(wav, lo, hi + 1)
+    voice_db = voice_threshold(env, settings.silence_db)  # from the local noise floor
+    raw = [w for w in words if w.end > lo and w.start < hi]
+    near = raw
+    if voice_db is None:
+        log.warning(
+            "%s: background noise near the silence level; word timings and end tail kept "
+            "from the transcript", name,
+        )  # fmt: skip
+    else:
+        near = snap_onsets(refine_word_ends(raw, env, voice_db), env, voice_db)
+    # an onset snapped before the start keeps its word (never clip the first word)
+    pick = cover_first_word(pick, raw, near)
+    refined = refine_boundaries(pick, near, silences, loud_seconds=loud_seconds)
     fps = probe_fps(src)
-    # Frame-grid bounds make the cut timeline exact, so remapped caption times stay in sync.
-    keep = snap_ranges(
-        keep_ranges(
-            refined.segments(),
-            silences,
-            settings.max_pause_s,
-            settings.dead_air_pad_s,
-            words=near if protect_words else None,
-        ),
-        fps,
+    unrolled = _first_start(refined)
+    refined = _lead_ins(refined, env, near, fps)  # cause sound, frame-0 pre-roll
+    lead = unrolled - _first_start(refined)
+    # dead air keeps each word up to its refined end, trusted at most PROTECT_S past the
+    # transcript's end (`protected_words`)
+    protected = protected_words(raw, near)
+    untailed = keep_ranges(
+        refined.segments(),
+        silences,
+        settings.max_pause_s,
+        settings.dead_air_pad_s,
+        words=protected if protect_words else None,
     )
+    untailed = cut_gaps(untailed, idle_gaps or [])
+    timed, tailed = near, untailed
+    if voice_db is not None and untailed:
+        # final words onto the last voiced frame, words over silence onto the speech; the
+        # tail follows the speech, every drop / dead-air / idle splice lands in silence
+        timed = anchor_words(near, env, voice_db, clip_end=untailed[-1][1], ranges=untailed)
+        tailed = _with_tail(untailed, timed, env, voice_db)
+        bounds = list(refined.cold_open) if refined.cold_open else []
+        tailed, timed = snap_splices(tailed, timed, env, voice_db, fps, fixed=bounds, adjust=True)  # type: ignore[misc]
+        timed = clamp_word_ends(timed, env, voice_db)  # no caption held past the voice
+    elif untailed:
+        tailed = min_tail(untailed, near)  # no tail on a noisy bed: still room for the fade
+    # frame-grid bounds make the cut timeline exact, so remapped caption times stay in sync
+    keep = snap_ranges(tailed, fps, keep_gaps=[*refined.drops, *(idle_gaps or [])])
+    # words starting in the tail (no audible onset: see `tail_end`) are not captioned
+    heard = [i for i, w in enumerate(timed) if not untailed or w.start < untailed[-1][1] - 1e-6]
+    spoken = [timed[i] for i in heard]
+    # a word's survival of a cut is judged on the span dead air protected (moved along with
+    # the word when anchoring / splice snapping moved it), not on an audio-refined end that
+    # may run far past it (anchor_words / snap_splices keep the words' order and count)
+    judge = [min(timed[i].end, protected[i].end + timed[i].start - near[i].start) for i in heard]
+    uncaptioned: list[list[float]] = []
+    if voice_db is not None and untailed:
+        uncaptioned = _to_output_spans(uncaptioned_speech(spoken, env, voice_db, keep), keep)
+        if uncaptioned:
+            log.warning(
+                "%s: speech without captions at %s (output s; the transcript has no words "
+                "there)", name, ", ".join(f"{a:.2f}-{b:.2f}" for a, b in uncaptioned),
+            )  # fmt: skip
 
+    join = seam_join(keep, refined.cold_open)
+    seam_db = seam_source_db(wav, keep[join + 1][0]) if join is not None else None
     inter = cut_segments(
-        src, keep, work_dir / f"{name}.mp4", "libx264", quality=INTERMEDIATE_QUALITY, fps=fps
+        src,
+        keep,
+        work_dir / f"{name}.mkv",
+        "libx264",
+        quality=INTERMEDIATE_QUALITY,
+        fps=fps,
+        crossfade_at=join,  # no pop / step at the seam
+        splice_fades=splice_fades(keep, env),  # longer on loud audio: no chop
     )
-    crop = detect_crop(inter)
-    in_w, in_h = (crop[0], crop[1]) if crop else probe_size(inter)
+    duration = probe_duration(inter)
+    size = probe_size(inter)
+    if profile is not None and tuple(profile.size) != tuple(size):
+        log.warning(
+            "%s: layout profile is for %s, the cut is %s; profile ignored", name, profile.size, size
+        )
+        profile = None
+    letterbox = profile.bars if profile is not None else detect_crop(inter)
+    crop, bands = letterbox, None
 
+    seam = seam_time(keep, refined.cold_open)
+    cuts = cut_times_for(keep)
+    # punctuation-only tokens never captioned (nor shielding a splice remnant from
+    # drop_cut_slivers); the first word (and the first after the seam) capitalised once the
+    # remnants are gone
+    out_words = remap_words(spoken, keep, fps, judge_ends=judge)
+    out_words = drop_lead_fragments(out_words, lead)  # no pre-roll fragment caption
+    out_words = caption_words(drop_cut_slivers(caption_words(out_words), cuts), seam)
+    # loudness is normalised to the speech: the captioned words' spans on the clip's timeline
+    audio = plan_loudness(inter, speech=[(w.start, w.end) for w in out_words])
+    # a source noise gate's digital silence exposed by the cut gets a room-tone bed (below)
+    bed = bool(audio) and bool(digital_zero_runs(inter, ZERO_RUN_S))
+    gaps = _word_gaps(out_words)
     layouts: list[SceneLayout] = []
+    steps: list[tuple[float, float]] = []
     if settings.vertical:
-        layouts = plan_layouts(inter, detector, settings.facecam, crop=crop)
-        graph = reframe_graph(layouts, in_w, in_h, crop=crop)
+        layouts, crop, bands = _plan_vertical(inter, detector, settings, size, letterbox, profile)
+        in_w, in_h = (crop[0], crop[1]) if crop else size
+        # per-scene zoom plan (soft-source cap, small-face base zoom, headroom); the layouts
+        # carry it into the sidecar and to caption placement; word gaps steer reframe snaps
+        layouts = [
+            plan_zoom(lay, in_w, in_h).model_copy(
+                update={"gaps": [g for g in gaps if lay.start <= g[0] < lay.end]}
+            )
+            for lay in layouts
+        ]
+        steps = zoom_schedule(
+            duration,
+            cuts,
+            emphasis_times(pick.edit_beats, keep),
+            boundaries=[w.end for w in out_words if w.text.rstrip().endswith(_SENTENCE_END)],
+            changes=[lay.start for lay in layouts[1:]],  # no beat step next to a camera change
+            word_gaps=gaps,
+        )
+        # the edge guard's holds/shifts, once: the graph and the sidecar get the same steps
+        steps, layouts = guard_zoom(layouts, in_w, in_h, steps, cuts)
+        if any(lay.cam_rect is not None for lay in layouts):
+            # the talked-over static / death screens: the streamer's reaction, full cam --
+            # switched on the jump cuts near its edges, off the hook title and EARLIER tag
+            texts = text_windows(pick.hook_text, duration, seam) if settings.captions else []
+            covered = [(a, b) for a, b in _to_output_spans(screens or [], keep)]
+            layouts = plan_cam_covers(covered, layouts, duration, cuts=cuts, avoid=texts)
+            # full-cam reaction beats, never under the EARLIER tag nor over a scare / spike
+            peaks = reaction_peaks(spoken, env, keep, scares)
+            startles = startle_times(spoken, env, keep, [t for t, _ in peaks], scares, spikes)
+            avoid = [(a, b) for a, b in beat_avoid(seam, scares or [], spikes or [], keep)]
+            layouts = plan_cam_beats(peaks, layouts, cuts, duration, avoid, startles)
+            layouts = game_lift(inter, layouts, crop, cuts)  # near-black gameplay lifted
+        layouts = [
+            lay.model_copy(
+                update={
+                    "face_dx": face_offset(lay, in_w, in_h, steps),
+                    "snaps": scene_snaps(lay, in_w, in_h, steps),
+                    # STACKED: the cam panel's head region (full-cam beats included)
+                    "face_px": stacked_face_px(lay, in_w, in_h, steps)
+                    if lay.kind == "STACKED"
+                    else face_track_px(lay, in_w, in_h, steps),
+                }
+            )
+            for lay in layouts
+        ]
+        graph = reframe_graph(layouts, in_w, in_h, crop=crop, zoom_steps=steps, cut_times=cuts)
     else:
         graph = _horizontal_graph(crop)
 
     out_label = "[vout]"
+    if seam is not None:
+        # a dark flash on bright frames -- measured on what the flash covers
+        regions = _seam_regions(layouts, seam) if settings.vertical else None
+        lum = seam_luma(inter, seam, fps, regions=regions, crop=crop)
+        dark = lum is not None and lum > SEAM_BRIGHT
+        graph += f";[vout]{seam_flash(seam, fps, dark=dark)}[vseam]"
+        out_label = "[vseam]"
+    ass_ref: dict = {"ass": None, "ass_sha1": None}
     if settings.captions:
         ass = work_dir / f"{name}.ass"
-        cap_words = remap_words(near, keep)
+        # the early line and the hook/tag position see every scene shown with hook or tag
+        until = early_until(out_words, pick.hook_text, duration, seam, breaks=cuts)
         text = build_ass(
-            cap_words,
+            out_words,
             pick.hook_text,
-            probe_duration(inter),
-            caption_y_for(layouts),
-            hook_y_for(layouts),
+            duration,
+            caption_y_for(layouts, until=until),
+            hook_y_for(layouts, until=until),
+            seam=seam,
+            caption_y_late=caption_y_for(layouts, late=True),
+            breaks=cuts,  # caption pages never span a cut (nor the seam)
+            faces=face_samples(layouts),  # each page clears the faces shown with it
         )
         atomic_write_text(ass, text)
-        graph += f";[vout]{subtitles_filter(ass, fonts_dir())}[vfinal]"
+        ass_ref = {"ass": ass.name, "ass_sha1": hashlib.sha1(ass.read_bytes()).hexdigest()}
+        graph += f";{out_label}{subtitles_filter(ass, fonts_dir())}[vfinal]"
         out_label = "[vfinal]"
 
+    audio_args: list[str] = []
+    audio_graph = ""  # the room-tone mix (filter graph), when there is one
+    last_end = max((w.end for w in out_words), default=None)  # the end fade spares it
+    audio_map = ["-map", "0:a?"]
+    if audio is not None and bed:
+        # digital silence in the cut: a room-tone bed under everything, after the loudness
+        # chain (it adds nothing measurable to the loudness), faded with the clip. Both mix
+        # inputs are pinned to one format, rate and the clip's channel layout: left to amix's
+        # negotiation (the mono bed against the stereo clip) the planned loudness came out
+        # ~0.7 dB low (podcast clips at -14.9 LUFS) and the peaks ~3 dB over the plan
+        fmt = mix_format(inter)
+        audio_graph = (
+            f"[0:a]{audio.af},{fmt}[amain];{room_tone(duration)},{fmt}[abed];"
+            f"[amain][abed]amix=inputs=2:duration=first:normalize=0,"
+            f"{audio_fades(duration, last_end)}[aout]"
+        )
+        graph += ";" + audio_graph
+        audio_map = ["-map", "[aout]"]
+        log.info("%s: digital silence in the cut; room tone at %g dBFS", name, ROOM_TONE_DB)
+    elif audio is not None:  # the clip has audio
+        audio_args = ["-af", f"{audio.af},{audio_fades(duration, last_end)}"]
+    master_wav = work_dir / f"{name}.master.wav"
+
+    def audio_master() -> Path:
+        """The clip's audio exactly as mixed for the final encode, lossless (the true-peak
+        safety net re-encodes from it, never from the AAC)."""
+        if audio_map == ["-map", "[aout]"]:
+            mix = ["-lavfi", audio_graph, "-map", "[aout]"]
+        else:
+            mix = ["-map", "0:a", *audio_args]
+        _run(
+            ["ffmpeg", "-hide_banner", "-y", "-i", str(inter), *mix,
+             "-c:a", "pcm_s24le", "-ar", "48000", str(master_wav)]
+        )  # fmt: skip
+        return master_wav
+
     tmp = dst.with_suffix(".tmp.mp4")
-    _run(
-        [
-            "ffmpeg", "-hide_banner", "-y", "-i", str(inter),
-            "-filter_complex", graph,
-            "-map", out_label, "-map", "0:a?",
-            *encoder_args(encoder or pick_encoder()), "-pix_fmt", "yuv420p",
-            "-c:a", "copy",  # the intermediate's AAC 192k is the one lossy audio encode
-            "-movflags", "+faststart",
-            str(tmp),
-        ]
-    )  # fmt: skip
+    script = work_dir / f"{name}.graph.txt"
+    try:
+        _run(
+            [
+                "ffmpeg", "-hide_banner", "-y", "-i", str(inter),
+                # always a script: zoom/track expressions can outgrow the Windows command line
+                *filter_graph_args(graph, script, force=True),
+                "-map", out_label, *audio_map,
+                *encoder_args(encoder or pick_encoder()), "-pix_fmt", "yuv420p",
+                *audio_args,
+                "-c:a", "aac", "-b:a", "192k", "-ar", "48000",  # the one lossy audio encode
+                "-movflags", "+faststart",
+                str(tmp),
+            ]
+        )  # fmt: skip
+    finally:
+        script.unlink(missing_ok=True)
     os.replace(tmp, dst)
+    if audio and audio.mode != "skip":
+        ensure_true_peak(dst, master=audio_master)
+        master_wav.unlink(missing_ok=True)
     inter.unlink(missing_ok=True)
 
     kept = sum(e - s for s, e in keep)
+    segments = [list(sg) for sg in refined.segments()]
+    if segments and keep and keep[-1][1] > segments[-1][1]:
+        segments[-1][1] = keep[-1][1]  # the end tail is part of the clip's span
     return {
-        "segments": [list(s) for s in refined.segments()],
+        "segments": segments,
         "layout": [lay.model_dump(mode="json") for lay in layouts],
         "keep_ranges": [list(k) for k in keep],
-        "removed_s": round(max(refined.duration - kept, 0.0), 3),
+        "removed_s": round(max(sum(b - a for a, b in segments) - kept, 0.0), 3),
+        "cut_times": cuts,
+        # as rendered (guard holds applied, each scene's zoom plan); `zoom_levels` the levels
+        "zoom_steps": [list(st) for st in rendered_zoom_steps(layouts, steps)] if layouts else [],
+        "zoom_levels": [list(st) for st in steps],
+        "overlay_bands": list(bands) if bands else None,
+        "seam": seam,
+        **ass_ref,
+        "caption_words": [[w.start, w.end, w.text] for w in out_words],
+        "uncaptioned_speech": uncaptioned,
+        "room_tone": bed,
+        # the scares on the output timeline (the audit's Q-beat)
+        "scare_times": [t for x in scares or [] if (t := _to_output_time(x, keep)) is not None],
+        "beat_spikes": _to_output_spans(spikes or [], keep),
+        "seam_source_db": seam_db,
+        "layout_profile": _profile_summary(profile, layouts),
     }
+
+
+def _profile_summary(profile: LayoutProfile | None, layouts: list[SceneLayout]) -> dict | None:
+    """The stream profile's cam as the clip used it (source px), for the audit; None when no
+    scene used the profile's template."""
+    if profile is None or not any(lay.cam_rect is not None for lay in layouts):
+        return None
+    return profile.model_dump(mode="json", include={"cam", "outer", "head", "masks", "bars"})

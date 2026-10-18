@@ -17,6 +17,7 @@ def test_doctor_flags_missing_ffmpeg():
 
 def test_doctor_all_good():
     out = (
+        "ffmpeg version 7.1 Copyright (c) 2000-2024\n"
         " .. subtitles  V->V  Render text subtitles\n"
         " V....D h264_nvenc  NVENC\n"
         " V....D h264_amf  AMF\n"
@@ -137,3 +138,21 @@ def test_doctor_gpu_row_ok_with_discrete_gpu():
 def test_doctor_gpu_row_without_vulkaninfo():
     row = _gpu_row(lambda name: None if name == "vulkaninfo" else f"/bin/{name}", "")
     assert not row.ok and not row.required and "vulkaninfo" in row.detail
+
+
+def _versioned(version_line: str):
+    tables = " .. subtitles  V->V  Render text subtitles\n V....D h264_nvenc  NVENC\n"
+    return fake_completed(f"{version_line}\n{tables}")
+
+
+def test_doctor_requires_ffmpeg_7_for_filter_scripts():
+    """Renders pass their filter graph as a file (`-/filter_complex`, ffmpeg 7+)."""
+    which = lambda name: f"/bin/{name}"
+    old = {c.name: c for c in run_doctor(which=which, run=_versioned("ffmpeg version 6.1.1"))}
+    assert not old["ffmpeg"].ok and old["ffmpeg"].required
+    assert "6.1.1" in old["ffmpeg"].detail and "7" in old["ffmpeg"].detail
+    for line in ("ffmpeg version 7.1-full_build-www.gyan.dev", "ffmpeg version n8.0"):
+        assert {c.name: c for c in run_doctor(which=which, run=_versioned(line))}["ffmpeg"].ok
+    # a git build ("N-118000-g...") has no release number: assumed current
+    git = run_doctor(which=which, run=_versioned("ffmpeg version N-118000-gabc Copyright"))
+    assert {c.name: c for c in git}["ffmpeg"].ok

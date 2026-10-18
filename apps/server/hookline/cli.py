@@ -6,6 +6,7 @@ from typing import Annotated
 import typer
 from pydantic import ValidationError
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from hookline.config import Settings, parse_facecam
@@ -61,6 +62,12 @@ def run(
     no_chat: Annotated[
         bool, typer.Option("--no-chat", help="Skip Twitch chat download and chat signals")
     ] = False,
+    keep_overlays: Annotated[
+        bool,
+        typer.Option(
+            "--keep-overlays", help="Keep burned-in lower-thirds/edge overlays (no overlay crop)"
+        ),
+    ] = False,
     facecam: Annotated[
         str | None,
         typer.Option("--facecam", help="Facecam box X,Y,W,H as 0-1 fractions of the frame"),
@@ -80,6 +87,8 @@ def run(
         overrides["captions"] = False
     if no_chat:
         overrides["chat"] = False
+    if keep_overlays:
+        overrides["overlay_crop"] = False
     try:
         if clips is not None:
             overrides["clips"] = clips
@@ -137,4 +146,46 @@ def doctor() -> None:
         )
     console.print(table)
     if any(c.required and not c.ok for c in checks):
+        raise typer.Exit(1)
+
+
+@app.command()
+def audit(job_id: Annotated[str, typer.Argument(help="Job id (the output/<job> folder)")]) -> None:
+    """Check JOB_ID's rendered clips against the quality bar (exit 1 if any check fails)."""
+    from hookline.quality import audit_job
+
+    settings = Settings.from_env()
+    out_dir = settings.output_dir / job_id
+    if not out_dir.is_dir() or not any(out_dir.glob("*.mp4")):
+        err_console.print(
+            f"Error: no rendered clips for job {job_id} in {out_dir}",
+            style="red", highlight=False, markup=False,
+        )  # fmt: skip
+        raise typer.Exit(1)
+    report = audit_job(out_dir, settings.workspace_dir / job_id)
+    failed = warned = 0
+    result = {"pass": "[green]PASS[/green]", "warn": "[yellow]WARN[/yellow]"}
+    for clip in report["clips"]:
+        table = Table("Check", "Result", "Value", "Threshold", "Detail", title=clip["clip"])
+        for c in clip["checks"]:
+            status = c.get("status") or ("pass" if c["ok"] else "fail")
+            failed += status == "fail"
+            warned += status == "warn"
+            table.add_row(
+                c["id"],
+                result.get(status, "[red]FAIL[/red]"),
+                escape("" if c["value"] is None else str(c["value"])),
+                escape(c["threshold"]),
+                escape(c["detail"]),
+            )
+        console.print(table)
+    n_ok = sum(c["ok"] for c in report["clips"])
+    style = "green" if report["ok"] else "red"
+    console.print(
+        f"{n_ok}/{len(report['clips'])} clips pass; {failed} failed checks, "
+        f"{warned} warning{'' if warned == 1 else 's'}"
+        f" - report: {out_dir / 'audit.json'}",
+        style=style, highlight=False, markup=False,
+    )  # fmt: skip
+    if not report["ok"]:
         raise typer.Exit(1)

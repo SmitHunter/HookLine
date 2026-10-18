@@ -109,6 +109,28 @@ def test_parse_prefers_dtw_and_matches_real_pauses():
     assert 6.1 <= after_pause.start <= 6.7
 
 
+def test_parse_keeps_word_probability_from_tokens():
+    # the lowest speech-token p of each word; punctuation tokens ("," p=0.56) do not count
+    words = parse_whisper_cpp_json(_load("whisper_cpp_dtw_sample.json"), duration=60.0).words()
+    assert [w.text for w in words[:3]] == ["All", "these", "people,"]
+    assert [w.prob for w in words[:3]] == pytest.approx([0.286783, 0.979268, 0.997626])
+    no_tokens = parse_whisper_cpp_json(_load("whisper_cpp_sample.json"), duration=5.0)
+    assert all(w.prob == 1.0 for w in no_tokens.words())
+
+
+@pytest.mark.parametrize("p", [None, "", "nan?", "missing"])
+def test_parse_tolerates_a_null_or_missing_token_probability(p):
+    data = _load("whisper_cpp_dtw_sample.json")
+    for e in data["transcription"]:
+        for tok in e.get("tokens", []):
+            if p == "missing":
+                tok.pop("p", None)
+            else:
+                tok["p"] = p
+    words = parse_whisper_cpp_json(data, duration=60.0).words()
+    assert words and all(w.prob == 1.0 for w in words)
+
+
 def test_parse_falls_back_to_offsets_without_dtw():
     t = parse_whisper_cpp_json(_load("whisper_cpp_sample.json"), duration=5.0)
     assert t.timing == "segment" and t.words()[0].start == pytest.approx(0.32)
@@ -235,3 +257,120 @@ def test_backend_cache_keys(tmp_path):
     }
     fw = FasterWhisperBackend("large-v3-turbo", "cpu", "int8")
     assert fw.cache_key == {"backend": "faster-whisper", "model": "large-v3-turbo", "dtw": None}
+
+
+def _w(text: str, start: float, end: float | None = None):
+    from hookline.models import Word
+
+    return Word(start=start, end=end if end is not None else start + 0.3, text=text)
+
+
+def test_dedupe_removes_repeated_run():
+    from hookline.transcribe.clean import dedupe_segments
+
+    run = ["We", "were", "a", "little", "older"]
+    words = [_w(t, 1817.4 + i * 0.3) for i, t in enumerate(run)]
+    words += [_w(t, 1817.4 + i * 0.3) for i, t in enumerate(run)]
+    words += [_w("then", 1820.0)]
+    out = dedupe_segments(words)
+    assert [w.text for w in out] == [*run, "then"]
+
+
+def test_dedupe_handles_triple_and_punctuation():
+    from hookline.transcribe.clean import dedupe_segments
+
+    words = []
+    for _ in range(3):
+        words += [_w("It's", 10.0), _w("epic.", 10.3)]
+    assert [w.text for w in dedupe_segments(words)] == ["It's", "epic."]
+
+
+def test_dedupe_keeps_genuine_repeat_far_apart():
+    from hookline.transcribe.clean import dedupe_segments
+
+    words = [_w("no", 1.0), _w("way", 1.3), _w("no", 5.0), _w("way", 5.3)]
+    assert len(dedupe_segments(words)) == 4
+
+
+def test_spread_collapsed_words():
+    from hookline.transcribe.clean import spread_collapsed
+
+    words = [_w("a", 1817.40, 1817.45), _w("b", 1817.40, 1817.45), _w("c", 1817.40, 1817.45)]
+    words.append(_w("d", 1818.0, 1818.3))
+    out = spread_collapsed(words)
+    starts = [w.start for w in out]
+    assert starts == pytest.approx([1817.40, 1817.60, 1817.80, 1818.0])
+    assert out[0].end == pytest.approx(1817.60) and out[2].end == pytest.approx(1817.88)
+    assert all(w.end - w.start >= 0.08 - 1e-9 for w in out)
+
+
+def test_spread_leaves_run_when_no_room():
+    from hookline.transcribe.clean import spread_collapsed
+
+    words = [_w("a", 5.0, 5.05), _w("b", 5.0, 5.05), _w("c", 5.1, 5.3)]
+    out = spread_collapsed(words)
+    assert [w.start for w in out] == [5.0, 5.0, 5.1]
+
+
+def test_words_to_transcript_applies_cleaning():
+    from hookline.transcribe.base import words_to_transcript
+
+    words = [_w("hi", 1.0, 1.05), _w("there.", 1.0, 1.05), _w("ok", 2.0, 2.3)]
+    t = words_to_transcript(words, "en", 5.0, timing="dtw")
+    assert [w.start for w in t.words()] == pytest.approx([1.0, 1.5, 2.0])
+
+
+def test_dedupe_keeps_fast_stutter_repeats():
+    from hookline.transcribe.clean import dedupe_segments
+
+    for t in ("no", "go"):
+        words = [_w(t, 1.0 + i * 0.15, 1.0 + (i + 1) * 0.15) for i in range(4)]
+        assert len(dedupe_segments(words)) == 4
+
+
+def test_dedupe_keeps_sequential_repeat_with_small_overlap():
+    from hookline.transcribe.clean import dedupe_segments
+
+    run = ["we", "were", "here"]
+    words = [_w(t, 1.0 + i * 0.4, 1.0 + (i + 1) * 0.4 + 0.005) for i, t in enumerate(run)]
+    words += [_w(t, 2.195 + i * 0.4, 2.195 + (i + 1) * 0.4) for i, t in enumerate(run)]
+    assert len(dedupe_segments(words)) == 6
+
+
+def test_spread_trailing_run_uses_end_limit_and_caps_step():
+    from hookline.transcribe.clean import spread_collapsed
+
+    words = [_w("a", 10.0, 10.05), _w("b", 10.0, 10.05)]
+    out = spread_collapsed(words, end_limit=12.0)
+    assert [w.start for w in out] == pytest.approx([10.0, 10.6])  # step capped at 0.6
+    before_pause = [_w("a", 1.0, 1.05), _w("b", 1.0, 1.05), _w("c", 9.0, 9.2)]
+    out = spread_collapsed(before_pause)
+    assert out[1].start == pytest.approx(1.6) and out[1].end <= 2.0
+
+
+def test_cleaning_is_idempotent():
+    from hookline.transcribe.base import words_to_transcript
+
+    words = [_w("a", 1.0, 1.05), _w("b", 1.0, 1.05), _w("c", 2.0)]
+    words += [_w("x", 3.0), _w("y", 3.3), _w("x", 3.0), _w("y", 3.3)]
+    once = words_to_transcript(words, "en", 6.0, timing="dtw")
+    twice = words_to_transcript(once.words(), "en", 6.0, timing="dtw")
+    assert once.words() == twice.words()
+
+
+def test_dedupe_removes_collapsed_copy_after_normal_phrase():
+    from hookline.transcribe.clean import dedupe_segments
+
+    run = ["We", "were", "a", "little", "older."]
+    words = [_w(t, 1815.70 + i * 0.34, 1816.0 + i * 0.34) for i, t in enumerate(run)]
+    words += [_w(t, 1817.40, 1817.45) for t in run]
+    words += [_w("Then", 1817.40, 1817.45)]
+    out = dedupe_segments(words)
+    assert [w.text for w in out] == [*run, "Then"]
+
+
+def test_dedupe_collapsed_rule_needs_matching_text():
+    from hookline.transcribe.clean import dedupe_segments
+
+    words = [_w("a", 1.0), _w("b", 1.3), _w("c", 5.0, 5.05), _w("d", 5.0, 5.05)]
+    assert len(dedupe_segments(words)) == 4

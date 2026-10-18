@@ -1,8 +1,9 @@
-from hookline.models import Word
+from hookline.models import MIN_WORD_S, Word
 
 MIN_RANGE = 0.05
 MIN_PIECE_S = 1.5  # a cut may not leave a kept piece shorter than this (choppy jump cuts)
-MIN_WORD_S = 0.05  # captions drop shorter words; edge-clipped words are stretched to this
+DEFAULT_FPS = 30.0  # for the one-frame sliver threshold when the clip's fps is unknown
+MIN_SURVIVING = 0.5  # an edge-clipped word keeping less than this share of itself is dropped
 
 
 def _word_free(
@@ -79,18 +80,41 @@ def _drop_short_pieces(
     return cuts
 
 
+def cut_gaps(
+    keep: list[tuple[float, float]], gaps: list[tuple[float, float]]
+) -> list[tuple[float, float]]:
+    """`keep` with every `gaps` range (source seconds) cut out of it, e.g. the interior idle
+    stretches of `boundaries.idle_gaps`; pieces shorter than MIN_RANGE are dropped."""
+    out = list(keep)
+    for ga, gb in sorted(gaps):
+        nxt: list[tuple[float, float]] = []
+        for a, b in out:
+            if gb <= a or ga >= b:
+                nxt.append((a, b))
+                continue
+            nxt += [(x, y) for x, y in ((a, ga), (gb, b)) if y - x >= MIN_RANGE]
+        out = nxt
+    return out
+
+
 MERGE_GAP_S = 0.15
 
 
 def snap_ranges(
-    keep: list[tuple[float, float]], fps: float, merge_gap: float = MERGE_GAP_S
+    keep: list[tuple[float, float]],
+    fps: float,
+    merge_gap: float = MERGE_GAP_S,
+    keep_gaps: list[tuple[float, float]] | None = None,
 ) -> list[tuple[float, float]]:
     """Merge each range into the previous one when it starts less than `merge_gap` after it
-    ends (forward gaps only), then snap every bound to the source frame grid (k / fps) and
+    ends (forward gaps only), unless the gap overlaps one of `keep_gaps` (explicit drops are
+    intentional, however short), then snap every bound to the source frame grid (k / fps) and
     drop ranges that become empty. The output timeline is then exactly sum(end - start)."""
     merged: list[tuple[float, float]] = []
     for start, end in keep:
-        if merged and 0 <= start - merged[-1][1] < merge_gap:
+        gap = (merged[-1][1], start) if merged else (0.0, 0.0)
+        explicit = any(min(gap[1], b) - max(gap[0], a) > 1e-9 for a, b in keep_gaps or [])
+        if merged and 0 <= start - merged[-1][1] < merge_gap and not explicit:
             merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
         else:
             merged.append((start, end))
@@ -102,17 +126,45 @@ def snap_ranges(
     return out
 
 
-def remap_words(words: list[Word], keep: list[tuple[float, float]]) -> list[Word]:
-    """Move word timings onto the output timeline of the kept ranges."""
+def _survives(word: Word, judge_end: float | None, k_start: float, k_end: float) -> bool:
+    """Whether at least half of the word's judged span (start to `judge_end`, the end dead
+    air protected, when given and inside the word) lies in [k_start, k_end]."""
+    end = word.end if judge_end is None else min(word.end, max(judge_end, word.start))
+    if end - word.start <= 1e-9:
+        return True
+    kept = min(end, k_end) - max(word.start, k_start)
+    return kept >= MIN_SURVIVING * (end - word.start) - 1e-9
+
+
+def remap_words(
+    words: list[Word],
+    keep: list[tuple[float, float]],
+    fps: float | None = None,
+    judge_ends: list[float] | None = None,
+) -> list[Word]:
+    """Move word timings onto the output timeline of the kept ranges. A word a range edge
+    clips to less than half of its duration, or to less than one frame (1 / fps; 30 fps when
+    unknown), is left out of that range: it belongs to the speech the cut removed.
+
+    `judge_ends` (one per word) are the ends dead-air cutting protected (the transcript end
+    plus PROTECT_S): the half is judged on start..that end, so an audio-refined end inflated
+    past the protected span cannot cost a kept word its caption."""
+    frame = 1 / (fps or DEFAULT_FPS)
     out: list[Word] = []
     offset = 0.0
     for k_start, k_end in keep:
-        for word in words:
+        for i, word in enumerate(words):
             start = max(word.start, k_start)
             end = min(word.end, k_end)
             if end <= start:
                 continue
-            if end - start < MIN_WORD_S and (word.start < k_start or word.end > k_end):
+            clipped = word.start < k_start or word.end > k_end
+            judge = judge_ends[i] if judge_ends is not None else None
+            if clipped and (
+                end - start < frame - 1e-9 or not _survives(word, judge, k_start, k_end)
+            ):
+                continue  # mostly cut away at the seam (a dropped line's last word): no flash
+            if end - start < MIN_WORD_S and clipped:
                 # A cut clipped this word to a sliver: keep it visible, inside the range.
                 if word.end > k_end:
                     start = max(k_start, end - MIN_WORD_S)

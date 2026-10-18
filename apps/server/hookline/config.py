@@ -46,7 +46,7 @@ class Settings(BaseModel):
     whisper_device: int | None = None  # whisper.cpp `-dev` (Vulkan device index)
     clips: int = 5
     min_clip_s: float = 20
-    max_clip_s: float = 60
+    max_clip_s: float = 50
     short_input_s: float = 120
     max_prompt_tokens: int = 600_000
     cookies_from_browser: str | None = None
@@ -57,6 +57,7 @@ class Settings(BaseModel):
     silence_db: float = -32.0
     facecam: Box | None = None
     chat: bool = True
+    overlay_crop: bool = True  # crop burned-in lower-thirds/edge overlays (vertical only)
 
     @field_validator("facecam", mode="before")
     @classmethod

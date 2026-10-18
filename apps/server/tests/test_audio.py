@@ -41,3 +41,19 @@ def test_detect_silences_open_silence_closes_at_end(tone_gap_wav):
 
 def test_detect_silences_none_in_continuous_audio(tone_wav):
     assert detect_silences(tone_wav, 0, 3) == []
+
+
+def test_momentary_db_streams_a_short_term_envelope(tmp_path: Path):
+    from hookline.media.audio import momentary_db
+
+    wav = tmp_path / "burst.wav"
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+         r"aevalsrc='0.5*sin(2*PI*440*t)*gte(t\,2)':s=16000:d=4", "-c:a", "pcm_s16le", str(wav)],
+        check=True,
+    )  # fmt: skip
+    db = momentary_db(wav, hop=0.1, window=0.4)
+    assert len(db) == 40
+    assert db[19] <= -99  # digital silence (the window ending at 2.0 s), floored
+    assert db[20] == pytest.approx(-15.0, abs=0.5)  # one loud hop of four, the hop it starts
+    assert db[30] == pytest.approx(-9.0, abs=0.5)  # 0.5 amplitude sine: -9 dBFS mean power
