@@ -634,7 +634,16 @@ def test_run_job_trims_idle_ends_before_render_and_records_the_source_bitrate(
     # interior idle gaps of the fitted pick reach the render
     assert kws[0] == {"max_s": s.max_clip_s + 5.0, "quiet_db": s.silence_db}
     assert gaps == [seen[0]] and seen_kw[0]["idle_gaps"] == [(25.0, 27.0)]
+    # wave H round 1: beats / Q-beat see every scare (flashes too) and the gameplay spikes
+    signals = run_mod.Signals.model_validate_json(
+        (s.workspace_dir / run_mod.job_id_for(str(fixture_video)) / "signals.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert seen_kw[0]["scares"] == run_mod.scare_times(signals)
+    assert seen_kw[0]["spikes"] == run_mod.beat_spikes(signals)
     side = json.loads(clip.with_suffix(".json").read_text(encoding="utf-8"))
+    assert "beat_spikes" in side and "scare_times" in side
     assert side["source_video_kbps"] > 0
 
 
@@ -662,10 +671,11 @@ def test_signals_cache_keeps_motion_and_recomputes_only_the_onsets(signals_input
     assert sig["version"] == SIGNALS_VERSION >= 3 and sig["onset_times"] == []
     # a version-2 cache (no exact onset times) keeps its VOD motion decode
     sig.update({"version": 2, "motion": [7.0] * 150, "screen": [0] * 150})
+    sig.update({"screen_chroma": [None] * 150, "screen_mask": None})
     del sig["onset_times"], sig["transient_times"]
     (job / "signals.json").write_text(json.dumps(sig), encoding="utf-8")
 
-    def no_decode(src):
+    def no_decode(src, mask=None):
         raise AssertionError("motion re-decoded")
 
     monkeypatch.setattr(run_mod, "frame_stats", no_decode)
@@ -686,7 +696,7 @@ def test_a_failed_motion_analysis_is_retried_next_run(signals_inputs, monkeypatc
     job, src, wav, transcript = signals_inputs
     real = run_mod.frame_stats
 
-    def broken(src):
+    def broken(src, mask=None):
         raise FFmpegError("decode failed")
 
     monkeypatch.setattr(run_mod, "frame_stats", broken)
@@ -724,3 +734,31 @@ def test_run_job_builds_the_layout_profile_once_and_passes_it_with_scares(
     assert len(built) == 1 and built[0][1].startswith("source")
     assert len(seen) == 2 and all(p is prof for p, _ in seen)
     assert all(isinstance(sc, list) for _, sc in seen)  # the VOD's game transients
+
+
+def test_signals_recompute_screens_without_chroma_or_for_a_new_cam_mask(
+    signals_inputs, monkeypatch
+):
+    # wave H round 1: screen chroma (cam masked) is part of the motion decode
+    from hookline.pipeline import run as run_mod
+
+    job, src, wav, transcript = signals_inputs
+    calls = []
+
+    def fake(src, mask=None):
+        calls.append(mask)
+        return [7.0] * 150, [0] * 150, [None] * 150
+
+    monkeypatch.setattr(run_mod, "frame_stats", fake)
+    out = run_mod._signals(job, src, wav, transcript, lambda m: None)
+    assert calls == [None] and out.screen_chroma == [None] * 150 and out.screen_mask is None
+    run_mod._signals(job, src, wav, transcript, lambda m: None)
+    assert len(calls) == 1  # cached
+    cam = [(0.04, 0.5, 0.2, 0.83)]
+    out = run_mod._signals(job, src, wav, transcript, lambda m: None, mask=cam)
+    assert calls[-1] == cam and out.screen_mask == [list(b) for b in cam]
+    sig = json.loads((job / "signals.json").read_text(encoding="utf-8"))
+    del sig["screen_chroma"]  # a version-4 cache
+    (job / "signals.json").write_text(json.dumps(sig), encoding="utf-8")
+    run_mod._signals(job, src, wav, transcript, lambda m: None, mask=cam)
+    assert len(calls) == 3

@@ -21,7 +21,15 @@ from hookline.captions.ass import (
 )
 from hookline.config import Settings
 from hookline.fsutil import atomic_write_text
-from hookline.media.audio import Envelope, detect_silences, digital_zero_runs, energy_envelope
+from hookline.media.audio import (
+    ENVELOPE_RATE,
+    Envelope,
+    detect_silences,
+    digital_zero_runs,
+    energy_envelope,
+    pcm_span,
+    seam_jump_db,
+)
 from hookline.media.ffmpeg import (
     _run,
     cut_segments,
@@ -150,18 +158,86 @@ def seam_join(keep: list[tuple[float, float]], cold_open: tuple[float, float] | 
 SEAM_BRIGHT = 180.0  # frames around the seam this bright (mean grey) get a dark flash
 
 
-def seam_luma(path: Path, seam: float, fps: float) -> float | None:
-    """Mean grey level (0-255) of the frames 2 either side of `seam` in `path`; None when
-    they cannot be read."""
+_LUMA_W, _LUMA_H = 64, 36
+
+
+def seam_luma(
+    path: Path,
+    seam: float,
+    fps: float,
+    regions: list[tuple[float, float, float, float]] | None = None,
+    crop: Crop | None = None,
+) -> float | None:
+    """Mean grey level (0-255) of the frames 2 either side of `seam` in `path`, over what the
+    flash is drawn on: the `crop` (w, h, x, y px) of the picture and, inside it, the
+    `regions` (normalized x, y, w, h: a STACKED clip's cam and gameplay panels) -- the whole
+    cropped picture without regions. None when the frames cannot be read."""
+    pre = f"crop={crop[0]}:{crop[1]}:{crop[2]}:{crop[3]}," if crop else ""
     res = subprocess.run(
         ["ffmpeg", "-hide_banner", "-v", "error", "-ss", f"{max(seam - 2 / fps, 0):.3f}",
-         "-t", f"{4 / fps:.3f}", "-i", str(path), "-an", "-vf", "scale=32:18,format=gray",
+         "-t", f"{4 / fps:.3f}", "-i", str(path), "-an",
+         "-vf", f"{pre}scale={_LUMA_W}:{_LUMA_H}:flags=area,format=gray",
          "-f", "rawvideo", "-"],
         check=False, capture_output=True,
     )  # fmt: skip
-    if res.returncode != 0 or not res.stdout:
+    size = _LUMA_W * _LUMA_H
+    if res.returncode != 0 or len(res.stdout) < size:
         return None
-    return float(np.frombuffer(res.stdout, np.uint8).mean())
+    frames = np.frombuffer(res.stdout[: len(res.stdout) // size * size], np.uint8)
+    frames = frames.reshape(-1, _LUMA_H, _LUMA_W)
+    if not regions:
+        return float(frames.mean())
+    shown = np.zeros((_LUMA_H, _LUMA_W), bool)
+    for x, y, w, h in regions:
+        c0, c1 = int(x * _LUMA_W), int(np.ceil((x + w) * _LUMA_W))
+        r0, r1 = int(y * _LUMA_H), int(np.ceil((y + h) * _LUMA_H))
+        shown[max(r0, 0) : min(r1, _LUMA_H), max(c0, 0) : min(c1, _LUMA_W)] = True
+    if not shown.any():
+        return float(frames.mean())
+    return float(frames[:, shown].mean())
+
+
+def _seam_regions(
+    layouts: list[SceneLayout], seam: float
+) -> list[tuple[float, float, float, float]] | None:
+    """What the vertical output shows of the picture at `seam`: a STACKED scene's cam window
+    and gameplay panel; None (the whole picture) otherwise."""
+    lay = next((x for x in layouts if x.start <= seam < x.end), None)
+    if lay is None or lay.kind != "STACKED":
+        return None
+    out = [b for b in (lay.facecam, lay.game_box) if b is not None]
+    return out or None
+
+
+def seam_source_db(wav: Path, t: float) -> float | None:
+    """The source's own rise at source time `t` (`seam_jump_db` of `wav` around it): what the
+    audit's Q-seam allows the output's rise at the seam that starts there."""
+    lo = max(t - 0.1, 0.0)
+    pcm = pcm_span(wav, lo, t + 0.1, ENVELOPE_RATE)
+    if not len(pcm):
+        return None
+    return round(seam_jump_db(pcm, ENVELOPE_RATE, t - lo), 2)
+
+
+def voiced_words(
+    wav: Path, words: list[Word], lo: float, hi: float, silence_db: float
+) -> list[Word]:
+    """`words` with those starting in [lo, hi) clamped to their voice as the render's captions
+    are (`timing.clamp_word_ends`, the same threshold from the local noise floor): a word DTW
+    held over a pause ends with its voice. The rest, and every word when the bed is too loud
+    to tell the voice (`timing.voice_threshold` None), as given. Order kept."""
+    inside = [i for i, w in enumerate(words) if lo <= w.start < hi]
+    if not inside:
+        return words
+    env = energy_envelope(wav, max(lo, 0.0), hi + 1)
+    thr = voice_threshold(env, silence_db)
+    if thr is None:
+        return words
+    clamped = clamp_word_ends([words[i] for i in inside], env, thr)
+    out = list(words)
+    for i, w in zip(inside, clamped, strict=True):
+        out[i] = w
+    return out
 
 
 def seam_flash(seam: float, fps: float, dark: bool = False) -> str:
@@ -362,10 +438,8 @@ def _lead_ins(pick: ClipPick, env: Envelope, words: list[Word], fps: float) -> C
         lead = pre_roll(env, first[0], words, fps)
         if lead < first[0]:
             update["cold_open"] = (lead, first[1])
-    else:
-        start = update.get("start", pick.start)
-        if (lead := pre_roll(env, start, words, fps)) < start:
-            update["start"] = lead
+    elif (lead := pre_roll(env, pick.start, words, fps)) < pick.start:
+        update["start"] = lead
     if not update:
         return pick
 
@@ -449,6 +523,7 @@ def render_clip(
     idle_gaps: list[tuple[float, float]] | None = None,
     profile: LayoutProfile | None = None,
     scares: list[float] | None = None,
+    spikes: list[tuple[float, float]] | None = None,
 ) -> dict:
     """Write the finished clip to `dst`; returns sidecar extras (segments, layout, keep_ranges,
     removed_s, cut_times, zoom_steps, zoom_levels, overlay_bands, seam, ass, ass_sha1,
@@ -482,7 +557,10 @@ def render_clip(
     gives the static black bars (no per-clip detection) and, for a stream with a facecam
     overlay (unless `settings.facecam` overrides), the fixed STACKED template for every scene,
     with up to two full-cam reaction beats at the streamer's reaction peaks (`scares`: the
-    VOD's game-transient times, source s); the sidecar's `layout_profile` records its cam."""
+    VOD's scare times, source s); the sidecar's `layout_profile` records its cam. Wave H: the
+    sidecar records the `scares` and the gameplay `spikes` (`run.beat_spikes`: source spans)
+    on the output timeline (`scare_times`, `beat_spikes`: the audit's Q-beat) and the source's
+    own rise at the seam (`seam_source_db`: Q-seam)."""
     work_dir.mkdir(parents=True, exist_ok=True)
     dst.parent.mkdir(parents=True, exist_ok=True)
     name = dst.stem.split("-", 1)[0]
@@ -547,6 +625,8 @@ def render_clip(
                 "there)", name, ", ".join(f"{a:.2f}-{b:.2f}" for a, b in uncaptioned),
             )  # fmt: skip
 
+    join = seam_join(keep, refined.cold_open)
+    seam_db = seam_source_db(wav, keep[join + 1][0]) if join is not None else None
     inter = cut_segments(
         src,
         keep,
@@ -554,7 +634,7 @@ def render_clip(
         "libx264",
         quality=INTERMEDIATE_QUALITY,
         fps=fps,
-        crossfade_at=seam_join(keep, refined.cold_open),  # wave H: no pop / step at the seam
+        crossfade_at=join,  # wave H: no pop / step at the seam
     )
     duration = probe_duration(inter)
     size = probe_size(inter)
@@ -626,7 +706,9 @@ def render_clip(
 
     out_label = "[vout]"
     if seam is not None:
-        lum = seam_luma(inter, seam, fps)  # wave H: a dark flash on bright frames
+        # wave H: a dark flash on bright frames -- measured on what the flash covers
+        regions = _seam_regions(layouts, seam) if settings.vertical else None
+        lum = seam_luma(inter, seam, fps, regions=regions, crop=crop)
         dark = lum is not None and lum > SEAM_BRIGHT
         graph += f";[vout]{seam_flash(seam, fps, dark=dark)}[vseam]"
         out_label = "[vseam]"
@@ -711,6 +793,8 @@ def render_clip(
         "room_tone": bed,
         # wave H: the scares on the output timeline (the audit's Q-beat)
         "scare_times": [t for x in scares or [] if (t := _to_output_time(x, keep)) is not None],
+        "beat_spikes": _to_output_spans(spikes or [], keep),
+        "seam_source_db": seam_db,
         "layout_profile": _profile_summary(profile, layouts),
     }
 

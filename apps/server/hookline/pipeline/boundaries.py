@@ -468,11 +468,17 @@ def fit_to_signals(
 
 STATIC_WORD_PAD_S = 0.05  # a static cut starts / ends this far clear of a word it would split
 STATIC_MIN_GAP_S = 0.25  # a static cut shorter than this is not worth a jump cut
-VOICELESS_MAX_S = 6.0  # a stretch without speech longer than this inside a clip is trimmed ...
-VOICELESS_KEEP_S = 3.2  # ... to this much before the next speech or scare (its build-up) ...
-VOICELESS_LEAD_S = 0.3  # ... plus this much after the last word ...
-SCARE_HOLD_S = 1.5  # ... or this much after a scare (it is never cut)
-VOICELESS_WORD_S = 1.5  # a word counts as speech at most this long (held ends run over pauses)
+VOICELESS_MAX_S = 6.0  # a stretch without speech longer than this inside a clip is trimmed:
+# each scare in it keeps [scare - VOICELESS_SCARE_PRE_S, scare + VOICELESS_SCARE_POST_S]
+# (never cut); of the rest, at most VOICELESS_CAP_S is kept: VOICELESS_LEAD_S after the last
+# word, then up to VOICELESS_KEEP_S of build-up before the next speech (or the stretch's
+# closing scare), then the remainder before each scare's window, latest first. Voice is the
+# words as captioned: held ends clamped to the voice (`render.voiced_words`), like Q-voiceless.
+VOICELESS_KEEP_S = 3.2
+VOICELESS_LEAD_S = 0.3
+VOICELESS_CAP_S = 4.0
+VOICELESS_SCARE_PRE_S = 0.5
+VOICELESS_SCARE_POST_S = 1.5
 # A scare this soon after a clip's end is its payoff (the clip ends just before it): the end
 # moves to PAYOFF_REACT_S after it, or to the end of a sentence said by then (at most
 # PAYOFF_SAID_MAX_S after it), never into a static screen. 8.5, not 8: measured from the
@@ -481,6 +487,9 @@ PAYOFF_SCARE_S = 8.5
 PAYOFF_REACT_S = 2.5
 PAYOFF_SAID_MAX_S = 6.0
 PAYOFF_MIN_S = 0.2  # an extension leaving less than this after the scare is not made
+# A clip already ending on a sentence end (its punchline) is not extended to a scare more than
+# PAYOFF_PUNCHLINE_S after its end (stream 03: "...gonna run?" was run on into "Who? Dodge!").
+PAYOFF_PUNCHLINE_S = 4.0
 # A screen run starts somewhere in its first flagged 4 fps frame: an end stays this far clear.
 STATIC_EDGE_S = 0.25
 
@@ -526,7 +535,9 @@ def static_gaps(
 def avoid_static(pick: ClipPick, words: list[Word], signals: Signals) -> ClipPick:
     """A clip never starts or ends on a static screen or fade (`signals.static_runs`): a start
     on one moves to the first sentence start after it (its opening becomes `first_words`); an
-    end on one moves to the screen's start (or the end of a word running into it). Logs."""
+    end on one moves STATIC_EDGE_S before the screen's start -- or, with a word running into
+    the screen, to min(the word's end, the screen's start): pass voice-clamped words
+    (`render.voiced_words`), a DTW-held end is not voice. Logs."""
     out = pick
     for lo, hi in static_runs(signals, words):
         if lo - 1e-6 <= out.start < hi:
@@ -546,8 +557,8 @@ def avoid_static(pick: ClipPick, words: list[Word], signals: Signals) -> ClipPic
         if lo < out.end <= hi + 1e-6 and lo > out.start:
             end = lo - STATIC_EDGE_S
             for w in words:
-                if w.start < lo < w.end:
-                    end = w.end
+                if w.start < lo - STATIC_EDGE_S < w.end:
+                    end = min(w.end, lo)
             log.info(
                 "clip %r: ends on a static screen %.2f-%.2fs; end %.2f -> %.2f",
                 pick.title, lo, hi, out.end, end,
@@ -556,44 +567,77 @@ def avoid_static(pick: ClipPick, words: list[Word], signals: Signals) -> ClipPic
     return out
 
 
+def _voiceless_keep(
+    a: float, b: float, scares: list[float]
+) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+    """(the scare windows, the kept build-up spans) of the voiceless stretch [a, b]."""
+    windows = _merge(
+        [
+            (max(t - VOICELESS_SCARE_PRE_S, a), min(t + VOICELESS_SCARE_POST_S, b))
+            for t in scares
+            if a < t <= b
+        ]
+    )
+    free, cur = [], a
+    for x, y in windows:
+        if x > cur:
+            free.append((cur, x))
+        cur = max(cur, y)
+    if b > cur:
+        free.append((cur, b))
+    kept: list[tuple[float, float]] = []
+    budget = VOICELESS_CAP_S
+    if free and free[0][0] == a:  # a moment after the last word
+        lead = min(VOICELESS_LEAD_S, free[0][1] - a)
+        kept.append((a, a + lead))
+        budget -= lead
+    for i, (x, y) in enumerate(reversed(free)):  # build-ups, the next speech's first
+        floor = kept[0][1] if kept and kept[0][0] == x else x
+        take = min(y - floor, budget, VOICELESS_KEEP_S if i == 0 else budget)
+        if take > 0:
+            kept.append((y - take, y))
+            budget -= take
+    return windows, _merge(kept)
+
+
 def voiceless_gaps(
     pick: ClipPick, words: list[Word], signals: Signals, quiet: bool = False
 ) -> list[tuple[float, float]]:
     """Voiceless stretches inside the clip to cut (source s): between two of its words (or
-    from its last word to the last scare before its end), split at every scare
-    (`scare_times`; a scare is never cut), each piece longer than VOICELESS_MAX_S keeps
-    VOICELESS_LEAD_S after the word before it (SCARE_HOLD_S after a scare) and
-    VOICELESS_KEEP_S before the next speech or scare -- the build-up. Voice is the
-    transcript's words: a game bed is not voice. Logs each (unless `quiet`)."""
+    from its last word to the last scare before its end) longer than VOICELESS_MAX_S, each
+    scare's window kept (`scare_times`; a scare is never cut) and at most VOICELESS_CAP_S of
+    the rest (VOICELESS_LEAD_S after the word, VOICELESS_KEEP_S before the next speech, the
+    remainder before the scares: the build-up). Voice is `words` as given: pass them
+    voice-clamped (`render.voiced_words`, the captions' measure), a game bed is not voice.
+    Logs each (unless `quiet`)."""
     spoken = _spoken(pick, words)
     if not spoken:
         return []
     scares = scare_times(signals)
-
-    def said(w: Word) -> float:  # a held word (DTW ran it over the pause) counts this long
-        return min(w.end, w.start + VOICELESS_WORD_S)
-
-    stretches = [(said(w), nxt.start) for w, nxt in pairwise(spoken)]
-    last = max(said(w) for w in spoken)
+    stretches = [(w.end, nxt.start) for w, nxt in pairwise(spoken)]
+    last = max(w.end for w in spoken)
     tail = [t for t in scares if last < t < pick.end]
     if tail:
         stretches.append((last, tail[-1]))
     out = []
     for a, b in stretches:
-        points = [a, *(t for t in scares if a < t < b), b]
-        for i, (x, y) in enumerate(pairwise(points)):
-            if y - x <= VOICELESS_MAX_S:
-                continue
-            lead = VOICELESS_LEAD_S if i == 0 else SCARE_HOLD_S
-            gap = (round(x + lead, 3), round(y - VOICELESS_KEEP_S, 3))
-            if gap[1] - gap[0] < STATIC_MIN_GAP_S:
-                continue
-            out.append(gap)
-            if not quiet:
-                log.info(
-                    "clip %r: voiceless %.1f-%.1fs (no speech); cut to %.1f s before the %s",
-                    pick.title, x, y, VOICELESS_KEEP_S, "scare" if y in scares else "speech",
-                )  # fmt: skip
+        if b - a <= VOICELESS_MAX_S:
+            continue
+        windows, kept = _voiceless_keep(a, b, scares)
+        held = _merge([*windows, *kept])
+        cur, cuts = a, []
+        for x, y in held:
+            if x - cur >= STATIC_MIN_GAP_S:
+                cuts.append((round(cur, 3), round(x, 3)))
+            cur = max(cur, y)
+        if b - cur >= STATIC_MIN_GAP_S:
+            cuts.append((round(cur, 3), round(b, 3)))
+        out += cuts
+        if cuts and not quiet:
+            log.info(
+                "clip %r: voiceless %.1f-%.1fs (no speech); %.1f s cut, %d scare(s) kept",
+                pick.title, a, b, sum(y - x for x, y in cuts), len(windows),
+            )  # fmt: skip
     return out
 
 
@@ -615,6 +659,15 @@ def edit_gaps(
     )
 
 
+def _off_words(target: float, words: list[Word], screen: float | None, earlier: bool) -> float:
+    """`target` moved out of a word it splits: to the word's end (`earlier`: its start), or its
+    start when its end runs into the `screen`."""
+    for w in words:
+        if w.start < target < w.end:
+            return w.start if earlier or (screen is not None and w.end > screen) else w.end
+    return target
+
+
 def extend_payoff(
     pick: ClipPick,
     words: list[Word],
@@ -625,12 +678,21 @@ def extend_payoff(
     """A clip ending just before its payoff: the first scare (`scare_times`) within
     PAYOFF_SCARE_S after its end, with no static screen between, moves the end to
     PAYOFF_REACT_S after the scare -- or to the end of the sentence said in that time (at
-    most PAYOFF_SAID_MAX_S after the scare) -- but never into a static screen. Shortened to
-    fit `max_s` (counted without `edit_gaps`); not made when even PAYOFF_MIN_S after the
-    scare does not fit. Logs."""
+    most PAYOFF_SAID_MAX_S after the scare) -- but never into a static screen nor mid-word.
+    Not made when the clip already ends on a sentence end (its punchline) and the scare is
+    more than PAYOFF_PUNCHLINE_S after the end. Shortened in 0.5 s steps (each moved off a
+    word, earlier) to fit `max_s` (counted without `edit_gaps`); not made when even
+    PAYOFF_MIN_S after the scare does not fit. Logs."""
     scares = scare_times(signals)
     scare = next((t for t in scares if pick.end < t <= pick.end + PAYOFF_SCARE_S), None)
     if scare is None:
+        return pick
+    spoken = _spoken(pick, words)
+    if spoken and _ends_sentence(spoken[-1]) and scare - pick.end > PAYOFF_PUNCHLINE_S:
+        log.info(
+            "clip %r: ends on a sentence end; payoff scare at %.2fs (%.1f s on) not added",
+            pick.title, scare, scare - pick.end,
+        )  # fmt: skip
         return pick
     runs = static_runs(signals, words)
     if any(pick.end < lo < scare for lo, _ in runs):
@@ -644,10 +706,7 @@ def extend_payoff(
     screen = min((lo for lo, _ in runs if lo >= scare), default=None)
     if screen is not None:
         target = min(target, screen - STATIC_EDGE_S)
-    for w in words:  # never end mid-word
-        if w.start < target < w.end:
-            target = w.end if screen is None or w.end <= screen else w.start
-    target = round(target, 3)
+    target = round(_off_words(target, words, screen, earlier=False), 3)
     while target - scare >= PAYOFF_MIN_S - 1e-6:
         out = pick.model_copy(update={"end": target})
         if _length(out, words, signals, quiet_db) <= max_s + 1e-6:
@@ -656,7 +715,7 @@ def extend_payoff(
                 pick.title, scare, pick.end, target,
             )  # fmt: skip
             return out
-        target = round(target - 0.5, 3)
+        target = round(_off_words(target - 0.5, words, screen, earlier=True), 3)
     log.info(
         "clip %r: payoff scare at %.2fs after the end does not fit %.0fs; not extended",
         pick.title, scare, max_s,

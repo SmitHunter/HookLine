@@ -238,3 +238,44 @@ def digital_zero_runs(path: Path, min_s: float = 0.2) -> list[tuple[float, float
         for a, b in zip(edges[::2], edges[1::2], strict=True)
         if b - a >= need
     ]
+
+
+# Q-seam (wave H): short-term level frames of SEAM_FRAME_S within SEAM_WINDOW_S of a seam,
+# floored SEAM_FLOOR_DB under the window's loudest frame
+SEAM_FRAME_S = 0.005
+SEAM_WINDOW_S = 0.03
+SEAM_FLOOR_DB = 24.0
+
+
+def seam_jump_db(pcm: np.ndarray, rate: int, seam: float) -> float:
+    """The largest rise (dB) between consecutive SEAM_FRAME_S RMS frames within SEAM_WINDOW_S
+    of `seam`, levels floored SEAM_FLOOR_DB under the window's loudest frame."""
+    n = max(1, round(SEAM_FRAME_S * rate))
+    lo = max(0, round((seam - SEAM_WINDOW_S) * rate))
+    hi = min(len(pcm), round((seam + SEAM_WINDOW_S) * rate))
+    x = pcm[lo:hi]
+    m = len(x) // n
+    if m < 2:
+        return 0.0
+    rms = np.sqrt((x[: m * n].reshape(m, n) ** 2).mean(axis=1))
+    db = 20 * np.log10(np.maximum(rms, 1e-6))
+    db = np.maximum(db, db.max() - SEAM_FLOOR_DB)
+    return float(np.diff(db).max())
+
+
+def pcm_span(wav: Path, start: float, end: float, rate: int = ENVELOPE_RATE) -> np.ndarray:
+    """Mono float samples (-1..1) of `wav` over [start, end] at `rate`; empty when ffmpeg
+    cannot read it."""
+    start = max(start, 0.0)
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-ss", f"{start:.3f}", "-to", f"{end:.3f}", "-i", str(wav),
+        "-ac", "1", "-ar", str(rate), "-f", "s16le", "-",
+    ]  # fmt: skip
+    try:
+        res = subprocess.run(cmd, check=False, capture_output=True)
+    except FileNotFoundError:
+        return np.zeros(0)
+    if res.returncode != 0:
+        return np.zeros(0)
+    return np.frombuffer(res.stdout, np.int16).astype(np.float64) / 32768.0

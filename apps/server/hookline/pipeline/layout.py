@@ -69,6 +69,10 @@ BEAT_LEAD = 0.3
 MAX_BEATS = 2
 BEAT_AFTER = 3.0
 BEAT_GAP = 2.0
+# ... a scare's span: [scare - SCARE_PRE_S, scare + SCARE_POST_S] (the payoff is the gameplay).
+# Wave H defines it here for the audit's Q-beat; the main tree's G-layout round 1 (beats placed
+# off scares / spikes) defines the same line here -- one definition after the merge.
+SCARE_PRE_S, SCARE_POST_S = 0.5, 1.0
 
 
 class SceneLayout(BaseModel):

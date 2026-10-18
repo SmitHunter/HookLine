@@ -21,9 +21,10 @@ CLIP_MARKER = "\u2702\ufe0fclip"
 SCARE_MARKER = "\u26a1scare"
 # signals.json format; a cached file below this version has its onsets recomputed (2: wave
 # G-select added motion, onsets and game-audio transients; 3: exact onset times, 0.3 s speech
-# pad; 4: wave H per-frame screen flags). The VOD motion decode is kept from any cache that has
-# it and the screen flags.
-SIGNALS_VERSION = 4
+# pad; 4: wave H per-frame screen flags; 5: wave H round 1 screen chroma, cam masked). The VOD
+# motion decode is kept from any cache that has it, the screen flags and their chroma for the
+# current cam mask (`pipeline.run._signals`).
+SIGNALS_VERSION = 5
 # Audio onsets (short-term loudness every 0.1 s, `media.audio.momentary_db`): a jump of
 # >= 10 dB within 0.5 s, landing >= 12 dB over the VOD's median level and over -35 dBFS.
 ONSET_JUMP_DB = 10.0
@@ -48,6 +49,11 @@ LOW_MOTION = 3.0  # per-second motion below this is a still frame (death screen,
 STATIC_MIN_S = 3.0
 STATIC_VOICED_MAX = 0.4
 STATIC_BRIDGE_FRAMES = 1
+# ... and (round 1) grey: the run's mean chroma (`Signals.screen_chroma`, the stream cam masked)
+# under STATIC_CHROMA_MAX. Measured on the horror stream, cam masked: death / loading / black
+# screens 0.03-0.08, dark gameplay (the GrabPack HUD at 1556.75-1560.25, pitch-black
+# corridors) 1.47-2.3. (Unmasked the cam adds ~1.5: death screens ~1.5 vs gameplay 3.0-3.7.)
+STATIC_CHROMA_MAX = 0.8
 
 
 class Signals(BaseModel):
@@ -68,6 +74,11 @@ class Signals(BaseModel):
     # version 4 (wave H): per second, a bitmask of its MOTION_FPS frames that are screen frames
     # (`media.motion.frame_stats`)
     screen: list[int] | None = None
+    # version 5 (wave H round 1): per second, the mean chroma (`media.motion.frame_chroma`) of
+    # its screen frames (None without any), over the frame outside `screen_mask` (normalized
+    # x0, y0, x1, y1 boxes: the stream profile's cam and labels; None = the whole frame)
+    screen_chroma: list[float | None] | None = None
+    screen_mask: list[list[float]] | None = None
 
 
 def onset_times(
@@ -153,25 +164,48 @@ def screen_flags(signals: Signals, fps: int = MOTION_FPS) -> np.ndarray:
     """Per frame (`fps` per second) of the VOD: a screen frame. Empty without screen data."""
     if not signals.screen:
         return np.zeros(0, bool)
-    return np.array([bool(m >> k & 1) for m in signals.screen for k in range(fps)], dtype=bool)
+    masks = np.asarray(signals.screen, dtype=np.int64)
+    return ((masks[:, None] >> np.arange(fps)) & 1).astype(bool).ravel()
 
 
-def _voiced_s(words: list, lo: float, hi: float) -> float:
-    spans = sorted((max(w.start, lo), min(w.end, hi)) for w in words if w.end > lo and w.start < hi)
+def _voiced_s(starts: np.ndarray, ends: np.ndarray, lo: float, hi: float) -> float:
+    """Seconds of [lo, hi] under at least one word span (overlaps counted once)."""
+    sel = (ends > lo) & (starts < hi)
     total, cur = 0.0, lo
-    for a, b in spans:
+    for a, b in sorted(zip(np.maximum(starts[sel], lo), np.minimum(ends[sel], hi), strict=True)):
         a = max(a, cur)
         if b > a:
             total += b - a
             cur = b
-    return total
+    return float(total)
+
+
+# static_runs per (screen flags, chroma, words list): computed once per job / clip, not for
+# every boundary candidate (a 10 h VOD has ~144k screen frames). Entries hold their inputs, so
+# an id is never reused while cached.
+_STATIC_CACHE: dict[tuple[int, int, int, int], tuple[object, ...]] = {}
+_STATIC_CACHE_MAX = 16
 
 
 def static_runs(signals: Signals, words: list, fps: int = MOTION_FPS) -> list[tuple[float, float]]:
     """Static screens (source s, frame-precise): runs of screen frames (`screen_flags`; gaps of
     up to STATIC_BRIDGE_FRAMES busy frames bridged) lasting at least STATIC_MIN_S, with
-    `words` (the transcript) covering at most STATIC_VOICED_MAX of the run. Empty without
-    screen data."""
+    `words` (the transcript; voice-clamped by the pipeline) covering at most
+    STATIC_VOICED_MAX of the run and, with `Signals.screen_chroma`, of mean chroma under
+    STATIC_CHROMA_MAX (dark gameplay is coloured). Empty without screen data. Cached per
+    (signals' screen data, `words` list): the caller must not mutate `words` in place."""
+    key = (id(signals.screen), id(signals.screen_chroma), id(words), fps)
+    hit = _STATIC_CACHE.get(key)
+    if hit is not None and hit[0] is signals.screen and hit[1] is signals.screen_chroma:
+        return list(hit[3])  # type: ignore[arg-type]
+    runs = _static_runs(signals, words, fps)
+    if len(_STATIC_CACHE) >= _STATIC_CACHE_MAX:
+        _STATIC_CACHE.pop(next(iter(_STATIC_CACHE)))
+    _STATIC_CACHE[key] = (signals.screen, signals.screen_chroma, words, runs)
+    return list(runs)
+
+
+def _static_runs(signals: Signals, words: list, fps: int) -> list[tuple[float, float]]:
     flags = screen_flags(signals, fps)
     idx = np.flatnonzero(flags)
     if not len(idx):
@@ -182,13 +216,20 @@ def static_runs(signals: Signals, words: list, fps: int = MOTION_FPS) -> list[tu
             runs[-1][1] = int(k)
         else:
             runs.append([int(k), int(k)])
+    starts = np.array([w.start for w in words], dtype=np.float64)
+    ends = np.array([w.end for w in words], dtype=np.float64)
+    chroma = signals.screen_chroma
     out = []
     for a, b in runs:
         lo, hi = a / fps, (b + 1) / fps
         if hi - lo < STATIC_MIN_S - 1e-6:
             continue
-        if _voiced_s(words, lo, hi) > STATIC_VOICED_MAX * (hi - lo):
+        if _voiced_s(starts, ends, lo, hi) > STATIC_VOICED_MAX * (hi - lo):
             continue
+        if chroma is not None:
+            seen = [c for c in chroma[a // fps : b // fps + 1] if c is not None]
+            if seen and sum(seen) / len(seen) >= STATIC_CHROMA_MAX:
+                continue
         out.append((round(lo, 3), round(hi, 3)))
     return out
 

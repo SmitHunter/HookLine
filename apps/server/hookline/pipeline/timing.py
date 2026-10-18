@@ -596,7 +596,9 @@ CAUSE_LOOKBACK_S = 0.6  # a sharp onset this close before a segment start is its
 CAUSE_JUMP_DB = 15.0  # ... a rise of this much over the quietest of the preceding ...
 CAUSE_PRIOR_S = 0.1  # ... this long, landing over ...
 CAUSE_FLOOR_DB = -35.0  # ... this level; the segment then starts ...
-CAUSE_LEAD_S = 0.02  # ... this long before it
+# ... this long before it: at least the seam's audio crossfade (`ffmpeg.SEAM_XFADE_S`, 40 ms),
+# so the bang's attack is past the fade-in, not at half gain (a step in Q-seam)
+CAUSE_LEAD_S = 0.05
 HELD_WORD_S = 0.8  # a word longer than this ends with its voice (+ HELD_TAIL_S) ...
 HELD_TAIL_S = 0.1
 HELD_BRIDGE_S = 0.15  # ... its voiced runs bridged over dips this short
@@ -629,8 +631,8 @@ def cause_onset(env: Envelope, start: float, words: Sequence[Word]) -> float | N
 
 def clamp_word_ends(words: list[Word], env: Envelope, threshold_db: float) -> list[Word]:
     """`words` with a held end (longer than HELD_WORD_S: a word DTW / refinement stretched over
-    a pause or a game bed) ending HELD_TAIL_S after its voice (its first voiced runs, dips
-    under HELD_BRIDGE_S bridged), at most HELD_WORD_S long when no voice is found: a caption
+    a pause or a game bed) ending HELD_TAIL_S after its voice (its first voiced runs, breaths
+    of up to HELD_BRIDGE_S joined), at most HELD_WORD_S long when no voice is found: a caption
     never holds a word the speaker finished long ago. Ends only move earlier."""
     out = []
     for w in words:
@@ -641,8 +643,14 @@ def clamp_word_ends(words: list[Word], env: Envelope, threshold_db: float) -> li
         peak = float(env.db[i : max(j, i + 1)].max())
         thr = max(threshold_db, peak - HELD_DROP_DB)  # a game bed under the voice is not it
         runs = _voiced_runs(env, w.start, w.end, thr, bridge_s=HELD_BRIDGE_S)
-        runs = [r for r in runs if r[0] <= w.start + HELD_WORD_S]
-        end = w.start + HELD_WORD_S if not runs else runs[0][1] + HELD_TAIL_S
+        end = w.start + HELD_WORD_S
+        if runs and runs[0][0] <= w.start + HELD_WORD_S:
+            voice = runs[0][1]
+            for a, b in runs[1:]:  # a breath of up to HELD_BRIDGE_S keeps the word going
+                if a - voice > HELD_BRIDGE_S + 1e-6:
+                    break
+                voice = b
+            end = voice + HELD_TAIL_S
         end = min(w.end, max(end, w.start + HELD_MIN_S))
         out.append(w if end >= w.end else w.model_copy(update={"end": round(end, 3)}))
     return out
