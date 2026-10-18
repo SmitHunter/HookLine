@@ -509,6 +509,9 @@ VOICELESS_LEAD_S = 0.3
 VOICELESS_CAP_S = 4.0
 VOICELESS_SCARE_PRE_S = 0.5
 VOICELESS_SCARE_POST_S = 1.5
+# ... on gameplay (a stream with a facecam: `run_job`) the limit is VOICELESS_GAME_S, and the
+# kept build-up at most that long too; talk sources keep VOICELESS_MAX_S
+VOICELESS_GAME_S = 3.0
 # A scare this soon after a clip's end is its payoff (the clip ends just before it): the end
 # moves to PAYOFF_REACT_S after it, or to the end of a sentence said by then (at most
 # PAYOFF_SAID_MAX_S after it), never into a static screen. 8.5, not 8: measured from the
@@ -622,11 +625,12 @@ def _voiceless_keep(
     b: float,
     scares: list[float],
     screens: list[tuple[float, float]] | None = None,
+    cap: float = VOICELESS_CAP_S,
 ) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
     """(the scare windows, the kept build-up spans) of the voiceless stretch [a, b]. A scare
     inside a screen run (`signals.screen_runs`: a death / loading screen) has no window, and a
     window stops STATIC_EDGE_S into the next screen run: a jumpscare's death screen is not
-    held as its reaction."""
+    held as its reaction. At most `cap` s of build-up is kept."""
     screens = screens or []
 
     def window(t: float) -> tuple[float, float]:
@@ -646,7 +650,7 @@ def _voiceless_keep(
     if b > cur:
         free.append((cur, b))
     kept: list[tuple[float, float]] = []
-    budget = VOICELESS_CAP_S
+    budget = cap
     if free and free[0][0] == a:  # a moment after the last word
         lead = min(VOICELESS_LEAD_S, free[0][1] - a)
         kept.append((a, a + lead))
@@ -661,7 +665,11 @@ def _voiceless_keep(
 
 
 def voiceless_gaps(
-    pick: ClipPick, words: list[Word], signals: Signals, quiet: bool = False
+    pick: ClipPick,
+    words: list[Word],
+    signals: Signals,
+    quiet: bool = False,
+    limit: float = VOICELESS_MAX_S,
 ) -> list[tuple[float, float]]:
     """Voiceless stretches inside the clip to cut (source s): between two of its words (or
     from its last word to the last scare before its end) longer than VOICELESS_MAX_S, each
@@ -669,7 +677,8 @@ def voiceless_gaps(
     the rest (VOICELESS_LEAD_S after the word, VOICELESS_KEEP_S before the next speech, the
     remainder before the scares: the build-up). Voice is `words` as given: pass them
     voice-clamped (`render.voiced_words`, the captions' measure), a game bed is not voice.
-    Logs each (unless `quiet`)."""
+    Logs each (unless `quiet`). `limit` replaces VOICELESS_MAX_S (gameplay:
+    VOICELESS_GAME_S), the kept build-up then at most `limit` too."""
     spoken = _spoken(pick, words)
     if not spoken:
         return []
@@ -682,9 +691,9 @@ def voiceless_gaps(
         stretches.append((last, tail[-1]))
     out = []
     for a, b in stretches:
-        if b - a <= VOICELESS_MAX_S:
+        if b - a <= limit:
             continue
-        windows, kept = _voiceless_keep(a, b, scares, screens)
+        windows, kept = _voiceless_keep(a, b, scares, screens, cap=min(VOICELESS_CAP_S, limit))
         held = _merge([*windows, *kept])
         cur, cuts = a, []
         for x, y in held:
@@ -708,14 +717,15 @@ def edit_gaps(
     signals: Signals,
     quiet_db: float = QUIET_DB,
     quiet: bool = False,
+    voiceless_s: float = VOICELESS_MAX_S,
 ) -> list[tuple[float, float]]:
     """Every interior cut the signals ask for (source s, sorted, merged): `idle_gaps`,
-    `static_gaps` and `voiceless_gaps`."""
+    `static_gaps` and `voiceless_gaps` (stretches over `voiceless_s`)."""
     return _merge(
         [
             *idle_gaps(pick, words, signals, quiet_db, quiet=quiet),
             *static_gaps(pick, words, signals, quiet=quiet),
-            *voiceless_gaps(pick, words, signals, quiet=quiet),
+            *voiceless_gaps(pick, words, signals, quiet=quiet, limit=voiceless_s),
         ]
     )
 

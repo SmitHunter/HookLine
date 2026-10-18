@@ -707,7 +707,7 @@ def test_render_clip_sidecar_reports_uncaptioned_speech_snaps_and_face_samples(
     assert "snaps" in lay and "face_px" in lay and "gaps" not in lay
 
 
-def test_with_tail_ends_0_2_to_0_3_s_after_the_speech_even_before_the_old_end():
+def test_with_tail_ends_0_4_to_0_45_s_after_the_speech_even_before_the_old_end():
     # clip 02: the transcript's "action." ran 0.45 s on over silence, so the clip ended
     # 0.66 s after the voice; the end now follows the last voiced frame
     import numpy as np
@@ -720,7 +720,7 @@ def test_with_tail_ends_0_2_to_0_3_s_after_the_speech_even_before_the_old_end():
     env = Envelope(t0=0.0, hop=0.01, db=db)
     words = [Word(start=1.0, end=1.8, text="direct"), Word(start=1.8, end=2.9, text="action.")]
     ((_, end),) = _with_tail([(0.5, 3.0)], words, env, -32.0)
-    assert 2.2 + 0.2 - 0.011 <= end <= 2.2 + 0.3 + 1e-9
+    assert 2.2 + 0.4 - 0.011 <= end <= 2.2 + 0.45 + 1e-9
     # speech after the last word (uncaptioned) is never cut off
     db[240:260] = -15.0  # 2.4-2.6 s
     ((_, end2),) = _with_tail([(0.5, 3.0)], words[:1], Envelope(0.0, 0.01, db), -32.0)

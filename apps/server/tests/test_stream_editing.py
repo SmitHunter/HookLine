@@ -197,6 +197,19 @@ def test_voiceless_stretches_are_trimmed_keeping_the_build_up(caplog):
     assert voiceless_gaps(pick(0, 23), [*sentence(0, "a b"), *sentence(6, "c d")], sig()) == []
 
 
+def test_gameplay_voiceless_limit_is_3_s_talk_keeps_6_s():
+    from hookline.pipeline.boundaries import VOICELESS_GAME_S, edit_gaps, voiceless_gaps
+
+    words = [*sentence(0, "a b"), *sentence(6, "c d")]  # a ~5 s voiceless stretch
+    last = words[1].end
+    assert voiceless_gaps(pick(0, 9), words, sig()) == []  # talk: within 6 s
+    gaps = voiceless_gaps(pick(0, 9), words, sig(), limit=VOICELESS_GAME_S)
+    kept = (6 - last) - sum(b - a for a, b in gaps)
+    assert gaps and kept == pytest.approx(VOICELESS_GAME_S, abs=0.01)  # 0.3 s + 2.7 s build-up
+    assert gaps == [(pytest.approx(last + 0.3), pytest.approx(6 - 2.7))]
+    assert edit_gaps(pick(0, 9), words, sig(), voiceless_s=VOICELESS_GAME_S) == gaps
+
+
 def test_voiceless_stretch_takes_word_ends_as_given():
     # the caller passes voice-clamped words (`render.voiced_words`, the render's
     # caption clamp); no separate 1.5 s cap that would disagree with the audit

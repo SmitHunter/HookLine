@@ -223,6 +223,10 @@ SPLICE_FADE_S = 0.008  # audio fade out / in at every splice between segments
 SEAM_XFADE_S = 0.04  # the cold-open seam's audio crossfade (`cut_segments(crossfade_at=)`)
 
 
+def _fade(fades: list[float] | None, join: int) -> float:
+    return fades[join] if fades is not None and join < len(fades) else SPLICE_FADE_S
+
+
 def cut_segments(
     src: Path,
     segments: list[tuple[float, float]],
@@ -231,6 +235,7 @@ def cut_segments(
     quality: list[str] | None = None,
     fps: float | None = None,
     crossfade_at: int | None = None,
+    splice_fades: list[float] | None = None,
 ) -> Path:
     """Concatenate `segments` of `src` into `dst` (an intermediate: use `.mkv`, audio is
     uncompressed `pcm_s16le` so the final encode is the only lossy audio step). `quality`, when given, replaces the
@@ -240,7 +245,8 @@ def cut_segments(
     timeline is exactly the sum of the segments when their bounds lie on the source frame
     grid: video takes the frames whose timestamps fall in [start, end) (bounds shifted half a
     frame to absorb rounding), audio is sample-trimmed to the same span and fades out / in over
-    SPLICE_FADE_S at every join (lengths unchanged: the video stays frame-exact).
+    SPLICE_FADE_S at every join (lengths unchanged: the video stays frame-exact), or over
+    `splice_fades[i]` at the join after segment i when given (longer on loud audio).
 
     `crossfade_at` (the cold-open seam) is the index of the segment whose join with
     the next one is an SEAM_XFADE_S audio crossfade instead: that segment's audio runs on
@@ -263,11 +269,12 @@ def cut_segments(
         # crossfaded join: none, acrossfade ramps both sides)
         fades, a_end = "", b
         if i > 0 and i - 1 != xf:
-            fades += f",afade=t=in:st=0:d={SPLICE_FADE_S:g}"
+            fades += f",afade=t=in:st=0:d={_fade(splice_fades, i - 1):g}"
         if i == xf:
             a_end = b + SEAM_XFADE_S
         elif i + 1 < n:
-            fades += f",afade=t=out:st={max(b - a - SPLICE_FADE_S, 0.0):.6f}:d={SPLICE_FADE_S:g}"
+            d = _fade(splice_fades, i)
+            fades += f",afade=t=out:st={max(b - a - d, 0.0):.6f}:d={d:g}"
         parts.append(
             f"[{i}:v]trim=start={max(a - half, 0):.6f}:end={b - half:.6f},"
             f"setpts=PTS-STARTPTS[v{i}]"

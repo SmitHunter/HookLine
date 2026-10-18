@@ -101,6 +101,29 @@ BEAT_HEAD_PAD = 1.1
 BEAT_HEAD_MIN = 0
 BEAT_HEAD_TOP = 40  # ... and a head taller than BEAT_CHIN_Y less this is shown smaller
 BEAT_VIGNETTE = "vignette=angle=0.35"
+# ... a cam big enough fills the whole 9:16 frame instead (`full_cam_fill`: a head-centred
+# 9:16 window within MAX_UPSCALE, the head whole, chin and head top as above); a smaller one
+# shows its picture pinned to the top with the gameplay panel in the band under it (a cover
+# over a static screen: a black band -- the screen is not shown), never a blurred cam copy
+# Near-black gameplay panels get a gamma lift (`lift_gamma`): none from LIFT_BELOW mean luma
+# (Y, 16-235) up, the full LIFT_MAX at LIFT_FULL and below; black and white kept (`lift_lut`),
+# smoothed over LIFT_SMOOTH_S and changing at most LIFT_RATE gamma per second, instant at cuts
+# (`lift_keyframes`), from LIFT_FPS luma samples
+LIFT_BELOW = 35.0
+LIFT_FULL = 20.0
+LIFT_MAX = 1.45
+LIFT_SMOOTH_S = 2.0
+LIFT_RATE = 0.3
+LIFT_FPS = 2
+_LIFT_BLACK = 16 / 255
+# The opening of a FACE_TRACK clip (the first OPEN_CHECK_S): punched in only when the head --
+# the face box plus OPEN_HEAD_BACK face widths behind a turned face (hair, ear), OPEN_HEAD_FRONT
+# in front of it, OPEN_HEAD_SIDE each side of a face looking ahead -- stays inside the crop;
+# else it opens at base (`guard_zoom`)
+OPEN_CHECK_S = 0.5
+OPEN_HEAD_BACK = 0.6
+OPEN_HEAD_FRONT = 0.1
+OPEN_HEAD_SIDE = 0.3
 PATCH_BLUR = "gblur=sigma=16"  # an overlay inside the gameplay panel, blurred over
 # A template STACKED cam whose headroom caps its top zoom under STACK_PUNCH_MIN (an invisible
 # 1.02-1.035) zooms the gameplay panel instead, about its centre: levels up to ZOOM_TOP, the
@@ -955,7 +978,38 @@ def guard_zoom(
             continue
         held, shifts = _guard_scene(lay, in_w, in_h, held, cut_times)
         out.append(lay.model_copy(update={"shift_steps": shifts}))
-    return held, out
+    return _open_framed(out, in_w, in_h, held), out
+
+
+def _open_framed(
+    layouts: Sequence[SceneLayout], in_w: int, in_h: int, steps: list[tuple[float, float]]
+) -> list[tuple[float, float]]:
+    """`steps` opening at base instead of punched in when, in the first OPEN_CHECK_S of an
+    opening FACE_TRACK scene, the head (the face box widened by OPEN_HEAD_BACK face widths
+    behind a turned face -- the gaze lead's sign -- OPEN_HEAD_FRONT in front of it, or
+    OPEN_HEAD_SIDE each side of a face looking ahead) would leave the crop at the opening
+    zoom: the guard's margin is for the face box, which leaves out the back of the head."""
+    lay = next((x for x in layouts if x.start <= 1e-6), None)
+    if lay is None or _kind(lay) != "FACE_TRACK" or not lay.track_x or not steps:
+        return steps
+    if _level_at(steps, 0.0) <= 1.0:
+        return steps
+    fit = _SceneFit(lay, in_w, in_h, steps)
+    sides = {1: (OPEN_HEAD_BACK, OPEN_HEAD_FRONT), -1: (OPEN_HEAD_FRONT, OPEN_HEAD_BACK)}
+    left, right = sides.get(
+        int(math.copysign(1, lay.lead)) if lay.lead else 0, (OPEN_HEAD_SIDE,) * 2
+    )
+    lo_c, hi_c = fit.frame
+    for i, t in enumerate(fit.ts):
+        if t > OPEN_CHECK_S + 1e-9:
+            break
+        half = fit.cw / in_w / fit.zoom(t) / 2
+        c = min(max(fit.plan[i][1], lo_c), hi_c)
+        x, w = fit.xs[i], fit.ws[i]
+        if x - w / 2 - left * w < c - half - 1e-9 or x + w / 2 + right * w > c + half + 1e-9:
+            log.info("opening punch would cut the head at %.2f s; the clip opens at base", t)
+            return _dedupe([(0.0, 1.0), *(st for st in steps if st[0] > 1e-9)])
+    return steps
 
 
 class _SceneFit:
@@ -1659,9 +1713,11 @@ def full_cam_geometry(
     BEAT_ASPECT (1080x1350; a wide cam is cropped round the head, not shrunk into bands), as
     tall as the cam for a wider cam, as wide as it for a narrower one, never cutting the head
     (a head taller than the window: the window grows to hold it); shown 1080 wide (at most
-    the frame tall), centred, raised so the chin (the head box's bottom) lands at
+    the frame tall), centred across, pinned to the top (the band under it shows the gameplay
+    or, over a static screen, black) and raised so the chin (the head box's bottom) lands at
     BEAT_CHIN_Y at most -- the caption goes under the chin -- but never above the head top's
-    BEAT_HEAD_MIN."""
+    BEAT_HEAD_MIN; the top an even row. `full_cam_fill` tells when the cam fills the frame
+    instead."""
     assert layout.cam_rect is not None
     cw, ch, cx, cy = _box_px(layout.cam_rect, in_w, in_h)
     if layout.head_box is not None:
@@ -1687,12 +1743,49 @@ def full_cam_geometry(
     if head_px > BEAT_CHIN_Y - BEAT_HEAD_TOP:  # a head filling the window: shown smaller
         f = (BEAT_CHIN_Y - BEAT_HEAD_TOP) / head_px
         pw, ph = _even(pw * f), _even(ph * f)
-    top = (OUT_H - ph) / 2
+    top = 0.0
     if layout.head_box is not None:
         chin = (hy1 - wy) / wh * ph
         head_top = (hy0 - wy) / wh * ph
         top = max(min(top, BEAT_CHIN_Y - chin), BEAT_HEAD_MIN - head_top)
-    return (ww, wh, wx, wy), (pw, ph), float(int(top))
+    return (ww, wh, wx, wy), (pw, ph), float(math.ceil(top / 2) * 2)
+
+
+def full_cam_fill(layout: SceneLayout, in_w: int, in_h: int) -> tuple[int, int, int, int] | None:
+    """The cam window (an even crop (w, h, x, y) inside `cam_rect`) that fills the whole 9:16
+    frame in a full-cam framing: the tallest 9:16 window in the cam, upscaled at most
+    MAX_UPSCALE, the head whole across it with BEAT_HEAD_PAD round it, placed (head-centred,
+    inside the cam) so the chin lands at BEAT_CHIN_Y at most and the head top at BEAT_HEAD_MIN
+    at least. None when the cam is too small for that (the picture then shows pinned to the
+    top: `full_cam_geometry`) or there is no head box."""
+    if layout.cam_rect is None or layout.head_box is None:
+        return None
+    cw, ch, cx, cy = _box_px(layout.cam_rect, in_w, in_h)
+    wh = min(ch, _even(cw * OUT_H / OUT_W))
+    ww = min(_even(wh * OUT_W / OUT_H), cw)
+    if wh <= 0 or OUT_H / wh > MAX_UPSCALE + 1e-9:
+        return None
+    bx, by, bw, bh = layout.head_box
+    hx0, hy0, hx1, hy1 = bx * in_w, by * in_h, (bx + bw) * in_w, (by + bh) * in_h
+    if (hx1 - hx0) * BEAT_HEAD_PAD > ww:
+        return None
+    wx = min(max(round((hx0 + hx1) / 2 - ww / 2), cx), cx + cw - ww)
+    lo = max(hy1 - BEAT_CHIN_Y / OUT_H * wh, cy)  # the chin at BEAT_CHIN_Y at most
+    hi = min(hy0 - BEAT_HEAD_MIN / OUT_H * wh, cy + ch - wh)  # the head top on screen
+    if lo > hi + 1e-9 or wx > hx0 or hx1 > wx + ww:
+        return None
+    wy = min(max(round((hy0 + hy1) / 2 - wh / 2), math.ceil(lo)), math.floor(hi))
+    return ww, wh, wx, wy
+
+
+def _full_frame(
+    layout: SceneLayout, in_w: int, in_h: int
+) -> tuple[tuple[int, int, int, int], tuple[int, int], float, bool]:
+    """A full-cam framing as rendered: (cam window, picture size, top y, fills the frame)."""
+    fill = full_cam_fill(layout, in_w, in_h)
+    if fill is not None:
+        return fill, (OUT_W, OUT_H), 0.0, True
+    return (*full_cam_geometry(layout, in_w, in_h), False)
 
 
 def _track_w(in_w: int, in_h: int) -> int:
@@ -1814,13 +1907,16 @@ def _template_filter(
 ) -> str:
     """A stream profile's fixed STACKED template: the cam panel (the cam window, zoomed about
     its anchor row), over the gameplay panel (its source box with the overlay `patches` in it
-    blurred; `game_fit`: shown whole over a blurred fill), and during `cam_beats` the whole
-    cam full-width over its own blurred fill (`full_cam_geometry`)."""
+    blurred; `game_fit`: shown whole over a blurred fill; a near-black one lifted:
+    `game_lift`), and during `cam_beats` and `cam_covers` the full cam (`_full_frame`): filling
+    the frame, or its picture pinned to the top over the gameplay panel's middle (a beat) or
+    black (a cover: the static screen is not shown)."""
     o = label_out
-    beats = layout.cam_beats
+    beats, covers = layout.cam_beats, layout.cam_covers
+    full = bool(beats or covers)
     cw, ch, cx, cy = _cam_crop(layout, in_w, in_h)
     gw, gh, gx, gy = _box_px(layout.game_box, in_w, in_h)  # type: ignore[arg-type]
-    parts = [f"[{label_in}]split={3 if beats else 2}[{o}_a][{o}_b]" + (f"[{o}_c]" if beats else "")]
+    parts = [f"[{label_in}]split={3 if full else 2}[{o}_a][{o}_b]" + (f"[{o}_c]" if full else "")]
     cam_up = max(OUT_W / cw, STACK_CAM_H / ch)
     game = layout.zoom_panel == "game"  # the steps zoom the gameplay panel, not the cam
     ay = layout.anchor_px(STACK_CAM_H)
@@ -1833,7 +1929,7 @@ def _template_filter(
         f"[{o}_a]crop={cw}:{ch}:{cx}:{cy},{_fill(OUT_W, STACK_CAM_H, flags)}"
         f"{cam_zoom}{_sharpen(cam_up)}[{o}_cam]"
     )
-    chain, cur = f"[{o}_b]crop={gw}:{gh}:{gx}:{gy}", f"{o}_g0"
+    chain, cur = f"[{o}_b]crop={gw}:{gh}:{gx}:{gy}{_lift_filter(layout)}", f"{o}_g0"
     parts.append(f"{chain}[{cur}]")
     for k, patch in enumerate(layout.patches):
         pw, ph, px, py = _box_px(patch, in_w, in_h)
@@ -1859,25 +1955,135 @@ def _template_filter(
         parts.append(
             f"[{cur}]scale={OUT_W}:{STACK_GAME_H}{flags}{game_zoom}{_sharpen(OUT_W / gw)}[{o}_game]"
         )
-    if not beats:
+    if not full:
         parts.append(f"[{o}_cam][{o}_game]vstack,setsar=1[{o}]")
         return ";".join(parts)
-    parts.append(f"[{o}_cam][{o}_game]vstack[{o}_st]")
-    rw, rh, rx, ry = _box_px(layout.cam_rect, in_w, in_h)  # type: ignore[arg-type]
-    (ww, wh, wx, wy), (pw, ph), top = full_cam_geometry(layout, in_w, in_h)
-    when = "+".join(
-        f"between(t\\,{_fmt(a - layout.start)}\\,{_fmt(b - layout.start)})" for a, b in beats
+    (ww, wh, wx, wy), (pw, ph), top, fills = _full_frame(layout, in_w, in_h)
+    band = beats and not fills  # the gameplay panel's middle under a beat's cam picture
+    game = f"{o}_game"
+    if band:
+        parts.append(f"[{o}_game]split=2[{o}_gs][{o}_gb]")
+        game = f"{o}_gs"
+    parts.append(f"[{o}_cam][{game}]vstack[{o}_st]")
+
+    def when(spans: list[tuple[float, float]]) -> str:
+        return "+".join(
+            f"between(t\\,{_fmt(a - layout.start)}\\,{_fmt(b - layout.start)})" for a, b in spans
+        )
+
+    pic = (
+        f"[{o}_c]crop={ww}:{wh}:{wx}:{wy},scale={pw}:{ph}{LANCZOS}"
+        f"{_sharpen(pw / ww)},{BEAT_VIGNETTE}"
     )
-    # the whole cam blurred as the edge fill, the head-centred window large over it
-    parts.append(
-        f"[{o}_c]crop={rw}:{rh}:{rx}:{ry},split=2[{o}_cb][{o}_cf];"
-        f"[{o}_cb]{_fill(OUT_W, OUT_H)},{BLUR}[{o}_cbo];"
-        f"[{o}_cf]crop={ww}:{wh}:{wx - rx}:{wy - ry},scale={pw}:{ph}{LANCZOS}"
-        f"{_sharpen(pw / ww)},{BEAT_VIGNETTE}[{o}_cfo];"
-        f"[{o}_cbo][{o}_cfo]overlay=(W-w)/2:{int(top)}[{o}_full];"
-        f"[{o}_st][{o}_full]overlay=0:0:enable='{when}',setsar=1[{o}]"
-    )
+    if fills:  # one framing for beats and covers alike
+        parts.append(
+            f"{pic}[{o}_full];[{o}_st][{o}_full]overlay=0:0:enable='{when([*beats, *covers])}',"
+            f"setsar=1[{o}]"
+        )
+        return ";".join(parts)
+    x0, y0 = (OUT_W - pw) // 2, int(top)
+    vw, vh = min(pw, OUT_W), min(ph + min(y0, 0), OUT_H - max(y0, 0))
+    shown = f"crop={vw}:{vh}:{max(-x0, 0)}:{max(-y0, 0)},pad={OUT_W}:{OUT_H}:{max(x0, 0)}:{max(y0, 0)}:black"
+    labels = [f"[{o}_pb]"] * bool(beats) + [f"[{o}_pc]"] * bool(covers)
+    parts.append(pic + (f",split=2{''.join(labels)}" if len(labels) == 2 else labels[0]))
+    cur = f"{o}_st"
+    if beats:
+        bh = max(min(OUT_H - (y0 + ph), STACK_GAME_H), 2) // 2 * 2
+        parts.append(
+            f"[{o}_gb]crop={OUT_W}:{bh}:0:{(STACK_GAME_H - bh) // 2},"
+            f"pad={OUT_W}:{OUT_H}:0:{OUT_H - bh}:black[{o}_bandc];"
+            f"[{o}_bandc][{o}_pb]overlay={x0}:{y0}[{o}_fb];"
+            f"[{cur}][{o}_fb]overlay=0:0:enable='{when(beats)}'[{o}_sb]"
+        )
+        cur = f"{o}_sb"
+    if covers:
+        parts.append(
+            f"[{o}_pc]{shown}[{o}_fc];[{cur}][{o}_fc]overlay=0:0:enable='{when(covers)}'[{o}_sc]"
+        )
+        cur = f"{o}_sc"
+    parts.append(f"[{cur}]setsar=1[{o}]")
     return ";".join(parts)
+
+
+def _lift_filter(layout: SceneLayout) -> str:
+    """The gameplay panel's gamma lift (`game_lift`, scene time): an eq whose brightness
+    offset keeps black at black (`lift_lut`); empty without a lift."""
+    pts = [(t - layout.start, g) for t, g in layout.game_lift]
+    if not pts or all(abs(g - 1.0) < 1e-3 for _, g in pts):
+        return ""
+    g = _pwl_expr(pts)
+    b = f"pow({_LIFT_BLACK:.6f},{g})-{_LIFT_BLACK:.6f}"
+    return f",eq=gamma='{_esc(g)}':brightness='{_esc(b)}':eval=frame"
+
+
+def _esc(expr: str) -> str:
+    return expr.replace(",", r"\,")
+
+
+def lift_gamma(luma: float) -> float:
+    """Gamma for a gameplay panel of mean luma `luma` (Y, 16-235): 1 from LIFT_BELOW up,
+    rising linearly to LIFT_MAX at LIFT_FULL and below."""
+    if luma >= LIFT_BELOW:
+        return 1.0
+    k = min((LIFT_BELOW - luma) / (LIFT_BELOW - LIFT_FULL), 1.0)
+    return round(1.0 + (LIFT_MAX - 1.0) * k, 4)
+
+
+def lift_lut(y: int, gamma: float) -> int:
+    """What the lift's eq (gamma `gamma`, brightness pow(B, gamma) - B, B = black 16/255)
+    makes of luma `y`: black stays black, white near white, the shadows rise."""
+    v = y / 255 + _LIFT_BLACK**gamma - _LIFT_BLACK
+    if v <= 0:
+        return 0
+    return min(int(256.0 * v ** (1.0 / gamma)), 255)
+
+
+def lift_keyframes(
+    times: Sequence[float], luma: Sequence[float], cuts: Sequence[float] = ()
+) -> list[tuple[float, float]]:
+    """(output s, gamma) keyframes of a gameplay panel's lift from its mean luma samples
+    (output s): per stretch between `cuts`, each sample's `lift_gamma`, a 3-sample median (a
+    lone bright or dark frame is no change), averaged over LIFT_SMOOTH_S and limited to
+    LIFT_RATE gamma per second both ways; the level jumps only at a cut. [] when nothing is
+    lifted."""
+    order = sorted(range(len(times)), key=lambda i: times[i])
+    ts = [float(times[i]) for i in order]
+    gs = [lift_gamma(float(luma[i])) for i in order]
+    if not ts or all(g == 1.0 for g in gs):
+        return []
+    bounds = sorted(c for c in cuts if ts[0] < c <= ts[-1])
+    pieces: list[tuple[float | None, list[int]]] = [(None, [])]
+    for i, t in enumerate(ts):
+        while bounds and t >= bounds[0] - 1e-9:
+            cut = bounds.pop(0)
+            if pieces[-1][1]:
+                pieces.append((cut, []))
+        pieces[-1][1].append(i)
+    pts: list[tuple[float, float]] = []
+    for cut, idx in pieces:
+        raw = [gs[i] for i in idx]
+        med = []
+        for j in range(len(raw)):
+            win = sorted(raw[max(j - 1, 0) : j + 2])
+            med.append(win[len(win) // 2])
+        sm = []
+        for i in idx:
+            near = [
+                med[k] for k, u in enumerate(idx) if abs(ts[u] - ts[i]) <= LIFT_SMOOTH_S / 2 + 1e-9
+            ]
+            sm.append(sum(near) / len(near))
+        for j in range(1, len(sm)):  # the rate limit, forward and back
+            dt = ts[idx[j]] - ts[idx[j - 1]]
+            sm[j] = min(max(sm[j], sm[j - 1] - LIFT_RATE * dt), sm[j - 1] + LIFT_RATE * dt)
+        for j in range(len(sm) - 2, -1, -1):
+            dt = ts[idx[j + 1]] - ts[idx[j]]
+            sm[j] = min(max(sm[j], sm[j + 1] - LIFT_RATE * dt), sm[j + 1] + LIFT_RATE * dt)
+        seg = [(round(ts[i], 3), round(g, 4)) for i, g in zip(idx, sm, strict=True)]
+        if pts and cut is not None:  # held up to the cut, the new level from it
+            pts += [(round(cut - 0.001, 3), pts[-1][1]), (round(cut, 3), seg[0][1])]
+            seg = [p for p in seg if p[0] > cut + 1e-9]
+        pts += seg
+    return _drop_collinear(pts, 0.002)
 
 
 def _shifted(
@@ -1988,7 +2194,7 @@ def stacked_face_px(
     """A template STACKED scene's head (`head_box`: top of the hair to the chin) as rendered,
     every SAMPLE_STEP s: [output t, x0, top, x1, bottom, None] in output px -- in the cam
     panel at the zoom in effect (eases counted, about the anchor row; clipped to the panel),
-    during a full-cam beat on the full-cam picture. Captions and Q4b keep off it (the whole
+    during a full-cam beat or cover on the full-cam picture. Captions and Q4b keep off it (the whole
     head, not just the eyes-to-mouth core: the cam panel is small). [] for other scenes."""
     if _kind(layout) != "STACKED" or layout.head_box is None or layout.facecam is None:
         return []
@@ -2004,15 +2210,16 @@ def stacked_face_px(
         zoom = zoom_at_fn(steps or [(0.0, 1.0)], layout)
     ay = layout.anchor_px(STACK_CAM_H)
     full = None
-    if layout.cam_beats and layout.cam_rect is not None:
-        full = full_cam_geometry(layout, in_w, in_h)
-        (ww, wh, wx, wy), (pw, ph), top = full
+    spans = [*layout.cam_beats, *layout.cam_covers]
+    if spans and layout.cam_rect is not None:
+        full = _full_frame(layout, in_w, in_h)
+        (ww, wh, wx, wy), (pw, ph), top, _ = full
         left = (OUT_W - pw) / 2
     out: list[list[float | None]] = []
     n = max(math.ceil((layout.end - layout.start) / SAMPLE_STEP - 1e-9), 1)
     for k in range(n + 1):
         t = min(layout.start + k * SAMPLE_STEP, layout.end)
-        if full is not None and any(a <= t < b for a, b in layout.cam_beats):
+        if full is not None and any(a <= t < b for a, b in spans):
             row = [
                 left + (hx * in_w - wx) / ww * pw, top + (hy * in_h - wy) / wh * ph,
                 left + ((hx + hw) * in_w - wx) / ww * pw, top + ((hy + hh) * in_h - wy) / wh * ph,

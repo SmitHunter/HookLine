@@ -100,6 +100,13 @@ BEAT_SHIFT_MAX = 1.5
 # ... a scare's span: [scare - SCARE_PRE_S, scare + SCARE_POST_S] (the payoff is the gameplay);
 # a startled reaction word gets the same (render.startle_times)
 SCARE_PRE_S, SCARE_POST_S = 0.5, 1.0
+# A talked-over static / death screen (`signals.screen_runs`) inside a clip is covered by the
+# full cam (the streamer's reaction) instead of shown: each screen span on the output timeline
+# at least COVER_MIN_S long, padded COVER_PAD_S each side, spans within COVER_JOIN_S joined
+# (and run on to a scene edge that close), inside a scene with the profile's cam (`cam_covers`)
+COVER_MIN_S = 1.0
+COVER_PAD_S = 0.1
+COVER_JOIN_S = 0.5
 
 
 class SceneLayout(BaseModel):
@@ -145,6 +152,11 @@ class SceneLayout(BaseModel):
     game_fit: bool = False
     patches: list[Box] = []
     cam_beats: list[tuple[float, float]] = []
+    # ... the full-cam covers over a static / death screen (output s; `plan_cam_covers`)
+    cam_covers: list[tuple[float, float]] = []
+    # Gamma lift of a near-black gameplay panel: (output s, gamma) keyframes, linear between,
+    # held before the first and after the last (`reframe.lift_keyframes`); [] = none
+    game_lift: list[tuple[float, float]] = []
     fit_src: Box | None = Field(default=None, exclude=True)  # the pillarbox picture found
     # Which panel the zoom steps zoom (`reframe.plan_zoom`): the speaker's (FACE_TRACK frame,
     # cam panel, SPLIT panels, FIT_BLUR picture) or, in a template STACKED scene whose cam has
@@ -737,12 +749,15 @@ def plan_cam_beats(
     other beats; clear of the `avoid` spans (the EARLIER tag, scares, gameplay spikes) and of
     [startle - SCARE_PRE_S, startle + SCARE_POST_S] round every startled reaction word
     (`startles`, output s) but the peak's own -- moved just past them, at most BEAT_SHIFT_MAX
-    after the peak; at most MAX_BEATS."""
+    after the peak; at most MAX_BEATS. A beat keeps BEAT_GAP clear of the full-cam covers
+    (`cam_covers`) as of other beats."""
+    covers = [c for lay in layouts for c in lay.cam_covers]
     chosen: list[tuple[int, float, float]] = []
     for t, _ in sorted(peaks, key=lambda p: -p[1]):
         if len(chosen) >= MAX_BEATS:
             break
         others = [(s - SCARE_PRE_S, s + SCARE_POST_S) for s in startles or [] if abs(s - t) > 1e-3]
+        others += [(p - BEAT_GAP, q + BEAT_GAP) for p, q in covers]  # the cam is up already
         spans = sorted([*((p, q) for p, q in avoid or []), *others])
         a = max(t - BEAT_LEAD, 0.0)
         while (hit := next((q for p, q in spans if a < q and a + BEAT_S > p), None)) is not None:
@@ -771,4 +786,43 @@ def plan_cam_beats(
     out = list(layouts)
     for i, a, b in chosen:
         out[i] = out[i].model_copy(update={"cam_beats": sorted([*out[i].cam_beats, (a, b)])})
+    return out
+
+
+def _joined(spans: list[tuple[float, float]], gap: float) -> list[tuple[float, float]]:
+    out: list[tuple[float, float]] = []
+    for a, b in sorted(spans):
+        if out and a <= out[-1][1] + gap:
+            out[-1] = (out[-1][0], max(out[-1][1], b))
+        else:
+            out.append((a, b))
+    return out
+
+
+def plan_cam_covers(
+    screens: list[tuple[float, float]], layouts: list[SceneLayout], duration: float
+) -> list[SceneLayout]:
+    """`layouts` with full-cam covers (`cam_covers`, output s) over the static / death
+    `screens` (output spans, split at cuts): spans within COVER_JOIN_S joined, each at least
+    COVER_MIN_S long, padded COVER_PAD_S each side, clipped to every template STACKED scene
+    (one with the profile's cam: `cam_rect`) it overlaps and run on to that scene's edge when
+    it ends within COVER_JOIN_S of it. Scenes without the cam keep the screen."""
+    spans = [(a, b) for a, b in _joined(screens, COVER_JOIN_S) if b - a >= COVER_MIN_S - 1e-9]
+    out = []
+    for lay in layouts:
+        mine = []
+        if lay.kind == "STACKED" and lay.cam_rect is not None:
+            for a, b in spans:
+                lo = max(a - COVER_PAD_S, lay.start, 0.0)
+                hi = min(b + COVER_PAD_S, lay.end, duration)
+                if hi <= lo:
+                    continue
+                if lo - lay.start < COVER_JOIN_S:
+                    lo = lay.start
+                if lay.end - hi < COVER_JOIN_S:
+                    hi = lay.end
+                mine.append((round(lo, 3), round(hi, 3)))
+        if mine:
+            lay = lay.model_copy(update={"cam_covers": _joined([*lay.cam_covers, *mine], 0.0)})
+        out.append(lay)
     return out

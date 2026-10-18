@@ -147,8 +147,8 @@ def test_stacked_face_px_head_in_the_cam_panel_and_in_beats():
         assert eye is None and 0 <= top < bottom <= STACK_CAM_H  # head inside the cam panel
         assert 0 <= x0 < x1 <= OUT_W
     assert beat
-    for _, x0, top, x1, bottom, _ in beat:  # the big full-cam head, its chin on BEAT_CHIN_Y
-        assert bottom == pytest.approx(BEAT_CHIN_Y, abs=2) and 0 <= top < STACK_CAM_H / 2
+    for _, x0, top, x1, bottom, _ in beat:  # the big full-cam head, the picture at the top
+        assert bottom <= BEAT_CHIN_Y + 2 and 0 <= top < STACK_CAM_H / 2
         assert x1 - x0 > 0.5 * OUT_W  # a large head
 
 
