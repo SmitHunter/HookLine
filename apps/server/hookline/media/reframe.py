@@ -41,19 +41,16 @@ MERGE_S = 0.1  # a crop pulse this close to a zoom step moves onto it: one frami
 FIT_SLACK = 0.98  # plan_zoom's face-fit cap stays this far inside the guard's limit
 FACE_CORE = 0.8  # share of the face box width kept inside the crop for unguarded close-ups
 KEYFRAME_TOL = 0.5  # px: track keyframes this close to the line through their neighbours go
-# Reframe snaps (fix wave F): the rendered crop never pans faster than MAX_PAN_PX source px/s
+# Reframe snaps: the rendered crop never pans faster than MAX_PAN_PX source px/s
 # at a PAN_REF_W-wide source (scaled with the width). A move that needs more becomes an
 # instant reframe (a framing cut) at the moment the face would leave the margin, moved back
-# to a word gap within SNAP_GAP_S when the new framing already fits there; it frames the face
-# for up to SNAP_LOOKAHEAD s ahead. SNAP_EPS is the expression's one-step ramp.
+# to a word gap within SNAP_GAP_S when the new framing already fits there. SNAP_EPS is the
+# expression's one-step ramp.
 MAX_PAN_PX = 150.0
 PAN_REF_W = 1920
 MAX_PAN = MAX_PAN_PX / PAN_REF_W  # share of the source width per second
 SNAP_GAP_S = 0.3
-SNAP_LOOKAHEAD = 1.0
 SNAP_EPS = 0.001
-SNAP_SETTLED = 0.01  # a face moving less than this over the lookahead has settled (centred)
-RESYNC = 0.25  # an off-plan crop rejoins the plan within this share of a sample's reach
 PAN_TOL = 2 * KEYFRAME_TOL / PAN_REF_W  # held / limited crops keep this inside the margin
 BLUR = "boxblur=20:2"
 MIN_SCENE = 1 / 30
@@ -92,7 +89,7 @@ STEP_SHIFT = 0.04
 _CAP_STEP = 0.005
 
 _CROP_SAMPLES = 15
-# Full-cam reaction beats (wave G-layout): the cam's chin lands at most here, so a caption fits
+# Full-cam reaction beats: the cam's chin lands at most here, so a caption fits
 # below it inside Q4 (caption line 1180 - 39 px visible above it - a 40 px face gap).
 BEAT_CHIN_Y = 1100
 # ... the beat shows a head-centred window of the cam at this aspect (1080x1350: a large
@@ -332,9 +329,10 @@ def box_to_crop(
     box: tuple[float, float, float, float],
     size: tuple[int, int],
     crop: tuple[int, int, int, int] | None,
-) -> tuple[float, float, float, float]:
+) -> tuple[float, float, float, float] | None:
     """A box (x, y, w, h as fractions of the full `size` frame) in `crop` space, clipped to it:
-    x' = (x * W - crop_x) / crop_w, and likewise for y, w, h."""
+    x' = (x * W - crop_x) / crop_w, and likewise for y, w, h. None when nothing of it is
+    inside the crop (a box drawn on the letterbox bars)."""
     if crop is None:
         return box
     cw, ch, cx, cy = crop
@@ -342,6 +340,8 @@ def box_to_crop(
     y0 = min(max((box[1] * size[1] - cy) / ch, 0.0), 1.0)
     x1 = min(max(((box[0] + box[2]) * size[0] - cx) / cw, 0.0), 1.0)
     y1 = min(max(((box[1] + box[3]) * size[1] - cy) / ch, 0.0), 1.0)
+    if x1 - x0 <= 0 or y1 - y0 <= 0:
+        return None
     return x0, y0, x1 - x0, y1 - y0
 
 
@@ -894,29 +894,6 @@ def scene_snaps(
     if _kind(layout) != "FACE_TRACK" or not layout.track_x:
         return []
     return [round(t + layout.start, 3) for t in track_snaps(**_track_kw(layout, in_w, in_h, steps))]
-
-
-def guarded_steps(
-    steps: Sequence[Sequence[float]], spans: Sequence[tuple[float, float]]
-) -> list[tuple[float, float]]:
-    """Zoom `steps` held at level 1.0 (the base) inside each span: a step to 1.0 at its start
-    and back to the schedule's level at its end; schedule steps inside it, and repeats of the
-    level just before, dropped."""
-    seq = [(float(st[0]), float(st[1])) for st in steps]
-    if not spans:
-        return seq
-
-    def level_at(t: float) -> float:
-        return max((st for st in seq if st[0] <= t + 1e-9), default=(0.0, 1.0))[1]
-
-    out = [st for st in seq if not any(a <= st[0] < b for a, b in spans)]
-    for a, b in spans:
-        out += [(a, 1.0), (b, level_at(b))]
-    merged: list[tuple[float, float]] = []
-    for t, v in sorted(out):
-        if not merged or v != merged[-1][1]:
-            merged.append((t, v))
-    return merged
 
 
 def zoom_at_fn(steps: Sequence[Sequence[float]], layout: SceneLayout) -> Callable[[float], float]:

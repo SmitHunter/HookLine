@@ -240,7 +240,7 @@ def digital_zero_runs(path: Path, min_s: float = 0.2) -> list[tuple[float, float
     ]
 
 
-# Q-seam (wave H): short-term level frames of SEAM_FRAME_S within SEAM_WINDOW_S of a seam,
+# Q-seam: short-term level frames of SEAM_FRAME_S within SEAM_WINDOW_S of a seam,
 # floored SEAM_FLOOR_DB under the window's loudest frame
 SEAM_FRAME_S = 0.005
 SEAM_WINDOW_S = 0.03

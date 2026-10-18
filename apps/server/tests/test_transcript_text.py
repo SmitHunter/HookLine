@@ -158,7 +158,7 @@ def test_selection_lines_cap_every_run_at_25s():
     assert selection_lines([]) == []
 
 
-# --- fix round 1: ellipses, abbreviations, lightly punctuated (Twitch) speech -------------
+# --- ellipses, abbreviations, lightly punctuated (Twitch) speech ----------------------------------
 
 
 def _texts(words):

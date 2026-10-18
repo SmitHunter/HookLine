@@ -99,7 +99,6 @@ def _render(video, tmp_path, sample_pick, settings, final_argvs):
 def _check_render(video, tmp_path, sample_pick, settings, final_argvs, expected_mode):
     dst, argvs = _render(video, tmp_path, sample_pick, settings, final_argvs)
     m = measure_loudness(dst)
-    print(f"{expected_mode}: I={m.i} TP={m.tp} LRA={m.lra}")
     assert m.i == pytest.approx(-14.0, abs=1.0)
     assert m.tp <= -1.0
     (final,) = argvs
@@ -112,7 +111,6 @@ def _check_render(video, tmp_path, sample_pick, settings, final_argvs, expected_
     af = final[final.index("-af") + 1]
     assert ("linear=true" in af) == (expected_mode == "linear")
     reported = parse_loudnorm_json(argvs.stderrs[0])["normalization_type"]
-    print(f"{expected_mode}: loudnorm reported normalization_type={reported}")
     assert reported == expected_mode
 
 
@@ -125,7 +123,7 @@ def test_low_crest_clip_is_linear_and_minus_14(
 def test_speech_like_clip_is_levelled_linear_and_minus_14(
     quiet_speech_video, sample_pick, settings, tmp_path, final_argvs
 ):
-    """Wave G-select: its 16 dB swings (LRA ~16) are levelled to <= 8 LU, so loudnorm goes
+    """Its 16 dB swings (LRA ~16) are levelled to <= 8 LU, so loudnorm goes
     linear (before the leveler it had to go dynamic)."""
     _check_render(quiet_speech_video, tmp_path, sample_pick, settings, final_argvs, "linear")
     m = measure_loudness(tmp_path / "out" / "01-x.mp4")
@@ -139,13 +137,11 @@ def test_high_crest_clip_lands_on_target(
     take several dB off the peaks, its output undershoots the target. The render must check
     what the chain actually produces and correct for it."""
     src = measure_loudness(high_crest_video)
-    print(f"source: I={src.i} TP={src.tp} crest={src.tp - src.i:.1f}")
     assert src.tp - src.i > 16  # the limiter must take > 4 dB off at -14 / -2 dBTP
     dst, _ = _render(high_crest_video, tmp_path, sample_pick, settings, final_argvs)
     m = measure_loudness(dst)
-    print(f"high crest -> I={m.i} TP={m.tp}")
-    # wave G-select: the whole clip may sit up to SPEECH_SWAY_DB off -14 so its speech lands
-    # on -14 (its "words" are the loud bursts here). Round 1: the firm rungs' 1.2 s release
+    # the whole clip may sit up to SPEECH_SWAY_DB off -14 so its speech lands
+    # on -14 (its "words" are the loud bursts here). The firm rungs' 1.2 s release
     # cannot level under full-scale clicks every 0.43 s, so this clip ends on the dynamic path
     # (no sway, but dynamic loudnorm's own range control lands ~0.5 dB under): +-1 kept
     assert m.i == pytest.approx(-14.0, abs=0.5 + SPEECH_SWAY_DB)
@@ -162,7 +158,6 @@ def test_near_silent_clip_not_boosted(
     dst, _ = _render(near_silent_video, tmp_path, sample_pick, settings, final_argvs)
     assert trims == []  # near-silent audio is skipped, so no true-peak check either
     m = measure_loudness(dst)
-    print(f"silent -> I={m.i} TP={m.tp}")
     assert m.i <= -40.0
 
 
@@ -214,7 +209,6 @@ def test_ensure_true_peak_trims_hot_file(steady_quiet_video, tmp_path):
     assert before.tp > -1.2
     trim = ensure_true_peak(hot)
     after = measure_loudness(hot)
-    print(f"trim {trim:.2f} dB: TP {before.tp} -> {after.tp}, I {before.i} -> {after.i}")
     assert trim < 0 and after.tp <= -1.0
     assert not hot.with_suffix(".trim.mp4").exists()
     streams = _run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_name",
@@ -260,7 +254,7 @@ def test_ensure_true_peak_runs_on_hot_measurement(steady_quiet_video, tmp_path, 
 def test_ensure_true_peak_acts_when_the_trim_still_overshoots(
     steady_quiet_video, tmp_path, monkeypatch
 ):
-    """Round 1: the volume-trim fallback is re-measured; a peak still over -1.2 dBTP after it
+    """The volume-trim fallback is re-measured; a peak still over -1.2 dBTP after it
     (AAC ringing again) gets a second trim instead of being left hot."""
     from hookline.media import loudness as loud_mod
 
@@ -272,7 +266,7 @@ def test_ensure_true_peak_acts_when_the_trim_still_overshoots(
     real = loud_mod._run
     monkeypatch.setattr(loud_mod, "_run", lambda cmd: (cmds.append(cmd), real(cmd))[1])
     trim = ensure_true_peak(copy)
-    # round 2: the whole correction re-applied to the original audio, not a trim of the trim
+    # the whole correction re-applied to the original audio, not a trim of the trim
     assert len(cmds) == 4 and "volume=-1.10dB" in cmds[2] and "volume=-1.60dB" in cmds[3]
     assert trim == pytest.approx(-1.6)
 
@@ -312,7 +306,7 @@ def test_render_without_audio_stream(
                  "stream=index", "-of", "csv=p=0", str(dst)]).stdout.strip() == ""  # fmt: skip
 
 
-# --- wave G-select: speech-gated loudness and a loudness range <= 8 LU -------------------------
+# --- speech-gated loudness and a loudness range <= 8 LU -------------------------------------------
 
 GAME_SPEECH = [(2.0 * k, 2.0 * k + 1.6) for k in range(15) if k not in (4, 10)]
 
@@ -349,7 +343,6 @@ def test_game_clip_fixture_has_voice_under_game(game_clip):
 
     whole = measure_loudness(game_clip)
     speech = measure_loudness(game_clip, speech_filter(GAME_SPEECH))
-    print(f"fixture: I={whole.i} LRA={whole.lra} speech I={speech.i}")
     assert whole.lra > 8 and whole.i - speech.i > 4
 
 
@@ -360,7 +353,6 @@ def test_speech_lands_near_the_target_and_the_range_is_compressed(game_clip, tmp
     out = _apply(game_clip, plan.af, tmp_path / "out.m4a")
     m = measure_loudness(out)
     s = measure_loudness(out, speech_filter(GAME_SPEECH))
-    print(f"speech-gated: I={m.i} TP={m.tp} LRA={m.lra} speech I={s.i} ({plan.mode})")
     assert MAX_LRA == 8.0
     assert m.i == pytest.approx(-14.0, abs=1.0) and m.tp <= -1.0
     assert m.lra <= 8.0
@@ -406,7 +398,7 @@ def test_render_passes_the_spoken_spans_to_the_loudness_plan(
     assert spans and all(b > a for a, b in spans) and spans[0][0] < 1.0
 
 
-# --- wave G-select round 1: leveler release/knee, ladder bookkeeping --------------------------
+# --- leveler release/knee, ladder bookkeeping -----------------------------------------------------
 
 
 def test_firm_leveler_rungs_release_slowly_with_a_soft_knee():
@@ -502,7 +494,7 @@ def test_dynamic_loudnorm_aims_the_whole_clip_at_the_target(monkeypatch, tmp_pat
 
 
 def test_ensure_true_peak_limits_a_lone_transient_without_losing_loudness(tmp_path):
-    """Wave G-layout: AAC rang 1.9 dB over the plan on one game transient (stream clip 01);
+    """AAC rang 1.9 dB over the plan on one game transient (stream clip 01);
     a whole-clip volume trim then cost Q1 (-15.1 LUFS). Only the peak is limited now."""
     dst = tmp_path / "click.mp4"
     _run(["ffmpeg", "-hide_banner", "-v", "error", "-y",
@@ -517,3 +509,39 @@ def test_ensure_true_peak_limits_a_lone_transient_without_losing_loudness(tmp_pa
     after = measure_loudness(dst)
     assert after.tp <= -1.0
     assert after.i == pytest.approx(before.i, abs=0.2)  # the loudness stays
+
+
+def test_non_finite_loudnorm_numbers_never_reach_the_plan():
+    """loudnorm prints "-inf" for silence and can print "nan" (an all-zero gated segment):
+    neither may leak into a filter string."""
+    import math
+
+    from hookline.media.loudness import _num
+
+    assert _num("-inf") == -70.0
+    assert math.isfinite(_num("nan")) and math.isfinite(_num("inf"))
+    assert _num("-23.5") == -23.5
+
+
+def test_plan_loudness_probes_the_audio_stream_once(quiet_speech_video, tmp_path, monkeypatch):
+    """The audio-stream probe is per file, not per loudnorm pass (a plan runs up to
+    MAX_DECODES passes)."""
+    import shutil
+
+    from hookline.media import ffmpeg as ffmpeg_mod
+    from hookline.media import loudness as loud_mod
+
+    clip = tmp_path / "clip.mp4"
+    shutil.copy(quiet_speech_video, clip)
+    probes = []
+    real = ffmpeg_mod._run
+
+    def counting(argv, *a, **k):
+        if argv[0] == "ffprobe":
+            probes.append(argv)
+        return real(argv, *a, **k)
+
+    monkeypatch.setattr(ffmpeg_mod, "_run", counting)
+    monkeypatch.setattr(loud_mod, "_run", counting)
+    plan = loud_mod.plan_loudness(clip, speech=[(0.5, 4.0), (5.0, 9.0)])
+    assert plan is not None and len(probes) == 1

@@ -502,7 +502,7 @@ def _first_start(pick: ClipPick) -> float:
 
 
 def _lead_ins(pick: ClipPick, env: Envelope, words: list[Word], fps: float) -> ClipPick:
-    """Wave H: after a cold open, the main span's start (the seam) moved back onto the cause
+    """After a cold open, the main span's start (the seam) moved back onto the cause
     of what follows (`timing.cause_onset`: a bang the cut would split -- a pop at the seam);
     the clip's first start `timing.pre_roll`ed when its speech begins on frame 0. Logs."""
     update: dict = {}
@@ -567,6 +567,11 @@ def _plan_vertical(
         log.info("facecam %s overlaps overlay bands %s; bands kept", cam, bands)
         crop, bands = letterbox, None
     override = box_to_crop(cam, size, crop) if cam is not None else None
+    if cam is not None and override is None:
+        log.warning(
+            "--facecam %s lies inside the letterbox bars, outside the picture; ignored", cam
+        )
+        cam = None
     layouts = plan_layouts(inter, detector, override, crop=crop)
     if bands and cam is None and any(_cam_on_cut(lay, bands) for lay in layouts):
         log.info("facecam touches the overlay crop edge; re-planned without bands %s", bands)
@@ -628,12 +633,12 @@ def render_clip(
     final video encoder (resolved by `pick_encoder()` when None; pass it to avoid re-probing).
     `idle_gaps` (source seconds, `boundaries.idle_gaps`) are cut like dead air.
 
-    `profile` (wave G-layout: the job's `profile.layout_profile`, computed once over the VOD)
+    `profile` (the job's `profile.layout_profile`, computed once over the VOD)
     gives the static black bars (no per-clip detection) and, for a stream with a facecam
     overlay (unless `settings.facecam` overrides), the fixed STACKED template for every scene,
     with up to two full-cam reaction beats at the streamer's reaction peaks (`scares`: the
     VOD's scare times, source s; beats stay clear of them and of the gameplay `spikes`,
-    source spans: `beat_avoid`); the sidecar's `layout_profile` records its cam. Wave H: the
+    source spans: `beat_avoid`); the sidecar's `layout_profile` records its cam. The
     sidecar records the same `scares` and `spikes` (`run.beat_spikes`) on the output timeline
     (`scare_times`, `beat_spikes`: the audit's Q-beat) and the source's own rise at the seam
     (`seam_source_db`: Q-seam)."""
@@ -660,10 +665,10 @@ def render_clip(
     refined = refine_boundaries(pick, near, silences, loud_seconds=loud_seconds)
     fps = probe_fps(src)
     unrolled = _first_start(refined)
-    refined = _lead_ins(refined, env, near, fps)  # wave H: cause sound, frame-0 pre-roll
+    refined = _lead_ins(refined, env, near, fps)  # cause sound, frame-0 pre-roll
     lead = unrolled - _first_start(refined)
-    # Frame-grid bounds make the cut timeline exact, so remapped caption times stay in sync.
-    # dead air trusts a refined word end only so far past the transcript's
+    # dead air keeps each word up to its refined end, trusted at most PROTECT_S past the
+    # transcript's end (`protected_words`)
     protected = protected_words(raw, near)
     untailed = keep_ranges(
         refined.segments(),
@@ -681,9 +686,10 @@ def render_clip(
         tailed = _with_tail(untailed, timed, env, voice_db)
         bounds = list(refined.cold_open) if refined.cold_open else []
         tailed, timed = snap_splices(tailed, timed, env, voice_db, fps, fixed=bounds, adjust=True)  # type: ignore[misc]
-        timed = clamp_word_ends(timed, env, voice_db)  # wave H: no caption held past the voice
+        timed = clamp_word_ends(timed, env, voice_db)  # no caption held past the voice
     elif untailed:
         tailed = min_tail(untailed, near)  # no tail on a noisy bed: still room for the fade
+    # frame-grid bounds make the cut timeline exact, so remapped caption times stay in sync
     keep = snap_ranges(tailed, fps, keep_gaps=[*refined.drops, *(idle_gaps or [])])
     # words starting in the tail (no audible onset: see `tail_end`) are not captioned
     heard = [i for i, w in enumerate(timed) if not untailed or w.start < untailed[-1][1] - 1e-6]
@@ -710,7 +716,7 @@ def render_clip(
         "libx264",
         quality=INTERMEDIATE_QUALITY,
         fps=fps,
-        crossfade_at=join,  # wave H: no pop / step at the seam
+        crossfade_at=join,  # no pop / step at the seam
     )
     duration = probe_duration(inter)
     size = probe_size(inter)
@@ -728,7 +734,7 @@ def render_clip(
     # drop_cut_slivers); the first word (and the first after the seam) capitalised once the
     # remnants are gone
     out_words = remap_words(spoken, keep, fps, judge_ends=judge)
-    out_words = drop_lead_fragments(out_words, lead)  # wave H: no pre-roll fragment caption
+    out_words = drop_lead_fragments(out_words, lead)  # no pre-roll fragment caption
     out_words = caption_words(drop_cut_slivers(caption_words(out_words), cuts), seam)
     # loudness is normalised to the speech: the captioned words' spans on the clip's timeline
     audio = plan_loudness(inter, speech=[(w.start, w.end) for w in out_words])
@@ -783,7 +789,7 @@ def render_clip(
 
     out_label = "[vout]"
     if seam is not None:
-        # wave H: a dark flash on bright frames -- measured on what the flash covers
+        # a dark flash on bright frames -- measured on what the flash covers
         regions = _seam_regions(layouts, seam) if settings.vertical else None
         lum = seam_luma(inter, seam, fps, regions=regions, crop=crop)
         dark = lum is not None and lum > SEAM_BRIGHT
@@ -847,19 +853,23 @@ def render_clip(
         return master_wav
 
     tmp = dst.with_suffix(".tmp.mp4")
-    _run(
-        [
-            "ffmpeg", "-hide_banner", "-y", "-i", str(inter),
-            # always a script: zoom/track expressions can outgrow the Windows command line
-            *filter_graph_args(graph, work_dir / f"{name}.graph.txt", force=True),
-            "-map", out_label, *audio_map,
-            *encoder_args(encoder or pick_encoder()), "-pix_fmt", "yuv420p",
-            *audio_args,
-            "-c:a", "aac", "-b:a", "192k", "-ar", "48000",  # the one lossy audio encode
-            "-movflags", "+faststart",
-            str(tmp),
-        ]
-    )  # fmt: skip
+    script = work_dir / f"{name}.graph.txt"
+    try:
+        _run(
+            [
+                "ffmpeg", "-hide_banner", "-y", "-i", str(inter),
+                # always a script: zoom/track expressions can outgrow the Windows command line
+                *filter_graph_args(graph, script, force=True),
+                "-map", out_label, *audio_map,
+                *encoder_args(encoder or pick_encoder()), "-pix_fmt", "yuv420p",
+                *audio_args,
+                "-c:a", "aac", "-b:a", "192k", "-ar", "48000",  # the one lossy audio encode
+                "-movflags", "+faststart",
+                str(tmp),
+            ]
+        )  # fmt: skip
+    finally:
+        script.unlink(missing_ok=True)
     os.replace(tmp, dst)
     if audio and audio.mode != "skip":
         ensure_true_peak(dst, master=audio_master)
@@ -885,7 +895,7 @@ def render_clip(
         "caption_words": [[w.start, w.end, w.text] for w in out_words],
         "uncaptioned_speech": uncaptioned,
         "room_tone": bed,
-        # wave H: the scares on the output timeline (the audit's Q-beat)
+        # the scares on the output timeline (the audit's Q-beat)
         "scare_times": [t for x in scares or [] if (t := _to_output_time(x, keep)) is not None],
         "beat_spikes": _to_output_spans(spikes or [], keep),
         "seam_source_db": seam_db,

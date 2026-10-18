@@ -1,4 +1,4 @@
-"""VOD-level stream layout profile (wave G-layout), computed once per job and cached.
+"""VOD-level stream layout profile, computed once per job and cached.
 
 A streamer's facecam overlay is a fixed rectangle: the same small face in the same place for
 most of the VOD. The profile finds it once -- sampling PROFILE_SAMPLES frames across the VOD
@@ -51,8 +51,8 @@ CAM_FACE_MAX = 0.25
 # at least CAM_OFF_CENTRE face widths from the frame centre.
 CAM_AREA_MAX = 0.35
 CAM_OFF_CENTRE = 1.5
-# Snapping: the cam rectangle is searched within SNAP_REACH face heights of the face, growing
-# through the SNAP_REACHES until one finds it (a 16:9 cam reaches ~3 face heights sideways).
+# Snapping: the cam rectangle is searched within SNAP_REACHES[0] face heights of the face,
+# growing through the SNAP_REACHES until one finds it (a 16:9 cam reaches ~3 face heights sideways).
 # A pixel is a static edge when its gradient (> EDGE_T) matches the median frame's in
 # >= STATIC_SHARE of the samples -- or a still/live edge: a still pixel (mean |frame - median|
 # under STILL_T: a smooth wall, a border) next to a live one (over LIVE_T: gameplay) within 2
@@ -60,7 +60,6 @@ CAM_OFF_CENTRE = 1.5
 # centred on the face (SPAN of the face width either side) and the rectangle's 4 sides
 # >= PERIM_SHARE. The frame's own edge is a side too (a cam flush in a corner) when the
 # rectangle's band along it is still in >= STILL_SIDE of it (not a strip of gameplay).
-SNAP_REACH = 2.5
 SNAP_REACHES = (2.5, 4.0, 6.0, 9.0)
 STILL_T = 6.0
 LIVE_T = 10.0
@@ -311,14 +310,6 @@ def static_edges(gray: np.ndarray, box: PxBox) -> np.ndarray:
     pixel (an opaque overlay; busy gameplay matches by chance, never still)."""
     m = _masks(gray, box)
     return m.static & m.still
-
-
-def _static(gray: np.ndarray, motion: bool = False) -> np.ndarray:
-    """(H, W) bool: static edges of the (n, H, W) samples (`_masks`); with `motion` also the
-    still/live edges."""
-    _, height, width = gray.shape
-    m = _masks(gray, (0, 0, width, height))
-    return m.static | m.edge if motion else m.static
 
 
 def _outer_ends(

@@ -1,4 +1,4 @@
-"""Wave G-layout: the fixed STACKED template from a VOD's stream profile."""
+"""The fixed STACKED template from a VOD's stream profile."""
 
 import numpy as np
 import pytest
@@ -243,7 +243,7 @@ def test_classify_profile_scene_reuses_a_near_identical_previous_fit():
     assert lay.fit_src == pytest.approx((40 / 320, 0.0, 240 / 320, 1.0))
 
 
-# --- round 1: synthetic matrix (layout side) ------------------------------------------------
+# --- synthetic matrix (layout side) ---------------------------------------------------------------
 
 
 def _textured_profile(seed: int = 0):

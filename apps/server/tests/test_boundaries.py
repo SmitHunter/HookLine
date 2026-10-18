@@ -187,7 +187,7 @@ def test_loud_opener_is_kept_and_quiet_one_trimmed():
     assert refine_boundaries(pick(10.0, 40), ws, [], loud_seconds=None).start > 10.2
 
 
-# --- wave G-select: idle (no speech, low motion) stretches at a clip's ends -------------------
+# --- idle (no speech, low motion) stretches at a clip's ends --------------------------------------
 
 
 def _signals(motion, transients=()):
@@ -271,7 +271,7 @@ def test_no_scare_or_no_reaction_words_keeps_the_start():
 
 
 def test_cause_lead_in_is_capped_to_whole_sentences():
-    # round 1: the last 4 words of an unpunctuated run opened the clip mid-sentence
+    # the last 4 words of an unpunctuated run opened the clip mid-sentence
     ws = [*words_from("one two three four five six", start=14.2, step=0.6)]
     ws += words_from("what was that", start=17.8)
     p = include_cause(pick(17.8, 30), ws, _signals([20.0] * 40, transients=[14]))
@@ -343,7 +343,7 @@ def test_trimmed_end_is_clamped_to_a_trailing_drops_start():
     assert all(b <= p.end for _, b in p.segments())
 
 
-# --- wave G-select round 1: hard length clamp, interior idle gaps ---------------------------
+# --- hard length clamp, interior idle gaps --------------------------------------------------------
 
 
 def test_clamp_drops_the_cause_words_first():

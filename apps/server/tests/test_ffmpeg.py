@@ -184,7 +184,7 @@ def test_cut_segments_long_graph_goes_through_script(monkeypatch, tmp_path):
     assert not list(tmp_path.glob("*.graph.txt"))  # script removed after the cut
 
 
-# --- wave G-select: AMF QP 16/18/20 with B-frames when the encoder takes them ------------------
+# --- AMF QP 16/18/20 with B-frames when the encoder takes them ------------------------------------
 
 
 def test_amf_args_add_b_frames_only_when_supported(monkeypatch):

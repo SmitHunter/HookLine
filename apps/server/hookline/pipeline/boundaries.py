@@ -5,6 +5,7 @@ import logging
 import math
 from itertools import pairwise
 
+from hookline.config import Settings
 from hookline.models import ClipPick, Word
 from hookline.pipeline.signals import (
     LOW_MOTION,
@@ -12,6 +13,7 @@ from hookline.pipeline.signals import (
     low_motion,
     scare_seconds,
     scare_times,
+    screen_runs,
     static_runs,
 )
 
@@ -143,7 +145,7 @@ IDLE_TAIL_S = 1.0  # an idle tail is cut to this long after the last word
 IDLE_LEAD_S = 0.3  # an idle lead is cut to this long before the first word (Q6: speech by 0.5 s)
 # Per-second loudness (`Signals.loudness`, RMS dBFS) under this is quiet: the default
 # silence level (`Settings.silence_db`); callers pass the configured one.
-QUIET_DB = -32.0
+QUIET_DB: float = Settings.model_fields["silence_db"].default
 INTERIOR_IDLE_MIN_S = 2.0  # an idle stretch inside a clip longer than this is cut ...
 INTERIOR_IDLE_KEEP_S = 0.8  # ... down to this much (half kept on each side)
 _CLOSERS = "\"'”’)"
@@ -478,7 +480,7 @@ def fit_to_signals(
     return out
 
 
-# --- wave H: static screens, voiceless stretches, the payoff after the end -------------------
+# --- stream editing: static screens, voiceless stretches, the payoff after the end ---------
 
 STATIC_WORD_PAD_S = 0.05  # a static cut starts / ends this far clear of a word it would split
 STATIC_MIN_GAP_S = 0.25  # a static cut shorter than this is not worth a jump cut
@@ -584,15 +586,25 @@ def avoid_static(pick: ClipPick, words: list[Word], signals: Signals) -> ClipPic
 
 
 def _voiceless_keep(
-    a: float, b: float, scares: list[float]
+    a: float,
+    b: float,
+    scares: list[float],
+    screens: list[tuple[float, float]] | None = None,
 ) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
-    """(the scare windows, the kept build-up spans) of the voiceless stretch [a, b]."""
+    """(the scare windows, the kept build-up spans) of the voiceless stretch [a, b]. A scare
+    inside a screen run (`signals.screen_runs`: a death / loading screen) has no window, and a
+    window stops STATIC_EDGE_S into the next screen run: a jumpscare's death screen is not
+    held as its reaction."""
+    screens = screens or []
+
+    def window(t: float) -> tuple[float, float]:
+        nxt = next((lo for lo, _ in screens if lo > t), math.inf)
+        return max(t - VOICELESS_SCARE_PRE_S, a), min(
+            t + VOICELESS_SCARE_POST_S, b, nxt + STATIC_EDGE_S
+        )
+
     windows = _merge(
-        [
-            (max(t - VOICELESS_SCARE_PRE_S, a), min(t + VOICELESS_SCARE_POST_S, b))
-            for t in scares
-            if a < t <= b
-        ]
+        [window(t) for t in scares if a < t <= b and not any(lo <= t < hi for lo, hi in screens)]
     )
     free, cur = [], a
     for x, y in windows:
@@ -630,6 +642,7 @@ def voiceless_gaps(
     if not spoken:
         return []
     scares = scare_times(signals)
+    screens = screen_runs(signals)
     stretches = [(w.end, nxt.start) for w, nxt in pairwise(spoken)]
     last = max(w.end for w in spoken)
     tail = [t for t in scares if last < t < pick.end]
@@ -639,7 +652,7 @@ def voiceless_gaps(
     for a, b in stretches:
         if b - a <= VOICELESS_MAX_S:
             continue
-        windows, kept = _voiceless_keep(a, b, scares)
+        windows, kept = _voiceless_keep(a, b, scares, screens)
         held = _merge([*windows, *kept])
         cur, cuts = a, []
         for x, y in held:

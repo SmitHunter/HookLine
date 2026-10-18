@@ -14,8 +14,8 @@ _ENCODER_QUALITY_ARGS: dict[str, list[str]] = {
     # CRF 17 capped at 10 Mb/s (VBV) keeps detail on upscaled faces without runaway sizes.
     "libx264": ["-preset", "veryfast", "-crf", "17", "-maxrate", "10M", "-bufsize", "20M"],
     # The requested QVBR mode (-rc qvbr / hqvbr) fails to initialise on this AMD driver (error 4),
-    # so use constant-QP: quality-driven like CRF, bitrate scales with the content. QP 16/18/20
-    # (wave G-select): soft dark sources posterise at 18/20/22; B-frames added when supported.
+    # so use constant-QP: quality-driven like CRF, bitrate scales with the content. QP 16/18/20:
+    # soft dark sources (stream gameplay) posterise at 18/20/22; B-frames added when supported.
     "h264_amf": ["-rc", "cqp", "-qp_i", "16", "-qp_p", "18", "-qp_b", "20"],
     "h264_nvenc": ["-rc", "vbr", "-cq", "18", "-b:v", "0"],
 }
@@ -242,7 +242,7 @@ def cut_segments(
     frame to absorb rounding), audio is sample-trimmed to the same span and fades out / in over
     SPLICE_FADE_S at every join (lengths unchanged: the video stays frame-exact).
 
-    `crossfade_at` (wave H: the cold-open seam) is the index of the segment whose join with
+    `crossfade_at` (the cold-open seam) is the index of the segment whose join with
     the next one is an SEAM_XFADE_S audio crossfade instead: that segment's audio runs on
     SEAM_XFADE_S past its end, fading out under the next one's fade-in (no dip, no step;
     lengths still unchanged)."""

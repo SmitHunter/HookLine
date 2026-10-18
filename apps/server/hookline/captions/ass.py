@@ -2,10 +2,9 @@ import math
 import re
 from collections.abc import Sequence
 
-from hookline.models import Word
+from hookline.models import MIN_WORD_S, Word
 from hookline.pipeline.layout import STACK_CAM_H, STACK_GAME_H, SceneLayout
 
-MIN_WORD_S = 0.05
 MERGE_GAP_S = 0.05
 HOOK_S = 3.0
 HOOK_FADE_MS = 250
@@ -161,17 +160,22 @@ def caption_words(words: list[Word], seam: float | None = None) -> list[Word]:
 
     A stutter split by a dropped token ("I -- I") stays two words: when the pair is close
     enough for `_normalise` to merge it as one cut fragment, the second word starts just
-    past that gap (it moves by at most MERGE_GAP_S)."""
+    past that gap (it moves by at most MERGE_GAP_S) -- or, when that would leave it under
+    MIN_WORD_S (a sliver `_normalise` drops), the first word ends that much earlier."""
     out: list[Word] = []
     removed = False
     for w in words:
         if _unspoken(w.text):
             removed = bool(out)
             continue
-        if removed and _clean(w.text) == _clean(out[-1].text):
+        tight = removed and w.start - out[-1].end <= MERGE_GAP_S
+        if tight and _clean(w.text) == _clean(out[-1].text):
             start = round(out[-1].end + MERGE_GAP_S + 0.001, 3)
-            if w.start - out[-1].end <= MERGE_GAP_S and start < w.end:
+            end = round(w.start - MERGE_GAP_S - 0.001, 3)
+            if w.end - start >= MIN_WORD_S:
                 w = w.model_copy(update={"start": start})
+            elif end - out[-1].start >= MIN_WORD_S:
+                out[-1] = out[-1].model_copy(update={"end": end})
         out.append(w)
         removed = False
     firsts = {0} if out else set()
@@ -372,7 +376,7 @@ def _hold_ends(
 
 def _windows(has_hook: bool, duration: float, seam: float | None) -> tuple[float, float, float]:
     """(hook end, EARLIER tag start, tag end); both tag times equal the hook end when there
-    is no tag (no seam, or a seam at or past the end). Wave H: the tag shows at the seam; a
+    is no tag (no seam, or a seam at or past the end). The tag shows at the cold-open seam; a
     hook that would still be up then ends there."""
     hook_end = min(HOOK_S, duration) if has_hook else 0.0
     if seam is not None and 0 < seam < hook_end:

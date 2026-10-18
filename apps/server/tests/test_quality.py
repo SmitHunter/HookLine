@@ -283,6 +283,9 @@ def test_wrong_first_words_fail_q6(good_mp4, tmp_path):
         ("the reason we did that was money", "the reason we did that was money and", True),
         ("the reason we did that was money", "um the reason we did that was the money", True),
         ("Nobody saw it coming.", "coming it saw nobody", False),
+        # a one-word declaration compares against at most twice its length of speech
+        ("Go!", "Go! Oh, oh, oh!", True),
+        ("Go!", "Run now go", False),
     ],
 )
 def test_first_words_match_is_order_aware(want, got, ok):
@@ -470,7 +473,7 @@ def test_face_check_uses_the_schedule_levels_not_the_rendered_zooms():
 
     side = {"zoom_steps": [[0.0, 1.0], [2.0, 1.072]], "zoom_levels": [[0.0, 1.0], [2.0, 1.12]]}
     assert zoom_levels(side) == [[0.0, 1.0], [2.0, 1.12]]
-    old = {"zoom_steps": [[0.0, 1.0], [2.0, 1.12]]}  # pre-wave-D sidecars recorded levels
+    old = {"zoom_steps": [[0.0, 1.0], [2.0, 1.12]]}  # older sidecars recorded levels
     assert zoom_levels(old) == [[0.0, 1.0], [2.0, 1.12]]
     assert zoom_levels({}) == []
 
@@ -506,7 +509,7 @@ def test_q4b_checks_the_stacked_head_region():
     assert _check_face(clear, [lay], []).ok
 
 
-# --- wave G-select: Q8 bitrate bar follows the source ------------------------------------------
+# --- Q8 bitrate bar follows the source ------------------------------------------------------------
 
 
 def _info(v_kbps: float, size=(1080, 1920)) -> dict:
@@ -573,7 +576,7 @@ def test_audit_job_probes_the_workspace_source_for_old_sidecars(good_mp4, tmp_pa
     assert seen[0] is None and seen[1] > 0 and seen[2] == 1059.1
 
 
-# --- fix wave F: per-sample faces (Q4b), reframe snaps (Q7), uncaptioned speech (Q3b) ------
+# --- per-sample faces (Q4b), reframe snaps (Q7), uncaptioned speech (Q3b) -------------------------
 
 
 def _dip_layout(dip: bool) -> list[dict]:
@@ -617,7 +620,7 @@ def test_q3b_warns_on_uncaptioned_speech(good_mp4, tmp_path):
     )
 
 
-# --- fix wave F review round 1: eye line as the core top, samples held to the scene bounds ---
+# --- eye line as the core top, samples held to the scene bounds -----------------------------------
 
 
 def _px_layout(eye, samples=None):

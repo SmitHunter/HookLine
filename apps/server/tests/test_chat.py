@@ -227,3 +227,10 @@ def test_clip_with_bangs_and_emote_inside_a_sentence():
 def test_body_missing_uses_fragments():
     k = _kinds_of(None, [{"text": "nice", "emoticon": None}, {"text": "KEKW"}])
     assert k[1] == {"laugh": 1}
+
+
+def test_stretched_emotes_match_their_name():
+    assert _kinds_of("kekwww")[1] == {"laugh": 1}
+    assert _kinds_of("KEKWWWW")[1] == {"laugh": 1}
+    assert _kinds_of("letsgoooo")[1] == {"hype": 1}
+    assert _kinds_of("pogggg")[1] == {"hype": 1}

@@ -215,9 +215,6 @@ def test_packaging_rules_are_shared_with_selection():
         assert needle in PACKAGING_SYSTEM_PROMPT, needle
 
 
-# --- fix wave C review round 1 ----------------------------------------------------------------
-
-
 def test_caption_fix_schema_names_the_original_word():
     item = PACKAGING_SCHEMA["properties"]["clips"]["items"]["properties"]["caption_fixes"]
     assert set(item["items"]["required"]) == {"index", "original", "text"}
@@ -274,7 +271,7 @@ def test_caption_fix_original_matches_ignoring_case_and_punctuation(fake_llm, se
     assert p.caption_fixes == [CaptionFix(start=14.0, end=14.4, original="three.", text="tree.")]
 
 
-# --- fix wave E: context, duplicate hooks, hashtags, search titles ---------------------------
+# --- context, duplicate hooks, hashtags, search titles --------------------------------------------
 
 
 def test_prompt_shows_up_to_60s_of_context_before_the_clip(fake_llm, settings):
@@ -313,7 +310,7 @@ def test_cold_open_source_sentence_is_shown_as_context(fake_llm, settings):
     assert line.endswith("Nobody had ever trusted me with a kitchen.")
 
 
-def test_packaging_prompt_rules_wave_e():
+def test_packaging_prompt_rules_for_context_and_hooks():
     for needle in (
         "true of the source",
         "not contradicted by the cut",
@@ -381,9 +378,6 @@ def test_packaged_search_title_clause_cut_then_selection_fallback(fake_llm, sett
     fake_llm.queue({"clips": [_answer(search_title=long)]})
     (p,) = package_clips([_pick()], WORDS, fake_llm, settings)
     assert p.search_title == "Dishwasher Gets Restaurant Keys on Day Three"  # selection's
-
-
-# --- fix wave E review round 1 ----------------------------------------------------------------
 
 
 @pytest.mark.parametrize(

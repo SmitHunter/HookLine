@@ -1,4 +1,4 @@
-"""Wave G-layout round 1: the stream profile on a synthetic matrix of cam geometries and
+"""The stream profile on a synthetic matrix of cam geometries and
 source sizes (16:9 / 4:3 / square cams, a borderless cam flush in a corner, 1080p and 1440p,
 a full-frame webcam that must not profile)."""
 

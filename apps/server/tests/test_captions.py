@@ -346,7 +346,7 @@ def test_rendered_caption_cap_height(tmp_path):
     frame = _render(tmp_path, build_ass([w(0, 1, "test")], "", 2), 0.5)
     box = text_bbox(frame, "yellow")  # the active word
     assert box is not None
-    assert 72 <= box[3] - box[1] + 1 <= 80  # wave D: ~12% larger (75-76 px)
+    assert 72 <= box[3] - box[1] + 1 <= 80  # ~12% larger (75-76 px)
 
 
 def test_rendered_hook_cap_height(tmp_path):
@@ -545,7 +545,7 @@ def test_early_until_covers_hook_tag_and_groups_shown_with_them():
     assert early_until(ws, "Hook", 20) == pytest.approx(3.6 - 2 / 30)
 
 
-# --- M2.5 wave B: caption pages break at cuts and the seam; face rects follow the zoom plan --
+# --- caption pages break at cuts and the seam; face rects follow the zoom plan --------------------
 
 
 def _secs(ts):
@@ -620,7 +620,7 @@ def test_word_running_past_a_cut_opens_the_next_page():
     assert short[0][1] == pytest.approx(2.0)
 
 
-# --- wave D: pages lead speech by 2 frames; larger captions ------------------------------
+# --- pages lead speech by 2 frames; larger captions -----------------------------------------------
 
 
 def test_pages_appear_two_frames_before_their_first_word():
@@ -684,7 +684,7 @@ def test_face_rects_use_the_measured_face_offset_and_zoom():
     assert (z0 + z1) / 2 == pytest.approx(540 + 0.1 * 1080 * 1.12)
 
 
-# --- fix wave E: caption words ------------------------------------------------------------
+# --- caption words --------------------------------------------------------------------------------
 
 
 def test_caption_words_drop_punctuation_only_tokens_keeping_neighbour_timing():
@@ -741,7 +741,7 @@ def test_a_stutter_across_a_removed_dash_stays_two_caption_words():
     assert len(caps) == 3  # one event per spoken word: I, I, WENT.
 
 
-# --- fix wave F: captions clear the face at every sample of their page --------------------
+# --- captions clear the face at every sample of their page ----------------------------------------
 
 
 def _page_y(text: str) -> list[tuple[float, float, int]]:
@@ -878,7 +878,20 @@ def test_stacked_caption_and_hook_lines_clear_the_cam_panel_head():
     assert y == 732 + CAPTION_FACE_GAP + CAPTION_ABOVE
     assert hook_y_for([lay(500)]) == STACKED_HOOK_Y  # centred on the seam
     assert hook_y_for([lay(700)]) == 700 + CAPTION_FACE_GAP + HOOK_HALF  # still straddles
-    # round 2: a chin too low to straddle puts the box just below the seam, no further
+    # a chin too low to straddle puts the box just below the seam, no further
     assert hook_y_for([lay(732)]) == 760 + HOOK_HALF
     # capped: the captions under it stay inside Q4
     assert caption_y_for([lay(760)]) <= 1180 and hook_y_for([lay(760)]) + HOOK_HALF <= 1250
+
+
+def test_a_tight_stutter_stays_two_words_when_the_shift_would_leave_a_sliver():
+    """The second word of "I -- I" is too short to start past the merge gap without becoming
+    a sliver (< MIN_WORD_S, dropped): the first word ends earlier instead."""
+    from hookline.captions.ass import MERGE_GAP_S, MIN_WORD_S, _normalise, caption_words
+
+    words = [w(0.0, 0.3, "I"), w(0.3, 0.3, "--"), w(0.32, 0.38, "I"), w(0.4, 0.8, "went.")]
+    out = caption_words(words)
+    assert [x.text for x in out] == ["I", "I", "went."]
+    assert all(x.end - x.start >= MIN_WORD_S - 1e-6 for x in out)
+    assert out[1].start - out[0].end > MERGE_GAP_S
+    assert len(_normalise(out)) == 3

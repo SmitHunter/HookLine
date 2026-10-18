@@ -55,7 +55,7 @@ YAW_FULL = 0.3
 STACK_W = 1080
 STACK_CAM_H = 760
 STACK_GAME_H = 1920 - STACK_CAM_H  # 1160
-# Wave G-layout: a stream profile's fixed STACKED template. The gameplay panel may shift up to
+# A stream profile's fixed STACKED template. The gameplay panel may shift up to
 # GAME_SHIFT_MAX of the frame width to keep the cam and its label out; else they're blurred.
 GAME_SHIFT_MAX = 0.25
 # Per-scene checks: samples every PROFILE_SAMPLE_S s; the cam shows in a scene when its border
@@ -115,7 +115,7 @@ class SceneLayout(BaseModel):
     # the crop centre (share of crop width, + right), for caption placement and the audit.
     shift_steps: list[tuple[float, float]] = []
     face_dx: float | None = None
-    # Fix wave F: per track keyframe the face's (top y, height, eye line y) normalized (eye
+    # Per track keyframe the face's (top y, height, eye line y) normalized (eye
     # None when unknown); the reframe snaps (output s, framing changes for Q7); the rendered
     # face core per sample [output s, x0, top, x1, bottom, eye y] in output px (caption
     # placement and Q4b); word gaps (output s) a snap prefers -- render-time only, not saved.
@@ -134,8 +134,8 @@ class SceneLayout(BaseModel):
     zoom_cap: float | None = None
     zoom_anchor: float | None = None
     step_shift: float = 0.0  # flat-zoom FACE_TRACK: signed share of crop width steps shift by
-    # Wave G-layout (a stream profile's fixed STACKED template; `facecam` is then the cam
-    # panel's window): the cam's picture inside its border (full-cam beats), the head in it
+    # A stream profile's fixed STACKED template (`facecam` is then the cam panel's window):
+    # the cam's picture inside its border (full-cam beats), the head in it
     # (top of hair to chin: cam-panel zoom, captions, Q4b), the gameplay panel's source region
     # (`game_fit`: shown whole, letterboxed -- a pillarboxed cutscene) with the overlay parts in
     # it blurred over (`patches`), and the full-cam reaction beats (output s). Normalized boxes.
@@ -404,7 +404,7 @@ def plan_layouts(
     return layouts
 
 
-# --- Wave G-layout: the fixed STACKED template of a stream profile ------------------------
+# --- the fixed STACKED template of a stream profile ------------------------------------
 
 
 def _norm(box: PxBox, crop: Crop | None, size: tuple[int, int]) -> Box:

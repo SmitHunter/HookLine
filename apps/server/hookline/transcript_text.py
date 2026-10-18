@@ -11,6 +11,13 @@ def ends_sentence(text: str) -> bool:
     return text.rstrip(_TRAILING).endswith((".", "?", "!"))
 
 
+def ends_statement(text: str) -> bool:
+    """`ends_sentence`, except a trailing ellipsis ("...", "…"): the speaker trails off and the
+    thought continues."""
+    text = text.rstrip(_TRAILING)
+    return ends_sentence(text) and not text.endswith(("...", "…"))
+
+
 def _make(buf: list[Word]) -> Sentence:
     return Sentence(
         start=buf[0].start,
@@ -50,7 +57,7 @@ def _ends_line(word: Word, nxt: Word | None) -> bool:
     """Terminal punctuation for selection lines: not an ellipsis, not an abbreviation; a
     dotted acronym (U.S.) ends a sentence only before a capitalised word after a 0.3 s pause."""
     text = word.text.strip().rstrip(_TRAILING)
-    if not ends_sentence(text) or text.endswith(("...", "…")):
+    if not ends_statement(text):
         return False
     if text.lower().lstrip("\"'“‘(") in _ABBREVIATIONS:
         return False

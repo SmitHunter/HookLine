@@ -1,4 +1,4 @@
-"""Wave G-layout: rendering the fixed STACKED template (cam panel, gameplay panel, patches,
+"""Rendering the fixed STACKED template (cam panel, gameplay panel, patches,
 pillarbox fit, full-cam beats) and its head geometry."""
 
 import re

@@ -323,9 +323,15 @@ def final_argvs(monkeypatch) -> FinalEncodeSpy:
     real = render_mod._run
 
     def spy(cmd):
+        if "-/filter_complex" in cmd:  # the script is removed after the encode: inline it
+            i = cmd.index("-/filter_complex")
+            text = Path(cmd[i + 1]).read_text(encoding="utf-8")
+            recorded = [*cmd[:i], "-filter_complex", text, *cmd[i + 2 :]]
+        else:
+            recorded = cmd
         res = real(cmd)
-        if "-filter_complex" in cmd or "-/filter_complex" in cmd:
-            seen.append(cmd)
+        if "-filter_complex" in recorded:
+            seen.append(recorded)
             seen.stderrs.append(res.stderr)
         return res
 

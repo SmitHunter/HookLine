@@ -1,4 +1,4 @@
-"""Measurements on rendered frames, and the automated M2.5 quality bar (`hookline audit`)."""
+"""Measurements on rendered frames, and the automated quality bar (`hookline audit`)."""
 
 import hashlib
 import json
@@ -25,6 +25,7 @@ from hookline.pipeline.boundaries import FILLER_OPENERS
 from hookline.pipeline.ingest import find_source
 from hookline.pipeline.layout import SCARE_POST_S, SCARE_PRE_S, SceneLayout
 from hookline.pipeline.signals import STATIC_CHROMA_MAX, STATIC_VOICED_MAX
+from hookline.pipeline.timing import UNCAPTIONED_S  # Q3b: what the render reports
 
 OUT_W, OUT_H = 1080, 1920
 GREY = "0x808080"  # canvas on which black outlines, shadows and hook boxes are visible
@@ -98,7 +99,6 @@ HOOK_MAX_LINES, HOOK_MAX_WORDS, HOOK_UNTIL = 2, 7, 3.0
 COVERAGE_MIN = 0.95
 SAFE_X, SAFE_Y = (60, 888), (290, 1250)
 FACE_OVERLAP_MAX = 0.10
-UNCAPTIONED_S = 0.3  # Q3b: the render reports voiced stretches longer than this (timing.py)
 PAGE_TOUCH_S = 0.05  # a caption group's events touch (word highlights); a gap starts another
 FACE_SAMPLE_HALF_S = 0.125  # a per-sample face (4 fps) stands for this long either side
 SPEECH_START_MAX = 0.5
@@ -333,8 +333,8 @@ def zoom_at(steps: list, t: float) -> float:
 
 def zoom_levels(sidecar: dict) -> list:
     """The clip's zoom schedule levels, which Q4b maps through each scene's plan: the sidecar's
-    `zoom_levels`, else `zoom_steps` (sidecars before wave D recorded the levels there; newer
-    ones record the rendered zooms)."""
+    `zoom_levels`, else `zoom_steps` (older sidecars recorded the levels there; newer ones
+    record the rendered zooms)."""
     return sidecar.get("zoom_levels") or sidecar.get("zoom_steps") or []
 
 
@@ -422,7 +422,7 @@ def _check_uncaptioned(side: dict) -> CheckResult:
     thr = f"no voiced stretch > {UNCAPTIONED_S:g}s without a caption"
     spans = side.get("uncaptioned_speech")
     if spans is None:
-        return CheckResult("Q3b", True, None, thr, "not recorded (render before fix wave F)")
+        return CheckResult("Q3b", True, None, thr, "not recorded (an older render)")
     if not spans:
         return CheckResult("Q3b", True, 0, thr, "none")
     where = ", ".join(f"{a:.2f}-{b:.2f}s" for a, b in spans)
@@ -515,8 +515,8 @@ def _check_face(
 def _check_hook(
     hooks: list[_Event], per_frame: list[list[int]], duration: float, seam: float | None = None
 ) -> CheckResult:
-    """Q5 from the hook event at 0 s and its line heights rendered over black at 0.1/2.7 s (wave
-    H: the hook ends at an earlier cold-open `seam`, where the EARLIER tag takes over)."""
+    """Q5 from the hook event at 0 s and its line heights rendered over black at 0.1/2.7 s (the
+    hook ends at an earlier cold-open `seam`, where the EARLIER tag takes over)."""
     thr = (
         f"<= {HOOK_MAX_LINES} lines, <= {HOOK_MAX_WORDS} words, cap >= {HOOK_MIN_PX}px, "
         f"0-{HOOK_UNTIL:g}s"
@@ -548,11 +548,12 @@ def _check_hook(
 
 def first_words_match(first_words: str, spoken: str) -> float:
     """Order-aware similarity (SequenceMatcher ratio) of the declared first words and the
-    first len(want) + 2 spoken tokens, leading filler openers stripped from both."""
+    first len(want) + min(2, len(want)) spoken tokens (a one-word declaration, "Go!", is not
+    diluted by the reaction after it), leading filler openers stripped from both."""
     want = _strip_fillers(_tokens(first_words))
     if not want:
         return 0.0
-    got = _strip_fillers(_tokens(spoken))[: len(want) + 2]
+    got = _strip_fillers(_tokens(spoken))[: len(want) + min(2, len(want))]
     return SequenceMatcher(None, want, got, autojunk=False).ratio()
 
 
@@ -698,11 +699,11 @@ def audit_clip(
         ),
         _check_pacing(sidecar, duration),
         _check_encode(_probe(mp4), sidecar.get("source_video_kbps")),
-        *_wave_h_checks(mp4, sidecar, words or [], duration),
+        *_stream_checks(mp4, sidecar, words or [], duration),
     ]
 
 
-# --- wave H: stream editing checks --------------------------------------------------------------
+# --- stream editing checks ----------------------------------------------------------------------
 
 STATIC_MAX_S = 0.5  # Q-static: voiceless static / death / loading screen frames allowed
 STATIC_FPS = 4
@@ -822,7 +823,7 @@ def _check_beat(side: dict) -> CheckResult:
     thr = f"no cam beat within -{BEAT_BEFORE_S:g}/+{BEAT_AFTER_S:g}s of a scare or on a spike"
     scares = side.get("scare_times")
     if scares is None:
-        return CheckResult("Q-beat", True, None, thr, "scares not recorded (render before wave H)")
+        return CheckResult("Q-beat", True, None, thr, "scares not recorded (an older render)")
     spikes = side.get("beat_spikes") or []
     beats = [b for lay in side.get("layout") or [] for b in lay.get("cam_beats") or []]
     hits = [
@@ -850,8 +851,8 @@ def _clip_pcm(mp4: Path, rate: int = 48000) -> np.ndarray:
     return np.frombuffer(res.stdout, np.int16).astype(np.float64) / 32768.0
 
 
-def _wave_h_checks(mp4: Path, side: dict, words: list[Word], duration: float) -> list[CheckResult]:
-    """Q-static, Q-voiceless, Q-seam and Q-beat (wave H)."""
+def _stream_checks(mp4: Path, side: dict, words: list[Word], duration: float) -> list[CheckResult]:
+    """Q-static, Q-voiceless, Q-seam and Q-beat: the stream editing checks."""
     seam = side.get("seam")
     pcm = _clip_pcm(mp4) if seam is not None else np.zeros(0)
     flags, chroma = screen_frame_flags(mp4)
