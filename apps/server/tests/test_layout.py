@@ -300,7 +300,7 @@ def test_plan_layouts_without_detector_is_fit_blur(fixture_video):
     assert layouts[0].start == 0 and layouts[0].end == pytest.approx(150, abs=0.1)
 
 
-# --- M2.5 wave B: tracking holds through face gaps; head top; zoom plan fields -------------
+# --- tracking holds through face gaps; head top; zoom plan fields ---------------------------------
 
 
 def _face_at(cx: float, y: float = 0.2, h: float = 0.4, score: float = 0.9) -> Face:
@@ -364,7 +364,7 @@ def test_zoom_level_maps_steps_through_base_and_cap():
     )
 
 
-# --- wave D: per-sample face widths, gaze lead ------------------------------------------
+# --- per-sample face widths, gaze lead ------------------------------------------------------------
 
 
 def test_track_records_face_width_per_keyframe():
@@ -395,7 +395,7 @@ def test_face_track_gaze_lead_from_median_yaw(yaws, lead):
     assert s.lead == pytest.approx(lead)
 
 
-# --- fix wave F: per-sample face rows (caption placement over time) -------------------------
+# --- per-sample face rows (caption placement over time) -------------------------------------------
 
 
 def test_face_track_records_each_samples_face_row_and_eye_line():

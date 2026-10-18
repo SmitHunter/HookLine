@@ -27,7 +27,7 @@ def test_frame_motion_is_per_second_and_spikes_on_a_flash(flash_video):
     assert motion[3] > 60 and motion[4] > 60  # into the flash (3 s) and out of it (4 s)
 
 
-# --- wave G-select round 1: a damaged VOD floods stderr; a stuck decode times out -----------
+# --- a damaged VOD floods stderr; a stuck decode times out ----------------------------------------
 
 _FLOOD = (
     "import sys; sys.stderr.buffer.write(b'concealing errors in P frame ' * 20000); "

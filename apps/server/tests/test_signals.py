@@ -131,7 +131,7 @@ def test_heat_seconds_cover_whole_runs():
     assert 305 in heat and 100 not in heat and 450 not in heat
 
 
-# --- wave G-select: game-audio transients, visual flashes, scare markers ----------------------
+# --- game-audio transients, visual flashes, scare markers -----------------------------------------
 
 
 def _env(n_s: int, base: float = -45.0) -> np.ndarray:
@@ -218,7 +218,7 @@ def test_signals_without_new_fields_are_an_old_version():
     assert old.version < SIGNALS_VERSION and old.motion is None and old.transients is None
 
 
-# --- wave G-select round 1: speech pad, exact onset times -------------------------------------
+# --- speech pad, exact onset times ----------------------------------------------------------------
 
 
 def test_speech_pad_is_point_three_seconds():

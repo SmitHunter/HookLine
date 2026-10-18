@@ -90,7 +90,7 @@ def test_track_expression_clamps_edges_and_interpolates():
     assert evaluate(expr, t=0) == pytest.approx(0)
     for t in (0, 0.5, 1, 1.5, 2, 2.5, 3, 10):
         assert 0 <= evaluate(expr, t=t) <= 1920 - 607
-    # fix wave F: a move this fast (the whole frame in 1 s) is a reframe snap, not a pan
+    # a move this fast (the whole frame in 1 s) is a reframe snap, not a pan
     assert evaluate(expr, t=0) <= evaluate(expr, t=0.5) <= evaluate(expr, t=1)
     assert evaluate(expr, t=1) == pytest.approx(1920 - 607)
 
@@ -261,7 +261,7 @@ def test_zoom_schedule_drops_out_of_range_and_overlapping_punches():
 
 
 def test_zoom_schedule_early_punch_from_zero_and_nothing_at_or_after_end():
-    # fix wave F: a beat on the opening words punches from the first frame (was dropped)
+    # a beat on the opening words punches from the first frame (was dropped)
     assert zoom_schedule(10.0, [], [0.3])[0] == (0.0, ZOOM_PUNCH)
     steps = zoom_schedule(10.0, [], [9.0])  # release would land at 10.4
     assert (9.0, ZOOM_PUNCH) in steps and all(t < 10.0 for t, _ in steps)
@@ -572,7 +572,7 @@ def test_overlay_real_source_lower_third(tmp_path):
         clip.unlink(missing_ok=True)
 
 
-# --- M2.5 wave B: tracking holds, every cut steps, soft-source caps, small faces, headroom ---
+# --- tracking holds, every cut steps, soft-source caps, small faces, headroom ---------------------
 
 _FPS = 30
 
@@ -608,8 +608,8 @@ def test_track_keeps_a_leaning_face_inside_the_crop():
     expr = track_x_expr(kfs, in_w=in_w, crop_w=crop_w, face_w=face_w)
     for t, x in kfs:
         left = evaluate(expr, t=t)
-        margin = 0.08 * crop_w - 1e-6  # wave D: the edge guard's margin
-        face_w = 0.17 * 0.8  # fix wave F: the hard constraint is the face core
+        margin = 0.08 * crop_w - 1e-6  # the edge guard's margin
+        face_w = 0.17 * 0.8  # the hard constraint is the face core
         assert left + margin <= (x - face_w / 2) * in_w
         assert (x + face_w / 2) * in_w <= left + crop_w - margin
 
@@ -641,7 +641,7 @@ def test_zoom_schedule_cut_inside_a_punch_ends_it_at_the_cut():
     steps = zoom_schedule(20.0, [7.3], [6.0])
     assert (6.0, ZOOM_PUNCH) in steps
     assert steps[steps.index((6.0, ZOOM_PUNCH)) + 1] == (7.3, 1.0)
-    # wave D: a punch within CUT_QUIET (1 s) before a cut lands on the cut instead
+    # a punch within CUT_QUIET (1 s) before a cut lands on the cut instead
     assert (6.8, ZOOM_PUNCH) in zoom_schedule(20.0, [6.8], [6.0])
     # a punch just after a cut moves onto it: the punch is the cut's framing change
     steps = zoom_schedule(20.0, [6.0], [6.3])
@@ -730,9 +730,6 @@ def test_plan_zoom_caps_the_level_when_head_and_chin_cannot_both_fit():
         assert plan.zoom_y(0.92 * OUT_H, s, OUT_H) <= OUT_H + 1e-6
 
 
-# --- wave B review round 1 --------------------------------------------------------------
-
-
 def test_track_ignores_a_single_outlier_sample():
     # another face for one 0.5 s sample: the crop must not pan towards it
     kfs = (
@@ -775,7 +772,7 @@ def test_track_close_up_that_fits_the_margin_stays_inside_it():
 
 
 def test_track_close_up_wider_than_the_margin_keeps_the_deadband_with_containment():
-    # review round 1: a face wider than the guard room is not guarded (no 1:1 jitter following,
+    # a face wider than the guard room is not guarded (no 1:1 jitter following,
     # no zoom hold); the deadband/EMA path only moves the crop as far as keeping it inside
     from hookline.media.reframe import _median3, track_guard_spans
 
@@ -860,9 +857,6 @@ def test_plan_zoom_flat_headroom_scene_shifts_crop_at_each_step():
     assert plan_zoom(_SOFT_TRACK, 3840, 2160).step_shift == 0.0
 
 
-# --- wave B review round 2 --------------------------------------------------------------
-
-
 @pytest.mark.parametrize("size", [(1706, 960), (1752, 986), (1800, 1012)])
 def test_plan_zoom_small_face_base_leaves_step_range(size):
     # ~1.9-2.0x upscale: MAX_UPSCALE leaves ~1.25-1.3 total zoom; the base must not eat it all
@@ -918,7 +912,7 @@ def test_step_shift_only_recorded_where_rendered():
     assert plan.step_shift == 0.0  # SPLIT never renders a shift
 
 
-# --- wave D: edge guard, gaze lead, instant cut zooms, quiet zone around cuts ------------
+# --- edge guard, gaze lead, instant cut zooms, quiet zone around cuts -----------------------------
 
 
 def _nesting(expr: str) -> int:
@@ -984,7 +978,7 @@ def test_track_edge_guard_keeps_a_fast_lean_inside_the_crop():
     in_w, cw = 1920, 486
     expr = track_x_expr(kfs, in_w=in_w, crop_w=cw, face_w=0.13, widths=ws)
     for (t, x), w in zip(kfs, ws, strict=True):
-        # fix wave F: the hard constraint is the face core (FACE_CORE of the box) + margin
+        # the hard constraint is the face core (FACE_CORE of the box) + margin
         assert _inside(evaluate(expr, t), cw, x, w * 0.8, in_w, 0.08), t
 
 
@@ -1046,7 +1040,7 @@ def test_scene_filter_face_track_guard_holds_the_zoom():
 
 
 def test_guard_zoom_keeps_a_framing_change_at_a_cut_inside_a_span():
-    # review round 1: a cut inside a guard span still changes the framing instantly, either
+    # a cut inside a guard span still changes the framing instantly, either
     # with a zoom step that keeps the face inside the margin or a shift toward the centre
     from hookline.media.reframe import guard_zoom, track_guard_spans
 
@@ -1156,7 +1150,7 @@ def test_rendered_zoom_steps_map_levels_through_each_scene():
     assert got[3] == (4.0, pytest.approx(ZOOM_IN))
 
 
-# --- wave D review round 2: guard fixed point, holds hold, shifts checked as rendered ------
+# --- guard fixed point, holds hold, shifts checked as rendered ------------------------------------
 
 
 def _lean_at(start: float, end: float, xs: list[float], fw: float = 0.13) -> SceneLayout:
@@ -1170,7 +1164,7 @@ def _lean_at(start: float, end: float, xs: list[float], fw: float = 0.13) -> Sce
 _LEAN = [0.5] * 8 + [0.6, 0.7, 0.75, 0.75, 0.75, 0.75, 0.7, 0.6] + [0.5] * 8
 _WOBBLE = [0.5 + (0.12 if (i // 2) % 2 else -0.12) for i in range(40)]
 _TWO_HOLDS = [0.5] * 4 + [0.75] * 4 + [0.5] * 5 + [0.25] * 4 + [0.5] * 8 + [0.75] * 4 + [0.5] * 10
-_GUARD_CASES = {  # the round-2 reviewer's probes (probeD/probe1.py, probe3.py)
+_GUARD_CASES = {  # edge-guard probes
     "cut inside hold": (
         [_lean_at(0, 6, _LEAN)],
         [(0.0, 1.0), (1.0, ZOOM_IN), (3.0, 1.0), (5.5, ZOOM_IN)],
@@ -1299,7 +1293,7 @@ def test_face_offset_includes_the_guard_shifts():
     assert face_offset(shifted, 1920, 864, [(0.0, 1.0)]) == pytest.approx(plain - 0.04, abs=1e-3)
 
 
-# --- wave D review round 3: one placement pass, spaced pulses, eases, lead slack ---------
+# --- one placement pass, spaced pulses, eases, lead slack -----------------------------------------
 
 
 def test_guard_zoom_unsettled_scene_holds_base_to_its_end(monkeypatch, caplog):
@@ -1385,7 +1379,7 @@ def test_hold_spans_later_pulse_does_not_block_an_earlier_one_and_no_pumping():
     held, shifts = _hold_spans(
         sched, [(13.256, 14.1), (25.267, 26.3)], [], lambda _: Fit(), (0, 30)
     )
-    # (fix wave F: cadence pulses may fill the long stretches around them too)
+    # (cadence pulses may fill the long stretches around them too)
     assert {13.256, 14.9, 25.267} <= {t for t, v in shifts if v}
     # a hold that starts on a zoom step never returns within CUT_QUIET of its start
     held, _ = _hold_spans(
@@ -1394,7 +1388,7 @@ def test_hold_spans_later_pulse_does_not_block_an_earlier_one_and_no_pumping():
     assert all(not (7.992 < t < 8.992) for t, _ in held), held
 
 
-# --- wave D review round 4: the reviewer's fuzz as a property test ------------------------
+# --- the reviewer's fuzz as a property test -------------------------------------------------------
 
 
 def _fuzz_scene(seed: int):
@@ -1457,12 +1451,12 @@ def test_guard_property_over_random_scenes(block):
             free = 1 < left < w - cw - 1 and 1 < vl and vl + vis < w - 1
             if not free or not R._guardable(fw, cw / w / z * (0.5 - R.GUARD_MARGIN)):
                 continue
-            core = fw * R.FACE_CORE / 2  # fix wave F: the face core keeps the margin
+            core = fw * R.FACE_CORE / 2  # the face core keeps the margin
             m = min(x * w - core * w - vl, vl + vis - x * w - core * w) / vis
             assert m >= R.GUARD_MARGIN - R.GUARD_JITTER, (seed, t, m)
 
 
-# --- fix wave F: reframe snaps instead of whip pans; step shift modelled; beats punch ------
+# --- reframe snaps instead of whip pans; step shift modelled; beats punch -------------------------
 
 _LEAN05 = (
     [0.52] * 8 + [0.56, 0.62, 0.70, 0.77, 0.80, 0.80, 0.79, 0.74, 0.66, 0.58, 0.55] + [0.55] * 8
@@ -1536,7 +1530,7 @@ def test_scene_snaps_are_on_the_output_timeline():
     assert snaps and all(lay.start < t < lay.end for t in snaps)
 
 
-# fuzz seeds where a flat scene's step shift broke the guard margin (reviewer round 4)
+# fuzz seeds where a flat scene's step shift broke the guard margin
 _STEP_SHIFT_SEEDS = [325, 361, 428, 454, 456, 468, 551, 678, 732, 791, 854, 868, 896, 972,
                      1049, 1052, 1102, 1165, 1194, 1324]  # fmt: skip
 
@@ -1602,7 +1596,7 @@ def test_zoom_schedule_beat_at_the_clip_start_punches_from_zero():
 
 
 def test_cut_in_a_shrunken_placement_span_gets_a_level_change():
-    # reviewer round 4, seed 89: the placement span 2.8-4.75 shrinks to 2.8-3.75 on the final
+    # the placement span 2.8-4.75 shrinks to 2.8-3.75 on the final
     # schedule; the cut at 3.965 then sits outside every hold and gets a framing change
     from hookline.media import reframe as R
 
@@ -1643,7 +1637,7 @@ def test_beat_inside_a_hold_punches_when_the_guard_allows():
     assert at[0] >= before
 
 
-# --- fix wave F item 9: a framing change at least every ZOOM_MAX_GAP s ----------------------
+# --- a framing change at least every ZOOM_MAX_GAP s -----------------------------------------------
 
 
 def _framing_changes(held, lay, cuts, end):
@@ -1663,7 +1657,7 @@ def test_zoom_schedule_fillers_prefer_the_largest_word_gap_without_punctuation()
 
 
 def test_guard_keeps_a_framing_change_every_max_gap_through_a_long_hold():
-    # wave E clip 03: a cut at 8.6 s, then one long unpunctuated sentence the guard holds at
+    # podcast clip 03: a cut at 8.6 s, then one long unpunctuated sentence the guard holds at
     # base (she keeps leaning); the fillers inside the hold are dropped, so the guard must put
     # a framing change (level step or pulse) back at a word gap at least every ZOOM_MAX_GAP
     from hookline.media.reframe import ZOOM_MAX_GAP, guard_zoom
@@ -1696,9 +1690,6 @@ def test_face_track_px_maps_each_sample_through_crop_and_zoom():
     zoomed = face_track_px(lay, 1920, 864, [(0.0, 1.12)])
     assert zoomed[0][3] - zoomed[0][1] > x1 - x0  # a zoom-in grows the face
     assert face_track_px(lay.model_copy(update={"track_face": []}), 1920, 864, []) == []
-
-
-# --- fix wave F review round 1 ------------------------------------------------------------
 
 
 def test_track_snap_moves_back_into_a_word_gap_where_the_new_framing_fits():
@@ -1756,7 +1747,7 @@ def test_punch_in_returns_exactly_on_the_camera_change():
     levels = [(0.0, 1.0)]
     out = _punch_in(levels, [(0.0, 1.0), (4.5, ZOOM_PUNCH)], [], (0.0, 5.0), spans_at)
     assert (4.5, ZOOM_PUNCH) in out
-    # round 3: the return sits on the camera change (instant there, `scene_filter`), so the
+    # the return sits on the camera change (instant there, `scene_filter`), so the
     # punch never carries into the next scene; nothing else past the punch
     assert (5.0, 1.0) in out and all(t <= 5.0 for t, _ in out)
 
@@ -1771,7 +1762,7 @@ def test_face_track_px_leaves_a_missing_eye_line_unset():
     assert px and all(row[5] is None for row in px)  # the caption falls back to the 20% core
 
 
-# --- fix wave F review round 3: a punch never carries across a camera change -------------
+# --- a punch never carries across a camera change -------------------------------------------------
 
 
 def test_punch_in_returns_at_the_scene_end_instantly():

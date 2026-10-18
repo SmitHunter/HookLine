@@ -548,9 +548,9 @@ def test_run_job_passes_loud_seconds_to_render(fixture_video, fake_llm, settings
 def test_picks_schema_is_7_and_schema_6_picks_are_reselected(settings, tmp_path):
     from hookline.pipeline.run import PACKAGE_SCHEMA, PICKS_SCHEMA, _load_picks, _picks_key
 
-    # wave G-select: scare markers and the gameplay cause/payoff rules change the picks
+    # scare markers and the gameplay cause/payoff rules change the picks
     assert PICKS_SCHEMA == 7 and _picks_key(settings, {})["schema"] == 7
-    assert PACKAGE_SCHEMA == 3  # wave E: context, hook/hashtag/search-title checks
+    assert PACKAGE_SCHEMA == 3  # context, hook/hashtag/search-title checks
     key = _picks_key(settings, {})
     old = {**key, "schema": 6}
     ppath = tmp_path / "picks.json"
@@ -612,9 +612,6 @@ def test_failed_packaging_keeps_selection_copy_and_retries_next_run(
     assert not (job / "package.json").exists()
 
 
-# --- wave G-select ------------------------------------------------------------------------------
-
-
 def test_signals_gain_motion_and_transients_and_old_cache_is_recomputed(
     fixture_video, fake_llm, settings_tmp
 ):
@@ -627,7 +624,7 @@ def test_signals_gain_motion_and_transients_and_old_cache_is_recomputed(
     sig = json.loads((job / "signals.json").read_text(encoding="utf-8"))
     assert sig["version"] == SIGNALS_VERSION >= 2
     assert len(sig["motion"]) >= 149 and sig["transients"] == [] and sig["onsets"] == []
-    # signals cached before wave G-select (no version) are recomputed
+    # signals cached before motion and onsets existed (no version) are recomputed
     for k in ("version", "motion", "transients", "onsets"):
         del sig[k]
     (job / "signals.json").write_text(json.dumps(sig), encoding="utf-8")
@@ -672,11 +669,11 @@ def test_run_job_trims_idle_ends_before_render_and_records_the_source_bitrate(
     s = settings_tmp.model_copy(update={"clips": 1, "vertical": False, "captions": False})
     (clip,) = run_job(str(fixture_video), s, fake_llm, FakeTranscriber(duration=150))
     assert len(trims) == 1 and seen[0].end == pytest.approx(trims[0].end - 3)
-    # round 1: the hard length clamp (payoff allowance) and the quiet level reach the fit;
+    # the hard length clamp (payoff allowance) and the quiet level reach the fit;
     # interior idle gaps of the fitted pick reach the render
     assert kws[0] == {"max_s": s.max_clip_s + 5.0, "quiet_db": s.silence_db}
     assert gaps == [seen[0]] and seen_kw[0]["idle_gaps"] == [(25.0, 27.0)]
-    # wave H round 1: beats / Q-beat see every scare (flashes too) and the gameplay spikes
+    # beats / Q-beat see every scare (flashes too) and the gameplay spikes
     signals = run_mod.Signals.model_validate_json(
         (s.workspace_dir / run_mod.job_id_for(str(fixture_video)) / "signals.json").read_text(
             encoding="utf-8"
@@ -689,7 +686,7 @@ def test_run_job_trims_idle_ends_before_render_and_records_the_source_bitrate(
     assert side["source_video_kbps"] > 0
 
 
-# --- wave G-select round 1: signals cache -------------------------------------------------------
+# --- signals cache --------------------------------------------------------------------------------
 
 
 @pytest.fixture
@@ -866,7 +863,7 @@ def test_layout_profile_failure_of_any_kind_falls_back_to_per_clip(tmp_path, mon
 def test_signals_recompute_screens_without_chroma_or_for_a_new_cam_mask(
     signals_inputs, monkeypatch
 ):
-    # wave H round 1: screen chroma (cam masked) is part of the motion decode
+    # screen chroma (cam masked) is part of the motion decode
     from hookline.pipeline import run as run_mod
 
     job, src, wav, transcript = signals_inputs

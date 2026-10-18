@@ -1,8 +1,8 @@
-"""Wave G-layout review round 2: the reviewer's adversarial cases as regressions -- startles
-need a game transient, borderless cams stop at a static HUD, a cam picture must move, cams
-hidden for a third of the VOD still profile, sit-back Just Chatting, bounded game punches, the
-seam hook with a large head, a memory-bounded snap, the coarse-cam fallback and the true-peak
-trim from the pre-AAC master."""
+"""Stream profile and reaction-beat edge cases as regressions -- startles need a game
+transient, borderless cams stop at a static HUD, a cam picture must move, cams hidden for a
+third of the VOD still profile, sit-back Just Chatting, bounded game punches, the seam hook
+with a large head, a memory-bounded snap, the coarse-cam fallback and the true-peak trim from
+the pre-AAC master."""
 
 import re
 import tracemalloc

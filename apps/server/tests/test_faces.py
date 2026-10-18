@@ -72,7 +72,7 @@ def test_detector_handles_changing_frame_sizes(synthetic_stream):
     assert a and b and abs(a[0].x - b[0].x) < 0.02
 
 
-# --- wave D: yaw from landmarks, batched sampling ---------------------------------------
+# --- yaw from landmarks, batched sampling ---------------------------------------------------------
 
 
 def test_face_yaw_from_eyes_and_nose():

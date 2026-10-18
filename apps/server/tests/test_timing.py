@@ -87,7 +87,7 @@ def test_snap_onsets_ignores_words_without_a_pause_and_far_rises():
     env = _env([(0.5, 1.0), (1.05, 1.3), (2.0, 2.5)])
     words = [_w(0.5, 1.0), _w(1.1, 1.3)]  # 0.1 s gap: not a pause
     assert snap_onsets(words, env, THR) == words
-    far = [_w(0.5, 1.0), _w(2.5, 2.8)]  # wave F: a rise 0.5 s before, after a pause: taken
+    far = [_w(0.5, 1.0), _w(2.5, 2.8)]  # a rise 0.5 s before, after a pause: taken
     assert snap_onsets(far, _env([(0.5, 1.0), (2.0, 2.8)]), THR)[1].start == pytest.approx(2.0)
     after = [_w(0.5, 1.0), _w(1.5, 1.8)]  # a rise 0.5 s after the start: out of reach
     assert snap_onsets(after, _env([(0.5, 1.0), (2.0, 2.8)]), THR)[1].start == 1.5
@@ -113,7 +113,7 @@ def test_tail_end_snaps_past_the_last_word_into_silence():
     env = _env([(1.0, 2.12)])  # the word's energy runs 0.12 s past its transcribed end
     end = tail_end(2.0, 1.95, 10.0, env, THR)
     assert 2.12 <= end <= 2.0 + 0.35 + 1e-9
-    assert end == pytest.approx(2.12 + 0.2, abs=0.011)  # wave F: 0.2 s into the silence
+    assert end == pytest.approx(2.12 + 0.2, abs=0.011)  # 0.2 s into the silence
 
 
 def test_tail_end_never_reaches_the_next_word_nor_shortens():
@@ -125,7 +125,7 @@ def test_tail_end_never_reaches_the_next_word_nor_shortens():
     assert capped <= 2.35 + 1e-9  # no silence in reach: at most 0.35 s past the last word
 
 
-# --- wave D review round 1: noisy sources, bounded extensions, audible next-word onsets ----
+# --- noisy sources, bounded extensions, audible next-word onsets ----------------------------------
 
 
 def _noisy(spans: list[tuple[float, float]], bed: float = -38.0, length: float = 6.0) -> Envelope:
@@ -153,7 +153,7 @@ def test_noise_bed_between_words_still_ends_words_and_snaps_onsets():
     assert ends[0].end == pytest.approx(1.42, abs=0.011)  # not stretched to the next word
     onsets = snap_onsets(ends, env, thr)
     assert onsets[1].start == pytest.approx(2.0, abs=0.011)
-    assert tail_end(2.6, 2.6, 10.0, env, thr) == pytest.approx(2.80, abs=0.011)  # wave F: +0.2
+    assert tail_end(2.6, 2.6, 10.0, env, thr) == pytest.approx(2.80, abs=0.011)  # +0.2
 
 
 def test_refine_word_ends_without_an_energy_fall_extends_at_most_0_6_s():
@@ -182,9 +182,6 @@ def test_tail_ignores_a_next_word_start_without_an_audible_onset():
     assert tail_end(2.0, 2.0, 2.15, heard, THR) <= 2.10 + 1e-9
 
 
-# --- wave D review round 2 ---------------------------------------------------------------
-
-
 def test_voice_threshold_gives_up_on_a_bed_near_the_silence_level():
     from hookline.pipeline.timing import voice_threshold
 
@@ -206,7 +203,7 @@ def test_tail_never_swallows_a_whole_audible_next_word():
     assert tail_end(2.0, 2.0, 2.1, env, THR, next_end=2.6) == pytest.approx(2.45, abs=0.011)
 
 
-# --- fix wave F: onsets after pauses, final and silent words, splices, tail ---------------
+# --- onsets after pauses, final and silent words, splices, tail -----------------------------------
 
 
 def test_snap_onsets_reanchors_a_late_onset_to_the_first_voiced_frame_within_0_7_s():
@@ -295,7 +292,7 @@ def test_tail_end_leaves_0_2_to_0_3_s_after_the_last_word():
     assert capped <= 2.3 + 1e-9  # no silence in reach: at most 0.3 s past the last word
 
 
-# --- fix wave F, real-clip follow-ups: fragments past the window, ramps, shared words -------
+# --- fragments past the window, ramps, shared words -----------------------------------------------
 
 
 def test_snap_splices_skips_a_short_dropped_fragment_and_moves_a_misplaced_kept_word():
@@ -304,7 +301,7 @@ def test_snap_splices_skips_a_short_dropped_fragment_and_moves_a_misplaced_kept_
     # clip 01: the kept range starts at 2.67 inside the tail of the dropped "alone." (sounding
     # 2.56-2.86); DTW put the kept "I" mostly past that sound (2.80-3.05), its real onset is
     # 3.14 (a kept word mostly inside the burst is that burst and keeps it -- unless it has its
-    # own onset just after it, see round 2; this "I" is not mostly inside: the burst goes)
+    # own onset just after it, see below; this "I" is not mostly inside: the burst goes)
     env = _env([(1.0, 1.9), (2.0, 2.42), (2.56, 2.86), (3.14, 3.5)])
     words = [_w(1.0, 1.9, "kept."), _w(2.28, 2.6, "alone."), _w(2.80, 3.05, "I"),
              _w(3.3, 3.5, "put")]  # fmt: skip
@@ -352,7 +349,7 @@ def test_uncaptioned_speech_bridges_syllable_gaps():
     assert span[0] == pytest.approx(1.44, abs=0.011) and span[1] == pytest.approx(2.14, abs=0.011)
 
 
-# --- fix wave F review round 1: reviewer probes as regressions -----------------------------
+# --- reviewer probes as regressions ---------------------------------------------------------------
 
 
 def test_snap_splices_keeps_a_kept_word_its_burst_starts_with():
@@ -398,7 +395,7 @@ def test_snap_onsets_chains_back_over_a_short_gap_inside_the_word():
     assert out[1].start == pytest.approx(3.34, abs=0.011)
 
 
-# --- fix wave F review round 2: burst-skip tie-break ---------------------------------------
+# --- burst-skip tie-break -------------------------------------------------------------------------
 
 
 def test_snap_splices_skips_a_burst_whose_kept_word_has_its_own_onset_after_it():
@@ -421,7 +418,7 @@ def test_snap_splices_skips_a_burst_whose_kept_word_has_its_own_onset_after_it()
 
 
 def test_uncaptioned_speech_needs_a_voice_like_spectrum(tmp_path):
-    """Q3b (wave G-layout): a loud noise burst (game sound), a low rumble or a sustained tone
+    """Q3b: a loud noise burst (game sound), a low rumble or a sustained tone
     (a scream, chase music) with no word is not uncaptioned speech; a harmonic stretch with
     formant-like energy in the voice band, rising and falling in syllables, is."""
     import wave
@@ -458,7 +455,7 @@ def test_uncaptioned_speech_needs_a_voice_like_spectrum(tmp_path):
 
 
 def test_uncaptioned_speech_finds_quiet_speech_under_a_game_bed(tmp_path):
-    """Q3b (round 1): quiet speech over a steady game bed swings only ~3 dB round its trend
+    """Q3b: quiet speech over a steady game bed swings only ~3 dB round its trend
     (the bed fills the syllable gaps): still flagged; the bed alone (no speech) is not."""
     import wave
 

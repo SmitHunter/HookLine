@@ -393,7 +393,7 @@ def test_render_clip_cold_open_seam_flash_and_tag(
         fixture_video, fixture_wav, pick, fixture_words, tmp_path / "r", dst, settings, NoFaces()
     )
     seam = extras["seam"]
-    assert seam == pytest.approx(3.14, abs=0.03)  # wave H: speech on frame 0 -> 3-frame pre-roll
+    assert seam == pytest.approx(3.14, abs=0.03)  # speech on frame 0 -> 3-frame pre-roll
     assert seam in extras["cut_times"]
     graph = _graph(final_argvs[0])
     assert graph.count("drawbox=") == 3 and "color=white" in graph
@@ -430,7 +430,7 @@ def test_render_clip_sidecar_caption_words_and_no_seam(
     assert extras["ass_sha1"] == hashlib.sha1(ass.read_bytes()).hexdigest()
 
 
-# --- wave D: audio fades, end tail ---------------------------------------------------------
+# --- audio fades, end tail ------------------------------------------------------------------------
 
 
 def _pcm_tail_rms(path, seconds: float) -> tuple[float, float]:
@@ -489,9 +489,6 @@ def test_render_clip_extends_the_last_range_by_the_tail(
     (last_end, end, next_start) = seen[0]
     assert last_end <= end <= next_start  # the fixture's sine is voiced up to the next word
     assert extras["keep_ranges"][-1][1] == pytest.approx(end + 0.3, abs=1 / 25)
-
-
-# --- wave D review round 1 ------------------------------------------------------------------
 
 
 def test_render_clip_sidecar_zoom_steps_are_the_rendered_guarded_steps(
@@ -614,7 +611,7 @@ def test_render_cuts_interior_idle_gaps(
     assert any(abs(b - 40.4) < 0.05 for _, b in keep) and extras["removed_s"] >= 4.1
 
 
-# --- fix wave F: splice fades, sliver words at cuts, end fade, room tone, sidecar --------
+# --- splice fades, sliver words at cuts, end fade, room tone, sidecar -----------------------------
 
 
 def _pcm(path, rate=48000):
@@ -696,7 +693,7 @@ def test_render_clip_sidecar_reports_uncaptioned_speech_snaps_and_face_samples(
     from hookline.pipeline import timing as timing_mod
 
     monkeypatch.setattr(render_mod, "voice_threshold", lambda env, db: -44.0)
-    # a steady tone has no syllables (wave G-layout's Q3b voice check): take it as speech here
+    # a steady tone has no syllables (the Q3b voice check): take it as speech here
     monkeypatch.setattr(timing_mod, "UNCAPTIONED_SWING_DB", 0.0)
     s = settings.model_copy(update={"captions": False})
     extras = render_clip(
@@ -730,15 +727,12 @@ def test_with_tail_ends_0_2_to_0_3_s_after_the_speech_even_before_the_old_end():
     assert end2 >= 2.6 + 0.2 - 0.011
 
 
-# --- fix wave F review round 1 ------------------------------------------------------------
-
-
 def test_audio_fades_never_start_before_the_last_word_ends():
     from hookline.pipeline.render import audio_fades
 
     assert "afade=t=out:st=9.800:d=0.2" in audio_fades(10.0, last_word_end=9.5)
     assert "afade=t=out:st=9.850:d=0.15" in audio_fades(10.0, last_word_end=9.85)
-    # wave G-layout: at least 0.15 s, even when the last word ends right at the clip's end
+    # at least 0.15 s, even when the last word ends right at the clip's end
     assert "afade=t=out:st=9.850:d=0.15" in audio_fades(10.0, last_word_end=9.97)
     assert "afade=t=out:st=9.800:d=0.2" in audio_fades(10.0)
 
@@ -807,16 +801,13 @@ def test_drop_cut_slivers_removes_the_short_word_next_to_a_cut_even_a_little_off
 def test_drop_cut_slivers_keeps_a_short_word_away_from_the_cut():
     from hookline.pipeline.render import drop_cut_slivers
 
-    # review round 3: a short "I" 0.5 s after a cut is a real word, not a splice remnant
+    # a short "I" 0.5 s after a cut is a real word, not a splice remnant
     words = [Word(start=0.0, end=1.0, text="kept"), Word(start=1.5, end=1.56, text="I"),
              Word(start=1.6, end=2.0, text="put")]  # fmt: skip
     assert [w.text for w in drop_cut_slivers(words, cuts=[1.0])] == ["kept", "I", "put"]
     near = [Word(start=0.0, end=1.0, text="kept"), Word(start=1.05, end=1.11, text="up."),
             Word(start=1.6, end=2.0, text="put")]  # fmt: skip
     assert [w.text for w in drop_cut_slivers(near, cuts=[1.0])] == ["kept", "put"]
-
-
-# --- wave G-layout -------------------------------------------------------------------------
 
 
 def test_min_tail_gives_the_end_fade_room_on_a_noisy_bed():
@@ -971,7 +962,7 @@ def test_startle_times_sharp_onsets_at_peak_words():
     db[700:790] = -20.0  # a shout at 8.0 s that builds up (no jump)
     env = Envelope(t0=0.0, hop=0.01, db=db)
     words = [Word(start=5.0, end=5.4, text="Oh!"), Word(start=8.0, end=8.4, text="no")]
-    scares = [5.1, 8.1]  # a game sting at each (round 2: no sting, no startle)
+    scares = [5.1, 8.1]  # a game sting at each (no sting, no startle)
     assert startle_times(words, env, [(0.0, 20.0)], [5.0, 8.0], scares) == [5.0]
     assert startle_times(words, env, [(2.0, 20.0)], [3.0], scares) == [3.0]  # output s
 

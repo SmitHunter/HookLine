@@ -123,7 +123,7 @@ def test_low_crest_clip_is_linear_and_minus_14(
 def test_speech_like_clip_is_levelled_linear_and_minus_14(
     quiet_speech_video, sample_pick, settings, tmp_path, final_argvs
 ):
-    """Wave G-select: its 16 dB swings (LRA ~16) are levelled to <= 8 LU, so loudnorm goes
+    """Its 16 dB swings (LRA ~16) are levelled to <= 8 LU, so loudnorm goes
     linear (before the leveler it had to go dynamic)."""
     _check_render(quiet_speech_video, tmp_path, sample_pick, settings, final_argvs, "linear")
     m = measure_loudness(tmp_path / "out" / "01-x.mp4")
@@ -140,8 +140,8 @@ def test_high_crest_clip_lands_on_target(
     assert src.tp - src.i > 16  # the limiter must take > 4 dB off at -14 / -2 dBTP
     dst, _ = _render(high_crest_video, tmp_path, sample_pick, settings, final_argvs)
     m = measure_loudness(dst)
-    # wave G-select: the whole clip may sit up to SPEECH_SWAY_DB off -14 so its speech lands
-    # on -14 (its "words" are the loud bursts here). Round 1: the firm rungs' 1.2 s release
+    # the whole clip may sit up to SPEECH_SWAY_DB off -14 so its speech lands
+    # on -14 (its "words" are the loud bursts here). The firm rungs' 1.2 s release
     # cannot level under full-scale clicks every 0.43 s, so this clip ends on the dynamic path
     # (no sway, but dynamic loudnorm's own range control lands ~0.5 dB under): +-1 kept
     assert m.i == pytest.approx(-14.0, abs=0.5 + SPEECH_SWAY_DB)
@@ -254,7 +254,7 @@ def test_ensure_true_peak_runs_on_hot_measurement(steady_quiet_video, tmp_path, 
 def test_ensure_true_peak_acts_when_the_trim_still_overshoots(
     steady_quiet_video, tmp_path, monkeypatch
 ):
-    """Round 1: the volume-trim fallback is re-measured; a peak still over -1.2 dBTP after it
+    """The volume-trim fallback is re-measured; a peak still over -1.2 dBTP after it
     (AAC ringing again) gets a second trim instead of being left hot."""
     from hookline.media import loudness as loud_mod
 
@@ -266,7 +266,7 @@ def test_ensure_true_peak_acts_when_the_trim_still_overshoots(
     real = loud_mod._run
     monkeypatch.setattr(loud_mod, "_run", lambda cmd: (cmds.append(cmd), real(cmd))[1])
     trim = ensure_true_peak(copy)
-    # round 2: the whole correction re-applied to the original audio, not a trim of the trim
+    # the whole correction re-applied to the original audio, not a trim of the trim
     assert len(cmds) == 4 and "volume=-1.10dB" in cmds[2] and "volume=-1.60dB" in cmds[3]
     assert trim == pytest.approx(-1.6)
 
@@ -306,7 +306,7 @@ def test_render_without_audio_stream(
                  "stream=index", "-of", "csv=p=0", str(dst)]).stdout.strip() == ""  # fmt: skip
 
 
-# --- wave G-select: speech-gated loudness and a loudness range <= 8 LU -------------------------
+# --- speech-gated loudness and a loudness range <= 8 LU -------------------------------------------
 
 GAME_SPEECH = [(2.0 * k, 2.0 * k + 1.6) for k in range(15) if k not in (4, 10)]
 
@@ -398,7 +398,7 @@ def test_render_passes_the_spoken_spans_to_the_loudness_plan(
     assert spans and all(b > a for a, b in spans) and spans[0][0] < 1.0
 
 
-# --- wave G-select round 1: leveler release/knee, ladder bookkeeping --------------------------
+# --- leveler release/knee, ladder bookkeeping -----------------------------------------------------
 
 
 def test_firm_leveler_rungs_release_slowly_with_a_soft_knee():
@@ -494,7 +494,7 @@ def test_dynamic_loudnorm_aims_the_whole_clip_at_the_target(monkeypatch, tmp_pat
 
 
 def test_ensure_true_peak_limits_a_lone_transient_without_losing_loudness(tmp_path):
-    """Wave G-layout: AAC rang 1.9 dB over the plan on one game transient (stream clip 01);
+    """AAC rang 1.9 dB over the plan on one game transient (stream clip 01);
     a whole-clip volume trim then cost Q1 (-15.1 LUFS). Only the peak is limited now."""
     dst = tmp_path / "click.mp4"
     _run(["ffmpeg", "-hide_banner", "-v", "error", "-y",

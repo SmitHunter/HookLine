@@ -354,7 +354,6 @@ def test_system_prompt_covers_brief():
         "😂",
         "✂️clip",
         "not a requirement",
-        # review round 1
         "a conversation the viewer never saw",
         "The cause line is then your `first_words`",
         "must still work cold",
@@ -736,7 +735,7 @@ def test_chunk_mode_uses_global_line_numbers(long_transcript, fake_llm, settings
     assert "line numbers" in prompts[1].lower()
 
 
-# --- review round 1: line-ownership anchoring, length-safe re-anchoring, enforced endings ----
+# --- line-ownership anchoring, length-safe re-anchoring, enforced endings -------------------------
 
 _FILLER = "filler{n} words keep going here."
 _SETUP = "And one night the head chef just doesn't show up."
@@ -945,7 +944,7 @@ def test_dropped_edit_beats_are_logged(long_transcript, fake_llm, settings, capl
     assert "dropped 2 edit beat(s)" in caplog.text
 
 
-# --- M2.5 wave A: sentence lines, verbatim cold opens, opener guard, packaging checks -------
+# --- sentence lines, verbatim cold opens, opener guard, packaging checks --------------------------
 
 
 def test_prompt_lines_are_whole_sentences_not_pause_fragments(fake_llm, settings):
@@ -1150,7 +1149,7 @@ def test_same_category_pick_still_fills_when_nothing_else(long_transcript, fake_
     assert [round(p.start) for p in select_clips(long_transcript, fake_llm, s)] == [30, 90]
 
 
-def test_system_prompt_covers_wave_a():
+def test_system_prompt_covers_cold_opens_and_the_opener_guard():
     for needle in (
         "`cold_open_words`",
         "never mark it skip only because of its opening",
@@ -1173,7 +1172,7 @@ def test_system_prompt_covers_wave_a():
         assert needle in SYSTEM_PROMPT, needle
 
 
-# --- fix round 1: length bounds, front-trim, opener refinements -------------------------------
+# --- length bounds, front-trim, opener refinements ------------------------------------------------
 
 
 def test_build_prompt_states_the_length_bounds(long_transcript, fake_llm, settings):
@@ -1329,12 +1328,12 @@ def test_opener_guard_never_moves_into_the_cold_open(fake_llm, settings, caplog)
     tr, item = _guard_item({**bad, 12: teaser}, bad[10])
     item["cold_open_words"] = teaser
     (p,) = _one(tr, fake_llm, settings, item, caplog)
-    # wave C: L11 is a first-person self-quote with content, so the guard may land on it
+    # L11 is a first-person self-quote with content, so the guard may land on it
     assert p.start == 44.0 and p.cold_open == (48.25, _end_of(tr, 12))
     assert "start moved to L11" in caplog.text
 
 
-# --- fix round 2: 50 s default maximum, 1.5 s minimum teaser ----------------------------------
+# --- 50 s default maximum, 1.5 s minimum teaser ---------------------------------------------------
 
 
 def test_prompt_length_bound_follows_settings(long_transcript, fake_llm, settings):
@@ -1387,7 +1386,7 @@ def test_0_8s_teaser_without_an_extendable_start_is_dropped(fake_llm, settings, 
     assert p.cold_open is None and "under 1.0s" in caplog.text
 
 
-# --- fix wave C: self-quotes, filler starts, drop_lines, mid-line starts, endings, titles ----
+# --- self-quotes, filler starts, drop_lines, mid-line starts, endings, titles ---------------------
 
 
 @pytest.mark.parametrize(
@@ -1546,7 +1545,7 @@ def test_system_prompt_has_no_examples_from_the_test_video():
         assert needle not in low, needle
 
 
-def test_system_prompt_covers_wave_c():
+def test_system_prompt_covers_drops_and_endings():
     for needle in (
         "`drop_lines`",
         "scores about 14",
@@ -1578,9 +1577,6 @@ def test_search_title_never_ends_on_a_function_word(text):
 def test_search_title_schema_states_the_limit():
     props = SELECTION_SCHEMA["properties"]["clips"]["items"]["properties"]
     assert "60" in props["search_title"].get("description", "")  # code still caps at 70
-
-
-# --- fix wave C review round 1 ----------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -1705,9 +1701,6 @@ def test_drop_ranges_swallow_a_short_wordless_piece(settings, caplog):
     assert out == [(1.0, 3.0), (5.5, 6.0)] and "swallow" in caplog.text
 
 
-# --- fix wave C review round 2 ----------------------------------------------------------------
-
-
 def test_a_question_answered_by_its_content_words_is_never_dropped(fake_llm, settings, caplog):
     over = {13: "Did the landlord raise the rent?", 14: "The landlord raised the rent again."}
     tr, item = _guard_item(over, _FILLER.format(n=10), drop_lines=[13])
@@ -1757,7 +1750,7 @@ def test_whole_line_fallback_logs_each_drop_once(fake_llm, settings, caplog):
     assert caplog.text.count("L25 ignored") == 1
 
 
-# --- fix wave E: search titles, payoff allowance, prompt calibration --------------------------
+# --- search titles, payoff allowance, prompt calibration ------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -1836,7 +1829,7 @@ def test_build_prompt_states_the_payoff_allowance():
     assert "up to 5 s over" in p and "within 8 s" in p
 
 
-def test_system_prompt_covers_wave_e():
+def test_system_prompt_covers_hook_calibration():
     for needle in (
         "5–15 seconds earlier",
         "outside knowledge",
@@ -1849,7 +1842,7 @@ def test_system_prompt_covers_wave_e():
         assert needle in SYSTEM_PROMPT, needle
 
 
-def test_wave_e_prompts_use_no_phrases_from_the_test_video():
+def test_prompts_use_no_phrases_from_the_test_video():
     from hookline.pipeline.package import PACKAGING_SYSTEM_PROMPT
 
     for prompt in (SYSTEM_PROMPT, PACKAGING_SYSTEM_PROMPT):
@@ -1868,9 +1861,6 @@ def test_wave_e_prompts_use_no_phrases_from_the_test_video():
             "president's office",
         ):
             assert needle not in low, needle
-
-
-# --- fix wave E review round 1 ----------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -1939,7 +1929,7 @@ def test_hard_length_bound_is_the_larger_of_125_percent_and_cap_plus_5(fake_llm,
     assert (p.start, p.end) == (40.0, _end_of(tr, 15))
 
 
-# Wave-E prompt examples must not mirror the test video's line structures either: these
+# Prompt examples must not mirror the test video's line structures either: these
 # function-word skeletons came from its lines ("the original investors in ... included ...",
 # "we're not making media just to make media ... we're making media so that ...") or map one
 # to one onto its clips (whose company / which school / which war).
@@ -1970,10 +1960,10 @@ def test_packaging_rules_have_no_stray_line_break():
     assert first.endswith("mouth."), first
 
 
-# --- wave G-select: gameplay cause and payoff ---------------------------------------------------
+# --- gameplay cause and payoff --------------------------------------------------------------------
 
 
-def test_system_prompt_covers_wave_g_select():
+def test_system_prompt_covers_gameplay_cause_and_payoff():
     for needle in (
         "⚡scare",
         "2–4 seconds of the cause",
@@ -1984,7 +1974,7 @@ def test_system_prompt_covers_wave_g_select():
         assert needle in SYSTEM_PROMPT, needle
 
 
-def test_wave_g_select_prompt_uses_no_phrases_from_the_test_stream():
+def test_gameplay_prompt_uses_no_phrases_from_the_test_stream():
     low = SYSTEM_PROMPT.lower()
     for needle in (
         "poppy",

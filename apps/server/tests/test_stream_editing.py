@@ -1,5 +1,5 @@
-"""Wave H (stream editing): static / death / loading screens, payoff extension, voiceless
-stretches, the cold-open seam, caption holds, frame-0 pre-roll and the new audit checks."""
+"""Stream editing: static / death / loading screens, payoff extension, voiceless stretches,
+the cold-open seam, caption holds, frame-0 pre-roll and the stream audit checks."""
 
 import itertools
 import subprocess
@@ -187,7 +187,7 @@ def test_voiceless_stretches_are_trimmed_keeping_the_build_up(caplog):
     assert any("voiceless" in r.getMessage() for r in caplog.records)
     # a scare inside is never cut: the stretch splits there
     gaps = voiceless_gaps(pick(0, 23), words, sig(scares=[10.0]))
-    # round 1: the stretch is judged whole; ~4 s of it kept besides [scare -.5, scare +1.5]
+    # the stretch is judged whole; ~4 s of it kept besides [scare -.5, scare +1.5]
     assert gaps == [
         (pytest.approx(last + 0.3), pytest.approx(9.5 - 0.5)),
         (pytest.approx(11.5), pytest.approx(20 - VOICELESS_KEEP_S)),
@@ -198,7 +198,7 @@ def test_voiceless_stretches_are_trimmed_keeping_the_build_up(caplog):
 
 
 def test_voiceless_stretch_takes_word_ends_as_given():
-    # round 1: the caller passes voice-clamped words (`render.voiced_words`, the render's
+    # the caller passes voice-clamped words (`render.voiced_words`, the render's
     # caption clamp); no separate 1.5 s cap that would disagree with the audit
     from hookline.pipeline.boundaries import voiceless_gaps
 
@@ -240,7 +240,7 @@ def test_fit_to_signals_moves_off_screens_and_extends_the_payoff():
     # a shout ("No!", mid-chase) is no punchline: the late catch is still its payoff
     shout = [*words[:-1], W(98.2, 101.6, "No!")]
     assert fit_to_signals(pick(67.6, 101.6), shout, s, max_s=50.0).end == pytest.approx(109.3)
-    # round 1: a clip ending on a punchline keeps it when the scare is > 4 s on
+    # a clip ending on a punchline keeps it when the scare is > 4 s on
     done = [*words[:-1], *sentence(98.2, "That was a close one.")]
     end = done[-1].end
     assert fit_to_signals(pick(67.6, end), done, s, max_s=50.0).end == pytest.approx(end)
@@ -260,7 +260,7 @@ def test_cause_onset_just_before_a_segment_start():
     from hookline.pipeline.timing import cause_onset
 
     env = _env([(1.0, 1.15, -18.0), (1.4, 2.0, -15.0)])  # a bang, then the reaction
-    assert cause_onset(env, 1.47, []) == pytest.approx(0.95)  # round 1: >= the crossfade
+    assert cause_onset(env, 1.47, []) == pytest.approx(0.95)  # >= the crossfade
     assert cause_onset(env, 2.5, []) is None  # nothing within 0.6 s before
     # an earlier word owns the sound: not pulled in (no fragment)
     assert cause_onset(env, 1.47, [W(0.7, 1.2, "girl.")]) is None
@@ -416,9 +416,6 @@ def test_words_ending_inside_the_pre_roll_are_not_captioned():
     ws = [W(0.0, 0.06, "girl."), W(0.06, 0.3, "This"), W(0.3, 0.5, "makes")]
     assert [w.text for w in drop_lead_fragments(ws, 0.06)] == ["This", "makes"]
     assert drop_lead_fragments(ws, 0.0) == ws
-
-
-# --- review round 1 ----------------------------------------------------------------------------
 
 
 def _bang_source(tmp_path: Path) -> Path:
