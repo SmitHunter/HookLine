@@ -517,3 +517,39 @@ def test_ensure_true_peak_limits_a_lone_transient_without_losing_loudness(tmp_pa
     after = measure_loudness(dst)
     assert after.tp <= -1.0
     assert after.i == pytest.approx(before.i, abs=0.2)  # the loudness stays
+
+
+def test_non_finite_loudnorm_numbers_never_reach_the_plan():
+    """loudnorm prints "-inf" for silence and can print "nan" (an all-zero gated segment):
+    neither may leak into a filter string."""
+    import math
+
+    from hookline.media.loudness import _num
+
+    assert _num("-inf") == -70.0
+    assert math.isfinite(_num("nan")) and math.isfinite(_num("inf"))
+    assert _num("-23.5") == -23.5
+
+
+def test_plan_loudness_probes_the_audio_stream_once(quiet_speech_video, tmp_path, monkeypatch):
+    """The audio-stream probe is per file, not per loudnorm pass (a plan runs up to
+    MAX_DECODES passes)."""
+    import shutil
+
+    from hookline.media import ffmpeg as ffmpeg_mod
+    from hookline.media import loudness as loud_mod
+
+    clip = tmp_path / "clip.mp4"
+    shutil.copy(quiet_speech_video, clip)
+    probes = []
+    real = ffmpeg_mod._run
+
+    def counting(argv, *a, **k):
+        if argv[0] == "ffprobe":
+            probes.append(argv)
+        return real(argv, *a, **k)
+
+    monkeypatch.setattr(ffmpeg_mod, "_run", counting)
+    monkeypatch.setattr(loud_mod, "_run", counting)
+    plan = loud_mod.plan_loudness(clip, speech=[(0.5, 4.0), (5.0, 9.0)])
+    assert plan is not None and len(probes) == 1

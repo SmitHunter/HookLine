@@ -1,7 +1,9 @@
 """Two-pass EBU R128 loudness normalisation helpers (target -14 LUFS, TP -1 dBTP)."""
 
+import functools
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -41,10 +43,22 @@ def parse_loudnorm_json(stderr: str) -> dict:
     return json.loads(blocks[-1])
 
 
+def _has_audio(path: Path) -> bool:
+    """`has_audio`, probed once per file version: a loudness plan measures the same clip up
+    to MAX_DECODES times."""
+    st = path.stat()
+    return _has_audio_of(str(path.resolve()), st.st_size, st.st_mtime_ns)
+
+
+@functools.lru_cache(maxsize=64)
+def _has_audio_of(path: str, size: int, mtime_ns: int) -> bool:
+    return has_audio(Path(path))
+
+
 def measure_loudness(path: Path, prefilter: str | None = None) -> Loudness | None:
     """Pass 1 of loudnorm over `path`'s audio (after `prefilter`, e.g. COMPRESSOR, when given):
     integrated loudness, true peak, LRA. None when the file has no audio stream."""
-    if not has_audio(path):
+    if not _has_audio(path):
         return None
     chain = f"{prefilter}," if prefilter else ""
     res = _run(
@@ -69,8 +83,10 @@ def measure_loudness(path: Path, prefilter: str | None = None) -> Loudness | Non
 
 
 def _num(v: str | float) -> float:
+    """A loudnorm statistic; -inf (silence) and any other non-finite value (nan) read as
+    -70, loudnorm's own silence floor."""
     x = float(v)
-    return -70.0 if x == float("-inf") else x
+    return x if math.isfinite(x) else -70.0
 
 
 def loudnorm_mode(m: Loudness, target_i: float | None = None) -> str:
