@@ -19,6 +19,7 @@ from hookline.captions.ass import (
     early_until,
     face_samples,
     hook_y_for,
+    text_windows,
 )
 from hookline.config import Settings
 from hookline.fsutil import atomic_write_text
@@ -844,8 +845,11 @@ def render_clip(
         # the edge guard's holds/shifts, once: the graph and the sidecar get the same steps
         steps, layouts = guard_zoom(layouts, in_w, in_h, steps, cuts)
         if any(lay.cam_rect is not None for lay in layouts):
-            # the talked-over static / death screens: the streamer's reaction, full cam
-            layouts = plan_cam_covers(_to_output_spans(screens or [], keep), layouts, duration)
+            # the talked-over static / death screens: the streamer's reaction, full cam --
+            # switched on the jump cuts near its edges, off the hook title and EARLIER tag
+            texts = text_windows(pick.hook_text, duration, seam) if settings.captions else []
+            covered = [(a, b) for a, b in _to_output_spans(screens or [], keep)]
+            layouts = plan_cam_covers(covered, layouts, duration, cuts=cuts, avoid=texts)
             # full-cam reaction beats, never under the EARLIER tag nor over a scare / spike
             peaks = reaction_peaks(spoken, env, keep, scares)
             startles = startle_times(spoken, env, keep, [t for t, _ in peaks], scares, spikes)

@@ -21,9 +21,16 @@ from hookline.media.ffmpeg import probe_duration, probe_video_kbps
 from hookline.media.loudness import measure_loudness
 from hookline.media.subtitles import fonts_dir, subtitles_filter
 from hookline.models import Word
-from hookline.pipeline.boundaries import FILLER_OPENERS
+from hookline.pipeline.boundaries import (
+    FILLER_OPENERS,
+    STATIC_MIN_GAP_S,
+    VOICELESS_MAX_S,
+    VOICELESS_SCARE_POST_S,
+    VOICELESS_SCARE_PRE_S,
+)
 from hookline.pipeline.ingest import find_source
 from hookline.pipeline.layout import SCARE_POST_S, SCARE_PRE_S, SceneLayout
+from hookline.pipeline.select import _OPENER_FILLERS, _START_FILLERS
 from hookline.pipeline.signals import STATIC_CHROMA_MAX, STATIC_VOICED_MAX
 from hookline.pipeline.timing import UNCAPTIONED_S  # Q3b: what the render reports
 
@@ -301,18 +308,55 @@ def _tokens(text: str) -> list[str]:
     return _TOKEN_RE.findall(text.lower().replace("\u2019", "'"))
 
 
+# What the opening checks strip off the front: the filler trim's openers and selection's own
+# start fillers (a declared "Oh, what was that?" opens on "What was that?")
+_Q6_FILLERS = {*FILLER_OPENERS, *_OPENER_FILLERS, *_START_FILLERS, "er", "ah", "hmm", "mm"}
+
+
 def _strip_fillers(tokens: list[str]) -> list[str]:
-    """Drop leading FILLER_OPENERS (one- or two-word, within the first 3 words): the filler
-    trim may legitimately remove them from the clip."""
+    """Drop leading fillers (`_Q6_FILLERS`, one- or two-word, within the first 3 words): the
+    filler trim and selection may legitimately remove them from the clip."""
     i = 0
     while i < min(len(tokens), 3):
-        if i + 1 < len(tokens) and f"{tokens[i]} {tokens[i + 1]}" in FILLER_OPENERS:
+        if i + 1 < len(tokens) and f"{tokens[i]} {tokens[i + 1]}" in _Q6_FILLERS:
             i += 2
-        elif tokens[i] in FILLER_OPENERS:
+        elif tokens[i] in _Q6_FILLERS:
             i += 1
         else:
             break
     return tokens[i:]
+
+
+def _stem(token: str) -> str:
+    """A token without its contraction ("what's" -> "what"): a paraphrased "What is" still
+    matches the spoken "What's"."""
+    return token.split("'")[0] or token
+
+
+_SAME_WORD_RATIO = 0.75  # two spellings of one word ("Hugie" / "Huggie"), >= 4 letters
+
+
+def _same_word(a: str, b: str) -> bool:
+    a, b = _stem(a), _stem(b)
+    if a == b:
+        return True
+    if min(len(a), len(b)) < 4:
+        return False
+    return SequenceMatcher(None, a, b).ratio() >= _SAME_WORD_RATIO
+
+
+def _fixed_tokens(text: str, fixes: list | None) -> list[str]:
+    """`text`'s tokens with the packaging's caption fixes applied (`original` -> `text`, one
+    token each): first_words quote the transcript, the captions show the fix."""
+    swap: dict[str, str] = {}
+    for f in fixes or []:
+        orig, new = (
+            (f.get("original"), f.get("text")) if isinstance(f, dict) else (f.original, f.text)
+        )
+        o, n = _tokens(orig or ""), _tokens(new or "")
+        if len(o) == 1 and n:
+            swap[o[0]] = " ".join(n)
+    return [t for tok in _tokens(text) for t in swap.get(tok, tok).split()]
 
 
 def _layout_at(layouts: list[dict], t: float) -> SceneLayout | None:
@@ -546,24 +590,26 @@ def _check_hook(
     return CheckResult("Q5", not problems, cap, thr, detail)
 
 
-def first_words_match(first_words: str, spoken: str) -> float:
-    """Order-aware similarity (SequenceMatcher ratio) of the declared first words and the
-    first len(want) + min(2, len(want)) spoken tokens (a one-word declaration, "Go!", is not
-    diluted by the reaction after it), leading filler openers stripped from both."""
-    want = _strip_fillers(_tokens(first_words))
+def first_words_match(first_words: str, spoken: str, fixes: list | None = None) -> float:
+    """Order-aware similarity (SequenceMatcher ratio) of the declared first words (the
+    caption `fixes` applied) and the first len(want) + min(2, len(want)) spoken tokens (a
+    one-word declaration, "Go!", is not diluted by the reaction after it), leading fillers
+    (`_Q6_FILLERS`) stripped from both, contractions on their stem."""
+    want = [_stem(t) for t in _strip_fillers(_fixed_tokens(first_words, fixes))]
     if not want:
         return 0.0
-    got = _strip_fillers(_tokens(spoken))[: len(want) + min(2, len(want))]
+    got = [_stem(t) for t in _strip_fillers(_tokens(spoken))][: len(want) + min(2, len(want))]
     return SequenceMatcher(None, want, got, autojunk=False).ratio()
 
 
-def first_word_clipped(first_words: str, main: list[Word]) -> str | None:
-    """The first word of `first_words` (leading filler openers stripped) when the clip's
-    opening does not start on it: the render cut it ("fuck was that?" for "The fuck was
-    that?"); None when it is heard."""
-    want = _strip_fillers(_tokens(first_words))
+def first_word_clipped(first_words: str, main: list[Word], fixes: list | None = None) -> str | None:
+    """The first word of `first_words` (the caption `fixes` applied, leading fillers stripped)
+    when the clip's opening does not start on it -- nor on a contraction or another spelling
+    of it (`_same_word`): the render cut it ("fuck was that?" for "The fuck was that?");
+    None when it is heard."""
+    want = _strip_fillers(_fixed_tokens(first_words, fixes))
     got = _strip_fillers(_tokens(" ".join(w.text for w in main)))
-    if not want or not got or got[0] == want[0]:
+    if not want or not got or _same_word(got[0], want[0]):
         return None
     return want[0]
 
@@ -575,6 +621,7 @@ def _check_opening(
     declared: bool = False,
     moved: dict | None = None,
     actual_first_words: str = "",
+    fixes: list | None = None,
 ) -> CheckResult:
     """Q6: speech by 0.5 s, and the opening (after a cold-open seam, where the declared first
     sentence begins) matches `first_words` in order. `declared` marks Claude's own first_words
@@ -582,7 +629,7 @@ def _check_opening(
     recorded a move (`moved`: from_line, to_line, reason), the opening is checked against
     `actual_first_words` (where the clip now starts) and a pass is a WARN naming the move."""
     if moved:
-        res = _check_opening(words, actual_first_words, seam)
+        res = _check_opening(words, actual_first_words, seam, fixes=fixes)
         if not res.ok:
             return res
         move = f"L{moved.get('from_line')} -> L{moved.get('to_line')}"
@@ -595,9 +642,9 @@ def _check_opening(
         return CheckResult("Q6", False, None, thr, "no speech")
     start = words[0].start
     main = [w for w in words if seam is None or w.start >= seam - 0.05]
-    match = first_words_match(first_words, " ".join(w.text for w in main))
+    match = first_words_match(first_words, " ".join(w.text for w in main), fixes)
     # the clip's very first word (a cold open's main span may start on a lead-in)
-    clipped = first_word_clipped(first_words, main) if seam is None else None
+    clipped = first_word_clipped(first_words, main, fixes) if seam is None else None
     ok = start <= SPEECH_START_MAX and match >= FIRST_WORDS_MIN and clipped is None
     label = "declared first_words" if declared else "first_words"
     detail = f"speech at {start:.2f}s; {label} match {match:.0%}"
@@ -610,17 +657,37 @@ def _check_opening(
     return CheckResult("Q6", ok, round(start, 3), thr, detail)
 
 
+def _still_spans(side: dict) -> list[tuple[float, float]]:
+    """Output spans whose picture holds still whatever the zoom steps do: the full-cam beats,
+    and the covers of a scene whose cover picture does not play the steps (`cover_zoom`
+    unset: a render before it did)."""
+    out = []
+    for lay in side.get("layout") or []:
+        out += [(float(a), float(b)) for a, b in lay.get("cam_beats") or []]
+        if not lay.get("cover_zoom"):
+            out += [(float(a), float(b)) for a, b in lay.get("cam_covers") or []]
+    return out
+
+
 def _check_pacing(side: dict, duration: float) -> CheckResult:
-    """Q7: longest stretch without a cut, zoom step (as rendered, edge-guard holds applied),
-    edge-guard crop shift, reframe snap, scene (layout) change or full-cam beat / cover edge."""
+    """Q7: longest stretch without a visible framing change: a cut, zoom step (as rendered,
+    edge-guard holds applied), edge-guard crop shift, reframe snap, scene (layout) change or
+    full-cam beat / cover edge. Zoom steps, shifts and snaps inside a full-cam picture that
+    holds still (`_still_spans`) are hidden and do not count."""
     thr = f"framing change every <= {PACE_MAX_GAP:g}s"
+    still = _still_spans(side)
+
+    def seen(t: float) -> bool:
+        return not any(a + 1e-6 < t < b - 1e-6 for a, b in still)
+
     changes = {float(t) for t in side.get("cut_times") or []}
-    changes |= {float(st[0]) for st in side.get("zoom_steps") or []}
-    changes |= {float(lay["start"]) for lay in side.get("layout") or []}
-    changes |= {
+    steps = {float(st[0]) for st in side.get("zoom_steps") or []}
+    steps |= {
         float(st[0]) for lay in side.get("layout") or [] for st in lay.get("shift_steps") or []
     }
-    changes |= {float(t) for lay in side.get("layout") or [] for t in lay.get("snaps") or []}
+    steps |= {float(t) for lay in side.get("layout") or [] for t in lay.get("snaps") or []}
+    changes |= {t for t in steps if seen(t)}
+    changes |= {float(lay["start"]) for lay in side.get("layout") or []}
     changes |= {  # full-cam reaction beats and screen covers: the cut to the cam and back
         float(t)
         for lay in side.get("layout") or []
@@ -714,6 +781,7 @@ def audit_clip(
             declared=bool(sidecar.get("declared_first_words")),
             moved=sidecar.get("opener_moved"),
             actual_first_words=sidecar.get("first_words") or "",
+            fixes=sidecar.get("caption_fixes"),
         ),
         _check_pacing(sidecar, duration),
         _check_encode(_probe(mp4), sidecar.get("source_video_kbps")),
@@ -726,7 +794,8 @@ def audit_clip(
 STATIC_MAX_S = 0.5  # Q-static: voiceless static / death / loading screen frames allowed
 STATIC_FPS = 4
 STATIC_ROWS = 0.45  # the frame from this far down (a STACKED clip's gameplay panel)
-VOICELESS_WARN_S = 6.0  # Q-voiceless: a wordless span longer than this
+VOICELESS_WARN_S = VOICELESS_MAX_S  # Q-voiceless: a wordless span longer than this (talk)
+VOICELESS_SLACK_S = STATIC_MIN_GAP_S
 # Q-seam: the output's rise at the seam (`media.audio.seam_jump_db`) over the source's own
 # rise at the same source point (the sidecar's `seam_source_db`) more than this: a step / pop
 SEAM_JUMP_DB = 12.0
@@ -803,10 +872,19 @@ def _check_static(
     return CheckResult("Q-static", total <= STATIC_MAX_S + 1e-6, round(total, 3), thr, detail)
 
 
-def _check_voiceless(words: list[Word], duration: float) -> CheckResult:
+def _check_voiceless(
+    words: list[Word],
+    duration: float,
+    limit: float = VOICELESS_WARN_S,
+    scares: list[float] | None = None,
+) -> CheckResult:
     """Q-voiceless (a warning): the longest span without a caption word (clip start and end
-    included) is at most VOICELESS_WARN_S."""
-    thr = f"<= {VOICELESS_WARN_S:g}s without speech"
+    included), the scare windows in it ([scare - VOICELESS_SCARE_PRE_S, scare +
+    VOICELESS_SCARE_POST_S], output s: the payoff, which the trimmer keeps) not counted, is at
+    most `limit` -- the source's voiceless limit (the sidecar's `voiceless_limit_s`: 3 s on
+    gameplay, 6 s on talk) -- plus VOICELESS_SLACK_S (the trimmer leaves a cut under
+    STATIC_MIN_GAP_S in place)."""
+    thr = f"<= {limit:g}s without speech (scare windows aside)"
     if not words:
         return CheckResult("Q-voiceless", True, None, thr, "no speech")
     spans, cur = [], 0.0
@@ -816,10 +894,18 @@ def _check_voiceless(words: list[Word], duration: float) -> CheckResult:
         cur = max(cur, w.end)
     if duration > cur:
         spans.append((cur, duration))
-    a, b = max(spans, key=lambda g: g[1] - g[0], default=(0.0, 0.0))
-    detail = f"longest {b - a:.1f}s at {a:.2f}-{b:.2f}"
-    warn = b - a > VOICELESS_WARN_S
-    return CheckResult("Q-voiceless", True, round(b - a, 3), thr, detail, warn=warn)
+    windows = [(t - VOICELESS_SCARE_PRE_S, t + VOICELESS_SCARE_POST_S) for t in scares or []]
+
+    def dead(a: float, b: float) -> float:
+        return (b - a) - _covered_s([Word(start=x, end=y, text="") for x, y in windows], a, b)
+
+    a, b = max(spans, key=lambda g: dead(*g), default=(0.0, 0.0))
+    length = dead(a, b) if spans else 0.0
+    detail = f"longest {length:.1f}s at {a:.2f}-{b:.2f}"
+    if length < b - a - 1e-6:
+        detail += f" ({b - a:.1f}s with the scare windows)"
+    warn = length > limit + VOICELESS_SLACK_S
+    return CheckResult("Q-voiceless", True, round(length, 3), thr, detail, warn=warn)
 
 
 def _check_seam(
@@ -891,7 +977,12 @@ def _stream_checks(mp4: Path, side: dict, words: list[Word], duration: float) ->
     flags, chroma = screen_frame_flags(mp4)
     return [
         _check_static(flags, STATIC_FPS, words, chroma, hidden=_stream_hidden(side)),
-        _check_voiceless(words, duration),
+        _check_voiceless(
+            words,
+            duration,
+            limit=side.get("voiceless_limit_s") or VOICELESS_WARN_S,
+            scares=side.get("scare_times") or [],
+        ),
         _check_seam(pcm, 48000, seam, side.get("seam_source_db")),
         _check_beat(side),
     ]

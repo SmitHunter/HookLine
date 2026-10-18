@@ -387,6 +387,15 @@ def _windows(has_hook: bool, duration: float, seam: float | None) -> tuple[float
     return hook_end, hook_end, hook_end
 
 
+def text_windows(
+    hook_text: str, duration: float, seam: float | None = None
+) -> list[tuple[float, float]]:
+    """When the hook title and the EARLIER tag are up (output s; empty spans left out):
+    placed for the scene's template, they stay off the full-cam covers (`plan_cam_covers`)."""
+    hook_end, tag_start, tag_end = _windows(bool(_layout_hook(hook_text)[0]), duration, seam)
+    return [(a, b) for a, b in ((0.0, hook_end), (tag_start, tag_end)) if b > a]
+
+
 def _early(
     starts: list[float], holds: list[float], windows: tuple[float, float, float]
 ) -> list[bool]:

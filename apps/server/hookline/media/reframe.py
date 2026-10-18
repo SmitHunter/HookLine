@@ -919,12 +919,18 @@ def scene_snaps(
     return [round(t + layout.start, 3) for t in track_snaps(**_track_kw(layout, in_w, in_h, steps))]
 
 
-def zoom_at_fn(steps: Sequence[Sequence[float]], layout: SceneLayout) -> Callable[[float], float]:
+def zoom_at_fn(
+    steps: Sequence[Sequence[float]],
+    layout: SceneLayout,
+    level: Callable[[float], float] | None = None,
+) -> Callable[[float], float]:
     """Rendered zoom of `layout` at scene time t under `steps` (output time): the highest of
     the level in effect, any step easing in within ZOOM_EASE s (an ease toward a zoom-in
     already narrows the crop) and, within PUNCH_RELEASE s after a step, the level before it
-    (a zoom-out is still easing)."""
+    (a zoom-out is still easing). `level` maps a step's level (default `layout.zoom_level`;
+    `cover_level` for a full-cam cover's picture)."""
     seq = sorted((float(t), float(s)) for t, s in steps)
+    lv = level or layout.zoom_level
 
     def at(t: float) -> float:
         u = t + layout.start
@@ -932,9 +938,28 @@ def zoom_at_fn(steps: Sequence[Sequence[float]], layout: SceneLayout) -> Callabl
         levels = [past[-1][1] if past else 1.0, *(s for v, s in seq if u < v <= u + ZOOM_EASE)]
         if len(past) > 1 and u - past[-1][0] < PUNCH_RELEASE:
             levels.append(past[-2][1])
-        return max(layout.zoom_level(s) for s in levels)
+        return max(lv(s) for s in levels)
 
     return at
+
+
+# A full-cam cover's picture plays the zoom steps (`SceneLayout.cover_zoom`) at this share of
+# their step: the cam is already upscaled to fill, a full 1.2 punch would soften it
+COVER_ZOOM_SHARE = 0.6
+
+
+def cover_level(s: float) -> float:
+    """A full-cam cover picture's zoom for schedule level `s` (1.0 at the base level)."""
+    return 1.0 + (s - 1.0) * COVER_ZOOM_SHARE
+
+
+def _cover_anchor(layout: SceneLayout, in_w: int, in_h: int, wh: int, wy: int, ph: int) -> float:
+    """The head centre's row in a full-cam picture `ph` px tall from the cam window rows
+    [wy, wy + wh): a cover's zoom keeps it in place."""
+    if layout.head_box is None:
+        return ph / 2
+    _, by, _, bh = layout.head_box
+    return ((by + bh / 2) * in_h - wy) / wh * ph
 
 
 def _dedupe(steps: list[tuple[float, float]]) -> list[tuple[float, float]]:
@@ -1853,7 +1878,16 @@ def scene_filter(
     flags = LANCZOS if scene_upscale(layout, in_w, in_h) > UPSCALE_SOFT else ""
     a, b = f"[{label_out}_a]", f"[{label_out}_b]"
     if kind == "STACKED" and layout.game_box is not None:
-        return _template_filter(layout, in_w, in_h, label_in, label_out, zoom, flags)
+        cover = "1"
+        if zoom_steps and layout.cam_covers and layout.cover_zoom:
+            cover = zoom_expr(
+                zoom_steps,
+                offset=layout.start,
+                length=layout.end - layout.start,
+                level=cover_level,
+                instant=[*cut_times, layout.start, layout.end],
+            )
+        return _template_filter(layout, in_w, in_h, label_in, label_out, zoom, flags, cover)
     if kind == "STACKED":
         cw, ch, cx, cy = _cam_crop(layout, in_w, in_h)
         gw, gh = _aspect_crop(in_w, in_h, OUT_W, STACK_GAME_H)
@@ -1903,14 +1937,23 @@ def scene_filter(
 
 
 def _template_filter(
-    layout: SceneLayout, in_w: int, in_h: int, label_in: str, label_out: str, zoom: str, flags: str
+    layout: SceneLayout,
+    in_w: int,
+    in_h: int,
+    label_in: str,
+    label_out: str,
+    zoom: str,
+    flags: str,
+    cover_zoom: str = "1",
 ) -> str:
     """A stream profile's fixed STACKED template: the cam panel (the cam window, zoomed about
     its anchor row), over the gameplay panel (its source box with the overlay `patches` in it
     blurred; `game_fit`: shown whole over a blurred fill; a near-black one lifted:
     `game_lift`), and during `cam_beats` and `cam_covers` the full cam (`_full_frame`): filling
     the frame, or its picture pinned to the top over the gameplay panel's middle (a beat) or
-    black (a cover: the static screen is not shown)."""
+    black (a cover: the static screen is not shown). A cover's picture plays `cover_zoom`
+    (`zoom_expr` through `cover_level`, about the head) -- its punches and pulses; a beat's
+    holds still."""
     o = label_out
     beats, covers = layout.cam_beats, layout.cam_covers
     full = bool(beats or covers)
@@ -1975,10 +2018,24 @@ def _template_filter(
         f"[{o}_c]crop={ww}:{wh}:{wx}:{wy},scale={pw}:{ph}{LANCZOS}"
         f"{_sharpen(pw / ww)},{BEAT_VIGNETTE}"
     )
-    if fills:  # one framing for beats and covers alike
+    zoomed = bool(covers) and cover_zoom != "1"
+    if fills and not zoomed:  # one framing for beats and covers alike
         parts.append(
             f"{pic}[{o}_full];[{o}_st][{o}_full]overlay=0:0:enable='{when([*beats, *covers])}',"
             f"setsar=1[{o}]"
+        )
+        return ";".join(parts)
+    ay = _cover_anchor(layout, in_w, in_h, wh, wy, ph)
+    punch = f"null{_zoom(cover_zoom, pw, ph, ay, LANCZOS)}," if zoomed else ""
+    if fills:  # the beats' picture still, the covers' zoomed
+        parts.append(pic + (f",split=2[{o}_fb][{o}_fz]" if beats else f"[{o}_fz]"))
+        cur = f"{o}_st"
+        if beats:
+            parts.append(f"[{cur}][{o}_fb]overlay=0:0:enable='{when(beats)}'[{o}_sb]")
+            cur = f"{o}_sb"
+        parts.append(
+            f"[{o}_fz]{punch.rstrip(',')}[{o}_fc];"
+            f"[{cur}][{o}_fc]overlay=0:0:enable='{when(covers)}',setsar=1[{o}]"
         )
         return ";".join(parts)
     x0, y0 = (OUT_W - pw) // 2, int(top)
@@ -1998,7 +2055,8 @@ def _template_filter(
         cur = f"{o}_sb"
     if covers:
         parts.append(
-            f"[{o}_pc]{shown}[{o}_fc];[{cur}][{o}_fc]overlay=0:0:enable='{when(covers)}'[{o}_sc]"
+            f"[{o}_pc]{punch}{shown}[{o}_fc];"
+            f"[{cur}][{o}_fc]overlay=0:0:enable='{when(covers)}'[{o}_sc]"
         )
         cur = f"{o}_sc"
     parts.append(f"[{cur}]setsar=1[{o}]")
@@ -2211,19 +2269,27 @@ def stacked_face_px(
     ay = layout.anchor_px(STACK_CAM_H)
     full = None
     spans = [*layout.cam_beats, *layout.cam_covers]
+    cover_z = None  # a cover's picture plays the steps about the head (`_template_filter`)
+    if layout.cam_covers and layout.cover_zoom and steps:
+        cover_z = zoom_at_fn(steps, layout, level=cover_level)
     if spans and layout.cam_rect is not None:
         full = _full_frame(layout, in_w, in_h)
         (ww, wh, wx, wy), (pw, ph), top, _ = full
         left = (OUT_W - pw) / 2
+        cay = _cover_anchor(layout, in_w, in_h, wh, wy, ph)
     out: list[list[float | None]] = []
     n = max(math.ceil((layout.end - layout.start) / SAMPLE_STEP - 1e-9), 1)
     for k in range(n + 1):
         t = min(layout.start + k * SAMPLE_STEP, layout.end)
         if full is not None and any(a <= t < b for a, b in spans):
-            row = [
-                left + (hx * in_w - wx) / ww * pw, top + (hy * in_h - wy) / wh * ph,
-                left + ((hx + hw) * in_w - wx) / ww * pw, top + ((hy + hh) * in_h - wy) / wh * ph,
-            ]  # fmt: skip
+            cz = 1.0
+            if cover_z is not None and any(a <= t < b for a, b in layout.cam_covers):
+                cz = cover_z(t - layout.start)
+            xs = [(v * in_w - wx) / ww * pw for v in (hx, hx + hw)]
+            ys = [(v * in_h - wy) / wh * ph for v in (hy, hy + hh)]
+            xs = [left + pw / 2 + cz * (x - pw / 2) for x in xs]
+            ys = [top + cay + cz * (y - cay) for y in ys]
+            row = [xs[0], ys[0], xs[1], ys[1]]
             row = [min(max(v, 0.0), lim) for v, lim in zip(row, (OUT_W, OUT_H) * 2, strict=True)]
         else:
             z = zoom(t - layout.start)

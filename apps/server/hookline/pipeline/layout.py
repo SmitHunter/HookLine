@@ -102,8 +102,9 @@ BEAT_SHIFT_MAX = 1.5
 SCARE_PRE_S, SCARE_POST_S = 0.5, 1.0
 # A talked-over static / death screen (`signals.screen_runs`) inside a clip is covered by the
 # full cam (the streamer's reaction) instead of shown: each screen span on the output timeline
-# at least COVER_MIN_S long, padded COVER_PAD_S each side, spans within COVER_JOIN_S joined
-# (and run on to a scene edge that close), inside a scene with the profile's cam (`cam_covers`)
+# at least COVER_MIN_S long, padded COVER_PAD_S each side (an edge within COVER_JOIN_S of a
+# jump cut lands on it instead), spans within COVER_JOIN_S joined (and run on to a scene edge
+# that close), inside a scene with the profile's cam (`cam_covers`)
 COVER_MIN_S = 1.0
 COVER_PAD_S = 0.1
 COVER_JOIN_S = 0.5
@@ -154,6 +155,9 @@ class SceneLayout(BaseModel):
     cam_beats: list[tuple[float, float]] = []
     # ... the full-cam covers over a static / death screen (output s; `plan_cam_covers`)
     cam_covers: list[tuple[float, float]] = []
+    # ... whose full-cam picture plays the zoom steps (punches, pulses: a jump cut under a
+    # cover still gets its framing change); older renders held it still (the audit's Q7)
+    cover_zoom: bool = False
     # Gamma lift of a near-black gameplay panel: (output s, gamma) keyframes, linear between,
     # held before the first and after the last (`reframe.lift_keyframes`); [] = none
     game_lift: list[tuple[float, float]] = []
@@ -799,30 +803,68 @@ def _joined(spans: list[tuple[float, float]], gap: float) -> list[tuple[float, f
     return out
 
 
+def _snap_edge(t: float, padded: float, cuts: list[float]) -> float:
+    """A cover edge at `t` (padded to `padded`) on the cut nearest it within COVER_JOIN_S --
+    the switch to the cam and the jump cut land in one frame, never a cut under the padding
+    -- else `padded`."""
+    near = [c for c in cuts if abs(c - t) <= COVER_JOIN_S + 1e-9]
+    return min(near, key=lambda c: abs(c - t)) if near else padded
+
+
+def _outside(
+    spans: list[tuple[float, float]], avoid: list[tuple[float, float]]
+) -> list[tuple[float, float]]:
+    """The parts of `spans` outside every `avoid` span."""
+    out = []
+    for a, b in spans:
+        pieces = [(a, b)]
+        for x, y in avoid:
+            pieces = [
+                p for lo, hi in pieces for p in ((lo, min(hi, x)), (max(lo, y), hi)) if p[1] > p[0]
+            ]
+        out += pieces
+    return out
+
+
 def plan_cam_covers(
-    screens: list[tuple[float, float]], layouts: list[SceneLayout], duration: float
+    screens: list[tuple[float, float]],
+    layouts: list[SceneLayout],
+    duration: float,
+    cuts: list[float] | None = None,
+    avoid: list[tuple[float, float]] | None = None,
 ) -> list[SceneLayout]:
     """`layouts` with full-cam covers (`cam_covers`, output s) over the static / death
     `screens` (output spans, split at cuts): spans within COVER_JOIN_S joined, each at least
-    COVER_MIN_S long, padded COVER_PAD_S each side, clipped to every template STACKED scene
-    (one with the profile's cam: `cam_rect`) it overlaps and run on to that scene's edge when
-    it ends within COVER_JOIN_S of it. Scenes without the cam keep the screen."""
+    COVER_MIN_S long, each edge on a jump cut (`cuts`, output s) within COVER_JOIN_S of it,
+    else padded COVER_PAD_S; clipped to every template STACKED scene (one with the profile's
+    cam: `cam_rect`) it overlaps and run on to that scene's edge when it ends within
+    COVER_JOIN_S of it; kept out of the `avoid` spans (the hook title and the EARLIER tag,
+    `ass.text_windows`: placed for the template, they would sit on the full cam's face), a
+    part left shorter than COVER_MIN_S dropped. Scenes without the cam keep the screen. A
+    scene given covers plays the zoom steps on its full-cam cover picture (`cover_zoom`)."""
+    cuts = sorted(cuts or [])
     spans = [(a, b) for a, b in _joined(screens, COVER_JOIN_S) if b - a >= COVER_MIN_S - 1e-9]
     out = []
     for lay in layouts:
         mine = []
         if lay.kind == "STACKED" and lay.cam_rect is not None:
             for a, b in spans:
-                lo = max(a - COVER_PAD_S, lay.start, 0.0)
-                hi = min(b + COVER_PAD_S, lay.end, duration)
+                lo = max(_snap_edge(a, a - COVER_PAD_S, cuts), lay.start, 0.0)
+                hi = min(_snap_edge(b, b + COVER_PAD_S, cuts), lay.end, duration)
                 if hi <= lo:
                     continue
-                if lo - lay.start < COVER_JOIN_S:
+                # run on to a scene edge that close -- never across a cut on the way
+                if lo - lay.start < COVER_JOIN_S and not any(lay.start < c <= lo for c in cuts):
                     lo = lay.start
-                if lay.end - hi < COVER_JOIN_S:
+                if lay.end - hi < COVER_JOIN_S and not any(hi <= c < lay.end for c in cuts):
                     hi = lay.end
-                mine.append((round(lo, 3), round(hi, 3)))
+                mine += [
+                    (round(x, 3), round(y, 3))
+                    for x, y in _outside([(lo, hi)], avoid or [])
+                    if y - x >= COVER_MIN_S - 1e-9
+                ]
         if mine:
-            lay = lay.model_copy(update={"cam_covers": _joined([*lay.cam_covers, *mine], 0.0)})
+            covers = _joined([*lay.cam_covers, *mine], 0.0)
+            lay = lay.model_copy(update={"cam_covers": covers, "cover_zoom": True})
         out.append(lay)
     return out

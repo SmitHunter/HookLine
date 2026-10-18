@@ -28,6 +28,7 @@ from hookline.media.reframe import (
     scene_filter,
     stacked_face_px,
 )
+from hookline.models import Word
 from hookline.pipeline.layout import (
     COVER_MIN_S,
     SceneLayout,
@@ -54,6 +55,10 @@ BIG = LayoutProfile(  # a big cam (a 900 px tall window fits 9:16 within MAX_UPS
     face=(1360, 260, 1540, 470),
     masks=[],
 )
+
+
+def W(start, end, text="word"):
+    return Word(start=start, end=end, text=text)
 
 
 def _template(start=0.0, end=10.0, profile=PROFILE, **kw) -> SceneLayout:
@@ -313,3 +318,117 @@ def test_q_static_skips_screen_frames_under_a_cover():
     side = {"layout": [{"start": 0.0, "end": 10.0, "cam_covers": [[1.9, 8.1]],
                         "cam_beats": [[8.5, 9.5]]}]}  # fmt: skip
     assert _stream_hidden(side) == [(1.9, 8.1)]  # a beat's band still shows the gameplay
+
+
+# --- covers: cuts, the hook and tag, punches on the cam ------------------------------------------
+
+
+def test_cover_edges_snap_to_cuts_never_padding_across_one():
+    """Stream clip 05: a screen split at a jump cut at 13.3 s was covered to 13.4 s (the full
+    cam showed the new footage, then switched), and from 3.533 s, 0.33 s before a cut at
+    3.867 s (two framing changes a third of a second apart)."""
+    lay = _template(0.0, 20.0)
+    out = plan_cam_covers([(3.633, 13.3)], [lay], 20.0, cuts=[3.867, 13.3])
+    assert out[0].cam_covers == [(3.867, 13.3)]
+    # a cut just inside the padding: the edge lands on it, not 0.1 s past it
+    out = plan_cam_covers([(5.0, 9.0)], [lay], 20.0, cuts=[4.95, 9.04])
+    assert out[0].cam_covers == [(4.95, 9.04)]
+    # no cut near: padded as before
+    out = plan_cam_covers([(5.0, 9.0)], [lay], 20.0, cuts=[2.0, 12.0])
+    assert out[0].cam_covers == [(4.9, 9.1)]
+
+
+def test_covers_keep_out_of_the_hook_and_the_earlier_tag():
+    lay = _template(0.0, 20.0)
+    hook, tag = (0.0, 3.0), (9.5, 10.7)
+    out = plan_cam_covers([(1.0, 6.0), (10.0, 14.0)], [lay], 20.0, avoid=[hook, tag])
+    assert out[0].cam_covers == [(3.0, 6.1), (10.7, 14.1)]  # each starts after the text
+    # what is left after the hook is too short to cover: no cover
+    out = plan_cam_covers([(1.0, 3.6)], [lay], 20.0, avoid=[hook])
+    assert out[0].cam_covers == []
+
+
+def test_text_windows_are_the_hook_and_the_earlier_tag():
+    from hookline.captions.ass import SEAM_TAG_S, text_windows
+
+    assert text_windows("A hook", 30.0, None) == [(0.0, 3.0)]
+    assert text_windows("A hook", 30.0, 2.0) == [(0.0, 2.0), (2.0, 2.0 + SEAM_TAG_S)]
+    assert text_windows("", 30.0, None) == []
+
+
+def _cover_chain(f: str) -> str:
+    """The cover's full-cam picture chain of a template scene filter (fills or pinned)."""
+    return next(part for part in f.split(";") if part.endswith("_fc]"))
+
+
+def test_covers_carry_the_punches_on_the_full_cam_picture(src, tmp_path):
+    """Jump cuts under a cover get a framing change: the zoom steps play on the full-cam
+    picture during a cover (a beat's picture stays still)."""
+    from hookline.media.reframe import ZOOM_IN
+
+    steps = [(0.0, 1.0), (1.5, ZOOM_IN), (2.6, 1.0)]
+    covered = plan_cam_covers([(1.0, 3.0)], [_template(0.0, 4.0)], 4.0)[0]
+    assert covered.cover_zoom
+    f = scene_filter(covered, 1280, 720, "a", "b", zoom_steps=steps)
+    assert "eval=frame" in _cover_chain(f)
+    still = covered.model_copy(update={"cover_zoom": False})  # a render before it did
+    assert "eval=frame" not in _cover_chain(scene_filter(still, 1280, 720, "a", "b", steps))
+    beat = _template(0.0, 4.0, cam_beats=[(1.0, 3.0)])
+    plain = _template(0.0, 4.0)
+    n = scene_filter(plain, 1280, 720, "a", "b", steps).count("eval=frame")
+    assert scene_filter(beat, 1280, 720, "a", "b", steps).count("eval=frame") == n
+    big = plan_cam_covers([(1.0, 3.0)], [_template(0.0, 4.0, profile=BIG)], 4.0)[0]
+    assert "eval=frame" in _cover_chain(scene_filter(big, 1920, 1080, "a", "b", steps))
+    out = _render(src, reframe_graph([covered], 1280, 720, zoom_steps=steps), tmp_path / "z.mp4")
+    assert _frame(out, 2.0)[:600].std() > 10  # renders: the cam picture under the cover
+
+
+def test_stacked_face_px_follows_a_punch_under_a_cover():
+    from hookline.media.reframe import ZOOM_PUNCH
+
+    lay = plan_zoom(plan_cam_covers([(1.0, 4.0)], [_template(0.0, 5.0)], 5.0)[0], 1280, 720)
+    flat = stacked_face_px(lay, 1280, 720, [(0.0, 1.0)])
+    punched = stacked_face_px(lay, 1280, 720, [(0.0, 1.0), (2.0, ZOOM_PUNCH)])
+    at = next(i for i, r in enumerate(flat) if r[0] == pytest.approx(3.0))
+    assert punched[at][3] - punched[at][1] > flat[at][3] - flat[at][1] + 4  # the head grew
+
+
+def test_q7_counts_only_framing_changes_the_viewer_sees():
+    """Stream clip 05: zoom steps under a cover whose picture held still were counted (4.4 s
+    reported, 6.03 s seen). Steps under a beat are hidden; under a cover only when the cover
+    carries them (`cover_zoom`)."""
+    from hookline.quality import _check_pacing
+
+    steps = [[0.0, 1.0], [3.0, 1.12], [5.5, 1.0], [8.0, 1.12], [11.0, 1.0]]
+    lay = {"start": 0.0, "end": 14.0, "kind": "STACKED", "cam_covers": [[2.0, 9.5]]}
+    side = {"cut_times": [], "layout": [lay], "zoom_steps": steps}
+    res = _check_pacing(side, 14.0)
+    assert not res.ok and res.value == pytest.approx(7.5)  # 2.0 -> 9.5: nothing seen to change
+    zoomed = {**side, "layout": [{**lay, "cover_zoom": True}]}
+    assert _check_pacing(zoomed, 14.0).ok
+    beat = {"start": 0.0, "end": 14.0, "kind": "STACKED", "cam_beats": [[2.5, 5.0]],
+            "cover_zoom": True}  # fmt: skip
+    res = _check_pacing({**side, "layout": [beat], "zoom_steps": [[0.0, 1.0], [3.0, 1.12],
+                                                                  [9.0, 1.0]]}, 14.0)  # fmt: skip
+    assert res.value == pytest.approx(5.0)  # 0 -> 2.5 -> 5.0 -> 9.0 -> 14.0: 3.0 hidden
+
+
+def test_q_voiceless_uses_the_sources_limit_and_skips_scare_windows():
+    from hookline.quality import _check_voiceless
+
+    words = [W(0.0, 1.0), W(5.0, 6.0), W(6.2, 9.0)]
+    assert _check_voiceless(words, 9.0).status == "pass"  # talk: 4 s is fine
+    assert _check_voiceless(words, 9.0, limit=3.0).status == "warn"  # gameplay: 3 s
+    # a scare at 2.5 s: its window [2.0, 4.0] is the payoff, not dead footage
+    assert _check_voiceless(words, 9.0, limit=3.0, scares=[2.5]).status == "pass"
+
+
+def test_stream_checks_read_the_recorded_voiceless_limit(monkeypatch, tmp_path):
+    import hookline.quality as q
+
+    monkeypatch.setattr(q, "screen_frame_flags", lambda mp4: ([], []))
+    words = [W(0.0, 1.0), W(5.0, 6.0)]
+    side = {"voiceless_limit_s": 3.0, "scare_times": []}
+    res = next(r for r in q._stream_checks(tmp_path / "x.mp4", side, words, 6.0)
+               if r.id == "Q-voiceless")  # fmt: skip
+    assert res.status == "warn" and "3" in res.threshold
