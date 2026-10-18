@@ -1800,3 +1800,28 @@ def test_punch_in_returns_at_the_scene_end_instantly():
     chain = scene_filter(lay, 1920, 864, "a", "b", zoom_steps=out, cut_times=[4.4])
     s = chain.split("scale=w='trunc(1080*(", 1)[1].split(")/2)*2'", 1)[0].replace("\\,", ",")
     assert evaluate(s, 0.0) == pytest.approx(1.0) and evaluate(s, 0.1) == pytest.approx(1.0)
+
+
+def test_a_box_inside_the_letterbox_maps_to_nothing():
+    assert box_to_crop((0.0, 0.0, 0.5, 0.05), (320, 180), (320, 140, 0, 20)) is None
+    assert box_to_crop((0.0, 0.0, 0.5, 0.3), (320, 180), (320, 140, 0, 20)) is not None
+
+
+def test_a_facecam_override_inside_the_letterbox_is_ignored_with_a_warning(
+    monkeypatch, settings, caplog
+):
+    import logging
+
+    from hookline.pipeline import render as render_mod
+
+    seen = []
+    monkeypatch.setattr(render_mod, "detect_overlay_bands", lambda inter, crop=None: None)
+    monkeypatch.setattr(
+        render_mod,
+        "plan_layouts",
+        lambda inter, det, override, crop=None: seen.append(override) or [],
+    )
+    s = settings.model_copy(update={"facecam": (0.0, 0.0, 0.5, 0.05)})
+    with caplog.at_level(logging.WARNING, logger="hookline.pipeline.render"):
+        render_mod._plan_vertical(Path("x.mp4"), None, s, (320, 180), (320, 140, 0, 20))
+    assert seen == [None] and "letterbox" in caplog.text

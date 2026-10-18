@@ -882,3 +882,16 @@ def test_stacked_caption_and_hook_lines_clear_the_cam_panel_head():
     assert hook_y_for([lay(732)]) == 760 + HOOK_HALF
     # capped: the captions under it stay inside Q4
     assert caption_y_for([lay(760)]) <= 1180 and hook_y_for([lay(760)]) + HOOK_HALF <= 1250
+
+
+def test_a_tight_stutter_stays_two_words_when_the_shift_would_leave_a_sliver():
+    """The second word of "I -- I" is too short to start past the merge gap without becoming
+    a sliver (< MIN_WORD_S, dropped): the first word ends earlier instead."""
+    from hookline.captions.ass import MERGE_GAP_S, MIN_WORD_S, _normalise, caption_words
+
+    words = [w(0.0, 0.3, "I"), w(0.3, 0.3, "--"), w(0.32, 0.38, "I"), w(0.4, 0.8, "went.")]
+    out = caption_words(words)
+    assert [x.text for x in out] == ["I", "I", "went."]
+    assert all(x.end - x.start >= MIN_WORD_S - 1e-6 for x in out)
+    assert out[1].start - out[0].end > MERGE_GAP_S
+    assert len(_normalise(out)) == 3

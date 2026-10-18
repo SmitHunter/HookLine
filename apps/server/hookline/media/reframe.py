@@ -332,9 +332,10 @@ def box_to_crop(
     box: tuple[float, float, float, float],
     size: tuple[int, int],
     crop: tuple[int, int, int, int] | None,
-) -> tuple[float, float, float, float]:
+) -> tuple[float, float, float, float] | None:
     """A box (x, y, w, h as fractions of the full `size` frame) in `crop` space, clipped to it:
-    x' = (x * W - crop_x) / crop_w, and likewise for y, w, h."""
+    x' = (x * W - crop_x) / crop_w, and likewise for y, w, h. None when nothing of it is
+    inside the crop (a box drawn on the letterbox bars)."""
     if crop is None:
         return box
     cw, ch, cx, cy = crop
@@ -342,6 +343,8 @@ def box_to_crop(
     y0 = min(max((box[1] * size[1] - cy) / ch, 0.0), 1.0)
     x1 = min(max(((box[0] + box[2]) * size[0] - cx) / cw, 0.0), 1.0)
     y1 = min(max(((box[1] + box[3]) * size[1] - cy) / ch, 0.0), 1.0)
+    if x1 - x0 <= 0 or y1 - y0 <= 0:
+        return None
     return x0, y0, x1 - x0, y1 - y0
 
 

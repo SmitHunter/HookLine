@@ -161,17 +161,22 @@ def caption_words(words: list[Word], seam: float | None = None) -> list[Word]:
 
     A stutter split by a dropped token ("I -- I") stays two words: when the pair is close
     enough for `_normalise` to merge it as one cut fragment, the second word starts just
-    past that gap (it moves by at most MERGE_GAP_S)."""
+    past that gap (it moves by at most MERGE_GAP_S) -- or, when that would leave it under
+    MIN_WORD_S (a sliver `_normalise` drops), the first word ends that much earlier."""
     out: list[Word] = []
     removed = False
     for w in words:
         if _unspoken(w.text):
             removed = bool(out)
             continue
-        if removed and _clean(w.text) == _clean(out[-1].text):
+        tight = removed and w.start - out[-1].end <= MERGE_GAP_S
+        if tight and _clean(w.text) == _clean(out[-1].text):
             start = round(out[-1].end + MERGE_GAP_S + 0.001, 3)
-            if w.start - out[-1].end <= MERGE_GAP_S and start < w.end:
+            end = round(w.start - MERGE_GAP_S - 0.001, 3)
+            if w.end - start >= MIN_WORD_S:
                 w = w.model_copy(update={"start": start})
+            elif end - out[-1].start >= MIN_WORD_S:
+                out[-1] = out[-1].model_copy(update={"end": end})
         out.append(w)
         removed = False
     firsts = {0} if out else set()

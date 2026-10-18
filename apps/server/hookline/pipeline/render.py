@@ -567,6 +567,11 @@ def _plan_vertical(
         log.info("facecam %s overlaps overlay bands %s; bands kept", cam, bands)
         crop, bands = letterbox, None
     override = box_to_crop(cam, size, crop) if cam is not None else None
+    if cam is not None and override is None:
+        log.warning(
+            "--facecam %s lies inside the letterbox bars, outside the picture; ignored", cam
+        )
+        cam = None
     layouts = plan_layouts(inter, detector, override, crop=crop)
     if bands and cam is None and any(_cam_on_cut(lay, bands) for lay in layouts):
         log.info("facecam touches the overlay crop edge; re-planned without bands %s", bands)

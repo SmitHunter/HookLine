@@ -32,6 +32,7 @@ _STRETCHED: tuple[tuple[re.Pattern[str], str], ...] = (
 _PHRASES: dict[str, str] = {"lets go": "hype", "clip it": "clip", "clip that": "clip"}
 _PUNCT = '.,?:;"()'
 _REPEAT_RE = re.compile(r"(.)\1{2,}")
+_DOUBLE_RE = re.compile(r"(.)\1+")
 
 
 class ChatError(Exception):
@@ -106,8 +107,11 @@ def _message_kinds(body: str) -> set[str]:
         if tok.lower() == "d:":
             kinds.add("shock")
         word = _REPEAT_RE.sub(r"\1\1", low)
-        if low in _EMOTES:
-            kinds.add(_EMOTES[low])
+        # an emote as typed, or stretched ("kekwww", "letsgoooo"): repeats collapsed to two
+        # letters, then to one
+        emote = next((e for e in (low, word, _DOUBLE_RE.sub(r"\1", low)) if e in _EMOTES), None)
+        if emote is not None:
+            kinds.add(_EMOTES[emote])
         for pat, kind in _STRETCHED:
             if pat.fullmatch(word):
                 kinds.add(kind)
