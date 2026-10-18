@@ -8,6 +8,7 @@ from itertools import pairwise
 from pathlib import Path
 
 from hookline.captions.ass import (
+    SEAM_TAG_S,
     build_ass,
     caption_words,
     caption_y_for,
@@ -42,13 +43,20 @@ from hookline.media.reframe import (
     reframe_graph,
     rendered_zoom_steps,
     scene_snaps,
+    stacked_face_px,
     zoom_schedule,
 )
 from hookline.media.subtitles import fonts_dir, subtitles_filter
 from hookline.models import ClipPick, Word
 from hookline.pipeline.boundaries import refine_boundaries
 from hookline.pipeline.deadair import cut_gaps, keep_ranges, remap_words, snap_ranges
-from hookline.pipeline.layout import SceneLayout, plan_layouts
+from hookline.pipeline.layout import (
+    SceneLayout,
+    plan_cam_beats,
+    plan_layouts,
+    plan_profile_layouts,
+)
+from hookline.pipeline.profile import LayoutProfile
 from hookline.pipeline.timing import (
     anchor_words,
     last_voiced,
@@ -70,7 +78,10 @@ CAM_EDGE_LO, CAM_EDGE_HI = 0.02, 0.98  # a cam box this close to a cropped edge 
 SEAM_FLASH = (0.35, 0.6, 0.35)  # white opacity of the 3 frames around the cold-open seam
 SEAM_SLACK_S = 0.1  # frame snapping may move a cold-open range bound by up to a frame
 FADE_IN_S, FADE_OUT_S = 0.02, 0.2  # audio fades at the clip's start and end (no clicks)
-MIN_FADE_OUT_S = 0.08  # ... the end fade shortens to this at least to spare the last word
+# ... the end fade shortens to this at least to spare the last word; on a bed too noisy for
+# the end tail the clip still runs this long past the last word (`min_tail`), so a loud game
+# bed fades out instead of stopping dead
+MIN_FADE_OUT_S = 0.15
 # Room tone: a pink-noise bed this loud (dBFS RMS) under clips whose cut exposes digital
 # silence (a source noise gate's exact zeros) at least ZERO_RUN_S long; too quiet to move
 # the loudness. PINK_RMS_DB: anoisesrc pink noise at amplitude 1 (measured).
@@ -79,6 +90,14 @@ PINK_RMS_DB = -14.3
 ZERO_RUN_S = 0.2
 CUT_SLIVER_S = 0.08  # a caption word this short next to a cut is a splice remnant: not shown
 CUT_SLIVER_NEAR_S = 0.2  # ... its mid-point this close to the cut (further on: a real word)
+MIX_RATE = 48000  # the room-tone mix runs at the encode's rate (see render_clip)
+# Reaction peaks (full-cam beats): a word whose loudest frame is REACT_DB over the clip's
+# median word, or REACT_NEAR_DB when it starts within SCARE_NEAR_S after a scare (a game
+# transient); scored by that lift, plus SCARE_BONUS after a scare.
+REACT_DB = 8.0
+REACT_NEAR_DB = 4.0
+SCARE_NEAR_S = 2.0
+SCARE_BONUS = 4.0
 
 log = logging.getLogger(__name__)
 
@@ -154,6 +173,61 @@ def audio_fades(duration: float, last_word_end: float | None = None) -> str:
         f"afade=t=in:st=0:d={FADE_IN_S:g},"
         f"afade=t=out:st={start:.3f}:d={round(duration - start, 3):g}"
     )
+
+
+def min_tail(
+    keep: list[tuple[float, float]], words: list[Word], min_s: float = MIN_FADE_OUT_S
+) -> list[tuple[float, float]]:
+    """`keep` with its last range running at least `min_s` past its last word (never into
+    the next word): the end fade's room when the bed is too noisy for the end tail."""
+    if not keep:
+        return keep
+    start, end = keep[-1]
+    last = max((w.end for w in words if start < w.end <= end + 1e-6), default=None)
+    if last is None or end - last >= min_s:
+        return keep
+    nxt = min((w.start for w in words if w.start >= end - 1e-6 and w.end > end), default=None)
+    new_end = last + min_s if nxt is None else min(last + min_s, max(nxt, end))
+    return [*keep[:-1], (start, round(max(new_end, end), 3))]
+
+
+def reaction_peaks(
+    words: list[Word],
+    env: Envelope,
+    keep: list[tuple[float, float]],
+    scares: list[float] | None = None,
+) -> list[tuple[float, float]]:
+    """(output s, score) of the streamer's reaction peaks among the spoken `words` (source
+    time): a word's loudest envelope frame REACT_DB over the clip's median word, or
+    REACT_NEAR_DB when it starts within SCARE_NEAR_S after a `scares` time; time order."""
+    levels = []
+    for w in words:
+        i, j = env.index(w.start), env.index(w.end)
+        levels.append(float(env.db[i : max(j, i + 1)].max()) if len(env.db) else -100.0)
+    if not levels:
+        return []
+    median = sorted(levels)[len(levels) // 2]
+    out = []
+    for w, lv in zip(words, levels, strict=True):
+        lift = lv - median
+        near = any(0.0 <= w.start - s <= SCARE_NEAR_S for s in scares or [])
+        if lift >= REACT_DB or (near and lift >= REACT_NEAR_DB):
+            t = _to_output_time(w.start, keep)
+            if t is not None:
+                out.append((t, round(lift + (SCARE_BONUS if near else 0.0), 3)))
+    return sorted(out)
+
+
+def mix_format(path: Path) -> str:
+    """aformat pinning a room-tone mix input to float planar at MIX_RATE in `path`'s audio
+    channel layout (mono / stereo; other counts keep their own layout)."""
+    res = _run(
+        ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries",
+         "stream=channels", "-of", "csv=p=0", str(path)]
+    )  # fmt: skip
+    layout = {"1": "mono", "2": "stereo"}.get(res.stdout.strip())
+    fmt = f"aformat=sample_fmts=fltp:sample_rates={MIX_RATE}"
+    return f"{fmt}:channel_layouts={layout}" if layout else fmt
 
 
 def room_tone(duration: float) -> str:
@@ -238,17 +312,28 @@ def _plan_vertical(
     settings: Settings,
     size: tuple[int, int],
     letterbox: Crop | None,
+    profile: LayoutProfile | None = None,
 ) -> tuple[list[SceneLayout], Crop | None, tuple[int, int] | None]:
     """(layouts, crop, overlay bands) for the vertical reframe. Burned-in lower-thirds/edge
     overlays (would show cut mid-word) are cropped away unless disabled, refused by
     `combine_crop`, or they'd cut into the facecam: an override box overlapping a band, or an
     auto-detected STACKED cam touching the cropped edge (it continues into the band), keeps
     the letterbox-only crop. The facecam override (full-frame fractions) is mapped into the
-    crop's space."""
+    crop's space.
+
+    With a stream `profile` cam (and no --facecam override) every scene gets the profile's
+    fixed STACKED template (`plan_profile_layouts`); bands over the cam are kept."""
     bands = detect_overlay_bands(inter, crop=letterbox) if settings.overlay_crop else None
     crop = combine_crop(size, letterbox, bands)
     if crop == letterbox:
         bands = None  # none found, or removal refused (too much of the height)
+    if settings.facecam is None and profile is not None and profile.outer is not None:
+        x0, y0, x1, y1 = profile.outer
+        box = (x0 / size[0], y0 / size[1], (x1 - x0) / size[0], (y1 - y0) / size[1])
+        if bands and box_hits_bands(box, size, letterbox, bands):
+            log.info("profile facecam %s overlaps overlay bands %s; bands kept", box, bands)
+            crop, bands = letterbox, None
+        return plan_profile_layouts(inter, profile, crop=crop), crop, bands
     cam = settings.facecam
     if cam is not None and bands and box_hits_bands(cam, size, letterbox, bands):
         log.info("facecam %s overlaps overlay bands %s; bands kept", cam, bands)
@@ -283,6 +368,8 @@ def render_clip(
     encoder: str | None = None,
     loud_seconds: set[int] | None = None,
     idle_gaps: list[tuple[float, float]] | None = None,
+    profile: LayoutProfile | None = None,
+    scares: list[float] | None = None,
 ) -> dict:
     """Write the finished clip to `dst`; returns sidecar extras (segments, layout, keep_ranges,
     removed_s, cut_times, zoom_steps, zoom_levels, overlay_bands, seam, ass, ass_sha1,
@@ -310,7 +397,13 @@ def render_clip(
     `protect_words` keeps dead-air cuts out of word spans; pass False for
     segment-interpolated word times, which tile the timeline with no gaps. `encoder` is the
     final video encoder (resolved by `pick_encoder()` when None; pass it to avoid re-probing).
-    `idle_gaps` (source seconds, `boundaries.idle_gaps`) are cut like dead air."""
+    `idle_gaps` (source seconds, `boundaries.idle_gaps`) are cut like dead air.
+
+    `profile` (wave G-layout: the job's `profile.layout_profile`, computed once over the VOD)
+    gives the static black bars (no per-clip detection) and, for a stream with a facecam
+    overlay (unless `settings.facecam` overrides), the fixed STACKED template for every scene,
+    with up to two full-cam reaction beats at the streamer's reaction peaks (`scares`: the
+    VOD's game-transient times, source s); the sidecar's `layout_profile` records its cam."""
     work_dir.mkdir(parents=True, exist_ok=True)
     dst.parent.mkdir(parents=True, exist_ok=True)
     name = dst.stem.split("-", 1)[0]
@@ -352,6 +445,8 @@ def render_clip(
         tailed = _with_tail(untailed, timed, env, voice_db)
         bounds = list(refined.cold_open) if refined.cold_open else []
         tailed, timed = snap_splices(tailed, timed, env, voice_db, fps, fixed=bounds, adjust=True)  # type: ignore[misc]
+    elif untailed:
+        tailed = min_tail(untailed, near)  # no tail on a noisy bed: still room for the fade
     keep = snap_ranges(tailed, fps, keep_gaps=[*refined.drops, *(idle_gaps or [])])
     # words starting in the tail (no audible onset: see `tail_end`) are not captioned
     heard = [i for i, w in enumerate(timed) if not untailed or w.start < untailed[-1][1] - 1e-6]
@@ -373,8 +468,13 @@ def render_clip(
         src, keep, work_dir / f"{name}.mkv", "libx264", quality=INTERMEDIATE_QUALITY, fps=fps
     )
     duration = probe_duration(inter)
-    letterbox = detect_crop(inter)
     size = probe_size(inter)
+    if profile is not None and tuple(profile.size) != tuple(size):
+        log.warning(
+            "%s: layout profile is for %s, the cut is %s; profile ignored", name, profile.size, size
+        )
+        profile = None
+    letterbox = profile.bars if profile is not None else detect_crop(inter)
     crop, bands = letterbox, None
 
     seam = seam_time(keep, refined.cold_open)
@@ -392,7 +492,7 @@ def render_clip(
     layouts: list[SceneLayout] = []
     steps: list[tuple[float, float]] = []
     if settings.vertical:
-        layouts, crop, bands = _plan_vertical(inter, detector, settings, size, letterbox)
+        layouts, crop, bands = _plan_vertical(inter, detector, settings, size, letterbox, profile)
         in_w, in_h = (crop[0], crop[1]) if crop else size
         # per-scene zoom plan (soft-source cap, small-face base zoom, headroom); the layouts
         # carry it into the sidecar and to caption placement; word gaps steer reframe snaps
@@ -412,12 +512,20 @@ def render_clip(
         )
         # the edge guard's holds/shifts, once: the graph and the sidecar get the same steps
         steps, layouts = guard_zoom(layouts, in_w, in_h, steps, cuts)
+        if any(lay.cam_rect is not None for lay in layouts):
+            # full-cam reaction beats, never under the EARLIER tag
+            tag = [(seam, seam + SEAM_TAG_S)] if seam is not None else []
+            peaks = reaction_peaks(spoken, env, keep, scares)
+            layouts = plan_cam_beats(peaks, layouts, cuts, duration, avoid=tag)
         layouts = [
             lay.model_copy(
                 update={
                     "face_dx": face_offset(lay, in_w, in_h, steps),
                     "snaps": scene_snaps(lay, in_w, in_h, steps),
-                    "face_px": face_track_px(lay, in_w, in_h, steps),
+                    # STACKED: the cam panel's head region (full-cam beats included)
+                    "face_px": stacked_face_px(lay, in_w, in_h, steps)
+                    if lay.kind == "STACKED"
+                    else face_track_px(lay, in_w, in_h, steps),
                 }
             )
             for lay in layouts
@@ -456,9 +564,13 @@ def render_clip(
     audio_map = ["-map", "0:a?"]
     if audio is not None and bed:
         # digital silence in the cut: a room-tone bed under everything, after the loudness
-        # chain (it adds nothing measurable to the loudness), faded with the clip
+        # chain (it adds nothing measurable to the loudness), faded with the clip. Both mix
+        # inputs are pinned to one format, rate and the clip's channel layout: left to amix's
+        # negotiation (the mono bed against the stereo clip) the planned loudness came out
+        # ~0.7 dB low (podcast clips at -14.9 LUFS) and the peaks ~3 dB over the plan
+        fmt = mix_format(inter)
         graph += (
-            f";[0:a]{audio.af}[amain];{room_tone(duration)}[abed];"
+            f";[0:a]{audio.af},{fmt}[amain];{room_tone(duration)},{fmt}[abed];"
             f"[amain][abed]amix=inputs=2:duration=first:normalize=0,"
             f"{audio_fades(duration, last_end)}[aout]"
         )
@@ -505,4 +617,13 @@ def render_clip(
         "caption_words": [[w.start, w.end, w.text] for w in out_words],
         "uncaptioned_speech": uncaptioned,
         "room_tone": bed,
+        "layout_profile": _profile_summary(profile, layouts),
     }
+
+
+def _profile_summary(profile: LayoutProfile | None, layouts: list[SceneLayout]) -> dict | None:
+    """The stream profile's cam as the clip used it (source px), for the audit; None when no
+    scene used the profile's template."""
+    if profile is None or not any(lay.cam_rect is not None for lay in layouts):
+        return None
+    return profile.model_dump(mode="json", include={"cam", "outer", "head", "masks", "bars"})

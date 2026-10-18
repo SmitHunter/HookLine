@@ -5,12 +5,14 @@ from itertools import pairwise
 from pathlib import Path
 from unittest import mock
 
+import numpy as np
 import pytest
 
 from hookline.config import Settings
 from hookline.media import ffmpeg as ffmpeg_mod
 from hookline.media.ffmpeg import extract_audio, probe_duration, probe_size
 from hookline.models import ClipPick, RubricScores, Transcript, Word
+from hookline.pipeline.layout import SceneLayout
 from hookline.pipeline.render import cut_times_for, emphasis_times, render_clip
 from hookline.pipeline.run import _face_detector
 from tests.conftest import NoFaces
@@ -690,8 +692,11 @@ def test_render_clip_sidecar_reports_uncaptioned_speech_snaps_and_face_samples(
     fixture_video, fixture_wav, fixture_words, sample_pick, settings, tmp_path, monkeypatch
 ):
     from hookline.pipeline import render as render_mod
+    from hookline.pipeline import timing as timing_mod
 
     monkeypatch.setattr(render_mod, "voice_threshold", lambda env, db: -44.0)
+    # a steady tone has no syllables (wave G-layout's Q3b voice check): take it as speech here
+    monkeypatch.setattr(timing_mod, "UNCAPTIONED_SWING_DB", 0.0)
     s = settings.model_copy(update={"captions": False})
     extras = render_clip(
         fixture_video, fixture_wav, sample_pick, fixture_words[::3], tmp_path,
@@ -732,7 +737,8 @@ def test_audio_fades_never_start_before_the_last_word_ends():
 
     assert "afade=t=out:st=9.800:d=0.2" in audio_fades(10.0, last_word_end=9.5)
     assert "afade=t=out:st=9.850:d=0.15" in audio_fades(10.0, last_word_end=9.85)
-    assert "afade=t=out:st=9.920:d=0.08" in audio_fades(10.0, last_word_end=9.97)  # min 0.08 s
+    # wave G-layout: at least 0.15 s, even when the last word ends right at the clip's end
+    assert "afade=t=out:st=9.850:d=0.15" in audio_fades(10.0, last_word_end=9.97)
     assert "afade=t=out:st=9.800:d=0.2" in audio_fades(10.0)
 
 
@@ -752,6 +758,10 @@ def test_render_clip_room_tone_bed_mixes_into_aout(
     graph = _graph(final)
     assert extras["room_tone"] is True and "-af" not in final
     assert "anoisesrc=color=pink" in graph and "amix=inputs=2" in graph and "[aout]" in graph
+    # both mix inputs pinned to one format, rate and the clip's channel layout: left to amix's
+    # negotiation the mix lost ~0.7 dB and the limiter's work (podcast clips at -14.9 LUFS)
+    fmt = "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=mono"  # the sine fixture
+    assert f",{fmt}[amain]" in graph and f",{fmt}[abed]" in graph
     assert final[final.index("[aout]") - 1] == "-map"
     assert dst.exists() and probe_duration(dst) == pytest.approx(
         sum(e - st for st, e in extras["keep_ranges"]), abs=0.1
@@ -803,3 +813,109 @@ def test_drop_cut_slivers_keeps_a_short_word_away_from_the_cut():
     near = [Word(start=0.0, end=1.0, text="kept"), Word(start=1.05, end=1.11, text="up."),
             Word(start=1.6, end=2.0, text="put")]  # fmt: skip
     assert [w.text for w in drop_cut_slivers(near, cuts=[1.0])] == ["kept", "put"]
+
+
+# --- wave G-layout -------------------------------------------------------------------------
+
+
+def test_min_tail_gives_the_end_fade_room_on_a_noisy_bed():
+    from hookline.pipeline.render import MIN_FADE_OUT_S, min_tail
+
+    words = [Word(start=9.0, end=9.98, text="end."), Word(start=10.6, end=11.0, text="next")]
+    keep = [(0.0, 5.0), (6.0, 10.0)]
+    assert min_tail(keep, words) == [(0.0, 5.0), (6.0, pytest.approx(9.98 + MIN_FADE_OUT_S))]
+    # never into the next word
+    close = [words[0], Word(start=10.05, end=10.4, text="next")]
+    assert min_tail(keep, close) == [(0.0, 5.0), (6.0, 10.05)]
+    roomy = [Word(start=9.0, end=9.5, text="end.")]
+    assert min_tail(keep, roomy) == keep
+
+
+def test_reaction_peaks_loud_words_and_scare_reactions():
+    from hookline.media.audio import Envelope
+    from hookline.pipeline.render import reaction_peaks
+
+    db = np.full(2000, -30.0)  # 20 s of speech at -30 dB
+    db[500:540] = -18.0  # a shout at 5.0 s (+12 dB)
+    db[1200:1240] = -25.0  # +5 dB at 12.0 s, 1 s after a scare
+    env = Envelope(t0=0.0, hop=0.01, db=db)
+    words = [Word(start=t, end=t + 0.4, text="w") for t in (1.0, 3.0, 5.0, 8.0, 12.0, 15.0)]
+    keep = [(0.0, 20.0)]
+    peaks = reaction_peaks(words, env, keep, scares=[11.0])
+    assert [round(t, 2) for t, _ in peaks] == [5.0, 12.0]
+    assert reaction_peaks(words, env, keep, scares=[]) == [(5.0, pytest.approx(12.0))]
+    # mapped onto the output timeline
+    assert reaction_peaks(words, env, [(4.0, 20.0)], scares=[])[0][0] == pytest.approx(1.0)
+
+
+def _template_profile():
+    from hookline.pipeline.profile import LayoutProfile
+
+    # the 320x180 fixture: a cam at the left, rows 90-162
+    return LayoutProfile(
+        size=(320, 180), bars=(316, 180, 2, 0), cam=(22, 92, 90, 160), outer=(20, 90, 92, 162),
+        head=(36, 100, 76, 150), face=(42, 112, 70, 150), masks=[(20, 162, 92, 172)],
+        ring=[(20, 90, 255)], share=0.9,
+    )  # fmt: skip
+
+
+def test_render_clip_with_a_profile_uses_the_template_and_the_vod_bars(
+    fixture_video, fixture_wav, fixture_words, sample_pick, settings, tmp_path, monkeypatch,
+    final_argvs,
+):  # fmt: skip
+    from hookline.pipeline import render as render_mod
+    from hookline.pipeline.layout import stack_template
+
+    prof = _template_profile()
+
+    def boom(*a, **k):
+        raise AssertionError("per-clip black-bar detection must not run with a profile")
+
+    planned = []
+
+    def fake_plan(video, profile, crop=None):
+        planned.append(crop)
+        end = probe_duration(video)
+        tpl = stack_template(profile, crop, profile.size)
+        return [SceneLayout(start=0.0, end=end, kind="STACKED", **tpl)]
+
+    monkeypatch.setattr(render_mod, "detect_crop", boom)
+    monkeypatch.setattr(render_mod, "detect_overlay_bands", lambda video, crop=None: None)
+    monkeypatch.setattr(render_mod, "plan_profile_layouts", fake_plan)
+    monkeypatch.setattr(render_mod, "voice_threshold", lambda env, db: -44.0)
+    dst = tmp_path / "out" / "05-p.mp4"
+    extras = render_clip(
+        fixture_video, fixture_wav, sample_pick, fixture_words, tmp_path / "r", dst, settings,
+        NoFaces(), profile=prof, scares=[],
+    )  # fmt: skip
+    assert planned == [(316, 180, 2, 0)]
+    graph = _graph(final_argvs[0])
+    assert graph.startswith("[0:v]crop=316:180:2:0,")
+    (lay,) = extras["layout"]
+    assert lay["kind"] == "STACKED" and lay["game_box"] is not None and lay["face_px"]
+    assert all(r[5] is None for r in lay["face_px"])  # the head region, no eye line
+    assert extras["layout_profile"]["cam"] == [22, 92, 90, 160]
+    assert probe_size(dst) == (1080, 1920)
+    json.dumps(extras)
+
+
+def test_render_clip_facecam_override_beats_the_profile(
+    fixture_video, fixture_wav, fixture_words, sample_pick, settings, tmp_path, monkeypatch,
+    final_argvs,
+):  # fmt: skip
+    from hookline.pipeline import render as render_mod
+
+    def boom(*a, **k):
+        raise AssertionError("the --facecam override wins over the profile")
+
+    monkeypatch.setattr(render_mod, "plan_profile_layouts", boom)
+    s = settings.model_copy(update={"facecam": (0.0, 0.5, 0.3, 0.3)})
+    extras = _render_with(fixture_video, fixture_wav, sample_pick, fixture_words, tmp_path, s)
+    assert extras["layout"][0]["facecam"] == [0.0, 0.5, 0.3, 0.3]
+    extras = render_clip(
+        fixture_video, fixture_wav, sample_pick, fixture_words, tmp_path / "r2",
+        tmp_path / "06-o.mp4", s, None, profile=_template_profile(),
+    )  # fmt: skip
+    # the override (mapped into the profile's black-bar crop), not the profile's template
+    assert extras["layout"][0]["facecam"] == pytest.approx([0.0, 0.5, 94 / 316, 0.3], abs=0.004)
+    assert extras["layout"][0]["game_box"] is None and extras["layout_profile"] is None

@@ -17,6 +17,7 @@ from hookline.pipeline.boundaries import fit_to_signals, idle_gaps
 from hookline.pipeline.chat import chat_keywords, chat_rate, try_fetch_chat
 from hookline.pipeline.ingest import find_source, ingest, job_id_for
 from hookline.pipeline.package import apply_caption_fixes, package_clips
+from hookline.pipeline.profile import LayoutProfile, layout_profile
 from hookline.pipeline.render import render_clip
 from hookline.pipeline.select import NoClipsSelectedError, select_clips
 from hookline.pipeline.signals import (
@@ -250,6 +251,21 @@ def _face_detector(settings: Settings, log: Callable[[str], None]) -> FaceDetect
         return None
 
 
+def _layout_profile(
+    job_dir: Path, src: Path, detector: FaceDetector | None, log: Callable[[str], None]
+) -> LayoutProfile | None:
+    """The VOD's layout profile (black bars; a stream's facecam overlay), once per job and
+    cached; None (per-clip detection) when it cannot be computed."""
+    try:
+        prof = layout_profile(job_dir, src, detector)
+    except (FFmpegError, ValueError, OSError) as e:
+        log(f"warning: layout profile failed ({e}); layouts are planned per clip")
+        return None
+    if prof.cam is not None:
+        log(f"[6/6] render: stream facecam at {prof.cam} px (fixed STACKED template)")
+    return prof
+
+
 def run_job(
     source: str,
     settings: Settings,
@@ -350,6 +366,8 @@ def run_job(
     out_dir = settings.output_dir / job_id
     work_dir = job_dir / "render"
     detector = _face_detector(settings, log)
+    profile = _layout_profile(job_dir, src, detector, log)
+    scares = list(signals.transient_times or [])  # game transients: full-cam reaction beats
     # Segment-interpolated word times are contiguous (no gaps), so protecting them from cuts
     # would remove no dead air at all; only real word timings (DTW / whisper) are protected.
     protect = transcript.timing != "segment"
@@ -390,6 +408,8 @@ def run_job(
                 encoder=encoder,
                 loud_seconds=loud,
                 idle_gaps=gaps,
+                profile=profile,
+                scares=scares,
             )
         except (FFmpegError, ValueError, OSError) as e:
             reason = (str(e).splitlines() or [type(e).__name__])[0]

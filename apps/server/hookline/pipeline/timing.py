@@ -59,6 +59,15 @@ SPLICE_MAX_S = 0.4  # a burst of the dropped side's sound around an edge is skip
 MAX_FRAGMENT_S = 0.35  # ... when at most this much of it lies on the kept side ...
 SPLICE_LEAD_S = 0.12  # ... the range then starts this long before the next onset
 UNCAPTIONED_BRIDGE_S = 0.25  # syllable gaps up to this long inside one uncaptioned stretch
+# ... and at least this share of its frames voice-like (`audio.voice_frames`), when known:
+# game sound, screams over music and rumbles are not speech the transcript missed
+UNCAPTIONED_VOICE = 0.5
+# ... and rising and falling like syllables: inside the stretch, the envelope (smoothed over
+# SYLLABLE_SMOOTH_S) swings around its SYLLABLE_TREND_S trend by >= UNCAPTIONED_SWING_DB
+# (std): a sustained scream or a tonal music bed holds steady
+UNCAPTIONED_SWING_DB = 5.0
+SYLLABLE_SMOOTH_S = 0.05
+SYLLABLE_TREND_S = 1.0
 
 
 def _frames(env: Envelope, seconds: float) -> int:
@@ -384,15 +393,44 @@ def uncaptioned_speech(
     ranges: list[tuple[float, float]],
 ) -> list[tuple[float, float]]:
     """Voiced stretches (source s) inside the kept `ranges` that no word covers (words
-    widened by WORD_PAD_S), at least UNCAPTIONED_S long: speech the transcript missed."""
+    widened by WORD_PAD_S), at least UNCAPTIONED_S long and, when the envelope knows, with at
+    least UNCAPTIONED_VOICE of their frames voice-like: speech the transcript missed."""
     out = []
     spans = sorted((w.start - WORD_PAD_S, w.end + WORD_PAD_S) for w in words)
     for lo, hi in ranges:
         for a, b in _voiced_runs(env, lo, hi, threshold_db, UNCAPTIONED_BRIDGE_S):
             for p, q in _uncovered((a, b), spans):
-                if q - p >= UNCAPTIONED_S:
+                if q - p >= UNCAPTIONED_S and _voice_like(env, p, q):
                     out.append((round(p, 3), round(q, 3)))
     return out
+
+
+def _voice_like(env: Envelope, a: float, b: float) -> bool:
+    """Whether [a, b) sounds like speech: mostly voice-like frames (when the envelope knows)
+    and a syllabic swing (`syllable_swing`)."""
+    if env.voice is None or not len(env.voice):
+        return True
+    i, j = env.index(a), env.index(b)
+    frames = env.voice[i : max(j, i + 1)]
+    return bool(frames.mean() >= UNCAPTIONED_VOICE) and syllable_swing(env, a, b) >= (
+        UNCAPTIONED_SWING_DB
+    )
+
+
+def syllable_swing(env: Envelope, a: float, b: float) -> float:
+    """Std (dB) over [a, b) of the envelope smoothed over SYLLABLE_SMOOTH_S around its
+    SYLLABLE_TREND_S moving average (both inside the stretch, edges held)."""
+    d = env.db[env.index(a) : max(env.index(b), env.index(a) + 1)]
+    if len(d) < 2:
+        return 0.0
+
+    def mean(n: int) -> np.ndarray:
+        n = max(min(n, len(d)), 1)
+        pad = np.pad(d, (n // 2, n - 1 - n // 2), mode="edge")
+        return np.convolve(pad, np.ones(n) / n, mode="valid")
+
+    smooth, trend = _frames(env, SYLLABLE_SMOOTH_S), _frames(env, SYLLABLE_TREND_S)
+    return float((mean(smooth) - mean(trend)).std())
 
 
 def _uncovered(

@@ -10,6 +10,8 @@ from hookline.captions.ass import (
     CAPTION_BELOW,
     CAPTION_LATE_MIN_Y,
     CAPTION_MIN_Y,
+    STACKED_CAPTION_Y,
+    STACKED_HOOK_Y,
     build_ass,
     caption_y_for,
     face_rects,
@@ -104,7 +106,7 @@ def test_min_duration_and_centisecond_format():
 def test_caption_y_for():
     st = SceneLayout(start=0, end=5, kind="STACKED")
     ft = SceneLayout(start=0, end=5, kind="FIT_BLUR")
-    assert caption_y_for([st, ft]) == 700
+    assert caption_y_for([st, ft]) == STACKED_CAPTION_Y
     assert caption_y_for([ft, st]) == 1180
     assert caption_y_for([]) == 1180
 
@@ -169,7 +171,7 @@ def test_hook_and_caption_placement_per_layout():
     assert (hook_y_for([]), caption_y_for([])) == (360, 1180)
     assert (hook_y_for([_lay("FIT_BLUR")]), caption_y_for([_lay("FIT_BLUR")])) == (360, 1180)
     stacked = [_lay("STACKED"), _lay("FIT_BLUR")]
-    assert (hook_y_for(stacked), caption_y_for(stacked)) == (965, 700)  # below the seam
+    assert (hook_y_for(stacked), caption_y_for(stacked)) == (STACKED_HOOK_Y, STACKED_CAPTION_Y)
     assert hook_y_for([_lay("FACE_TRACK")]) == 360  # no face box: default
 
 
@@ -812,3 +814,49 @@ def test_face_samples_hold_to_the_scene_bounds():
     )  # fmt: skip
     times = [s[0] for s in face_samples([lay])]
     assert min(times) <= 0.125 + 1e-9 and max(times) >= 6.0 - 0.125 - 1e-9  # covers the scene
+
+
+def test_stacked_captions_sit_on_the_seam():
+    """The caption straddles the cam/gameplay seam, reaching ~5% into the gameplay panel."""
+    from hookline.captions.ass import CAPTION_ABOVE, CAPTION_BELOW
+    from hookline.pipeline.layout import STACK_CAM_H, STACK_GAME_H
+
+    top, bottom = STACKED_CAPTION_Y - CAPTION_ABOVE, STACKED_CAPTION_Y + CAPTION_BELOW
+    assert top < STACK_CAM_H < bottom
+    assert bottom - STACK_CAM_H == pytest.approx(0.05 * STACK_GAME_H, abs=4)
+    # the hook title goes below the caption, inside Q4
+    assert STACKED_HOOK_Y - 156 >= bottom + 48 and STACKED_HOOK_Y + 156 <= 1250
+
+
+def test_stacked_early_captions_clear_a_low_head_without_reaching_the_hook():
+    """The STACKED hook sits under the seam captions: a caption moved down off the cam
+    panel's head while the hook is up stays TEXT_SEPARATION above the hook box."""
+    from hookline.captions.ass import CAPTION_BELOW, TEXT_SEPARATION
+
+    head = [(t / 4, 300.0, 300.0, 780.0, 745.0, None) for t in range(13)]  # chin at 745
+    hook_text = "Parks. Open space. All under siege."
+    ass = build_ass(
+        [w(0.2, 1.0, "HELLO"), w(1.0, 2.0, "THERE")], hook_text, 3.0,
+        STACKED_CAPTION_Y, STACKED_HOOK_Y, faces=head,
+    )  # fmt: skip
+    caps = "\n".join(ln for ln in ass.splitlines() if ln.startswith("Dialogue") and ",Cap," in ln)
+    ys = [int(m) for m in re.findall(r"\\pos\(\d+,(\d+)\)", caps)]
+    hook_top = STACKED_HOOK_Y - 136 - 20  # a two-line hook box
+    assert ys and all(y + CAPTION_BELOW <= hook_top - TEXT_SEPARATION for y in ys)
+
+
+def test_stacked_caption_and_hook_lines_clear_the_cam_panel_head():
+    """The seam caption moves down just enough to clear the streamer's chin in the cam panel
+    (the hook title follows it, inside Q4); full-cam beat rows (below the panel) don't count."""
+    from hookline.captions.ass import CAPTION_ABOVE, CAPTION_FACE_GAP, HOOK_HALF
+
+    def lay(chin):
+        rows = [[t / 4, 300, 30, 780, chin, None] for t in range(9)]
+        rows += [[2.25, 0, 400, 1080, 1100, None]]  # a full-cam beat row
+        return SceneLayout(start=0, end=2.5, kind="STACKED", face_px=rows)
+
+    assert caption_y_for([lay(600)]) == STACKED_CAPTION_Y  # chin well above the seam line
+    y = caption_y_for([lay(732)])
+    assert y == 732 + CAPTION_FACE_GAP + CAPTION_ABOVE
+    assert hook_y_for([lay(732)]) == y + 61 + 48 + HOOK_HALF
+    assert hook_y_for([lay(760)]) + HOOK_HALF <= 1250  # capped: the hook stays inside Q4

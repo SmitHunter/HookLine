@@ -2,8 +2,6 @@
 
 import logging
 import math
-import re
-from collections import Counter
 from collections.abc import Callable, Sequence
 from itertools import pairwise
 from pathlib import Path
@@ -11,15 +9,20 @@ from typing import NamedTuple
 
 import numpy as np
 
-from hookline.media.ffmpeg import FFmpegError, _run, probe_duration, probe_size
-from hookline.pipeline.layout import FACE_CORE_TOP, ZOOM_TOP, SceneLayout
+from hookline.media.ffmpeg import FFmpegError, probe_duration, probe_size
+from hookline.pipeline.layout import (
+    FACE_CORE_TOP,
+    STACK_CAM_H,
+    STACK_GAME_H,
+    ZOOM_TOP,
+    SceneLayout,
+)
+from hookline.pipeline.profile import vod_bars
 from hookline.vision.faces import sample_frames
 
 log = logging.getLogger(__name__)
 
 OUT_W, OUT_H = 1080, 1920
-STACK_CAM_H = 640
-STACK_GAME_H = OUT_H - STACK_CAM_H  # 1280
 SPLIT_H = OUT_H // 2  # 960
 TRACK_ALPHA = 0.3  # EMA weight per TRACK_ALPHA_DT s of track (scaled to the sample spacing)
 TRACK_ALPHA_DT = 0.5
@@ -88,35 +91,36 @@ FLAT_ZOOM = 0.03
 STEP_SHIFT = 0.04
 _CAP_STEP = 0.005
 
-_CROP_RE = re.compile(r"crop=(\d+):(\d+):(\d+):(\d+)")
-_CROP_SAMPLES = 5
-_MIN_REMOVED = 0.02
+_CROP_SAMPLES = 15
+# Full-cam reaction beats (wave G-layout): the cam's chin lands at most here, so a caption fits
+# below it inside Q4 (caption line 1180 - 39 px visible above it - a 40 px face gap).
+BEAT_CHIN_Y = 1100
+PATCH_BLUR = "gblur=sigma=16"  # an overlay inside the gameplay panel, blurred over
 
 
-def detect_crop(video: Path) -> tuple[int, int, int, int] | None:
-    """Black-bar crop (w, h, x, y) agreed by most of 5 evenly spaced samples, or None
-    when it would remove less than 2% of both width and height."""
-    width, height = probe_size(video)
+def detect_crop(
+    video: Path, samples: int = _CROP_SAMPLES, protect: tuple[int, int, int, int] | None = None
+) -> tuple[int, int, int, int] | None:
+    """Static black-bar crop (w, h, x, y) over `samples` evenly spaced frames: the union of
+    every frame's content (`profile.vod_bars`: lines with pixels above near-pure black), grown
+    to keep `protect` (x0, y0, x1, y1 px; a facecam); None when the bars are under 2% of both
+    dimensions. A job computes this once over the whole VOD (the layout profile); a dark
+    stretch of a game is content somewhere in the VOD, so it is never cropped."""
+    width, _ = probe_size(video)
     duration = probe_duration(video)
-    found: list[tuple[int, int, int, int]] = []
-    for i in range(_CROP_SAMPLES):
-        t = duration * (i + 0.5) / _CROP_SAMPLES
-        res = _run(
-            [
-                "ffmpeg", "-hide_banner", "-ss", f"{t:.3f}", "-i", str(video),
-                "-frames:v", "3", "-vf", "cropdetect=limit=24:round=2", "-f", "null", "-",
-            ]
-        )  # fmt: skip
-        matches = _CROP_RE.findall(res.stderr)
-        if matches:
-            w, h, x, y = (int(v) for v in matches[-1])
-            found.append((w, h, x, y))
-    if not found:
+    times = [duration * (i + 0.5) / samples for i in range(samples)]
+    try:
+        frames = sample_frames(video, times, width=width)
+    except FFmpegError as e:
+        log.warning("black-bar detection skipped for %s: %s", video.name, e)
         return None
-    crop = Counter(found).most_common(1)[0][0]
-    if width - crop[0] < _MIN_REMOVED * width and height - crop[1] < _MIN_REMOVED * height:
-        return None
-    return crop
+    gray = np.stack(
+        [
+            (f[..., 0] * 0.114 + f[..., 1] * 0.587 + f[..., 2] * 0.299).astype(np.uint8)
+            for f in frames
+        ]
+    )
+    return vod_bars(gray, protect=protect)
 
 
 # Burned-in overlays (lower-thirds, alert boxes, sub goals): edge-touching bands of rows whose
@@ -1631,6 +1635,31 @@ def _cam_crop(layout: SceneLayout, in_w: int, in_h: int) -> tuple[int, int, int,
     return cw, ch, cx, cy
 
 
+def _box_px(
+    box: tuple[float, float, float, float], in_w: int, in_h: int
+) -> tuple[int, int, int, int]:
+    """A normalized (x, y, w, h) box as an even ffmpeg crop (w, h, x, y) inside in_w x in_h."""
+    w, h = min(_even(box[2] * in_w), _even(in_w)), min(_even(box[3] * in_h), _even(in_h))
+    x = min(max(round(box[0] * in_w), 0), in_w - w)
+    y = min(max(round(box[1] * in_h), 0), in_h - h)
+    return w, h, x, y
+
+
+def full_cam_geometry(layout: SceneLayout, in_w: int, in_h: int) -> tuple[float, float]:
+    """(height, top y) in output px of a full-cam beat's cam picture: the whole cam
+    (`cam_rect`) at the full output width, centred, raised so the chin (the head box's
+    bottom) lands at BEAT_CHIN_Y at most -- the caption goes under the chin."""
+    assert layout.cam_rect is not None
+    cw, ch, _, cy = _box_px(layout.cam_rect, in_w, in_h)
+    fg_h = _even(OUT_W * ch / cw)
+    y = (OUT_H - fg_h) / 2
+    if layout.head_box is not None:
+        _, hy, _, hh = layout.head_box
+        chin = ((hy + hh) * in_h - cy) / ch * fg_h
+        y = min(y, BEAT_CHIN_Y - chin)
+    return fg_h, float(max(int(y), 0))
+
+
 def _track_w(in_w: int, in_h: int) -> int:
     return min(_even(in_h * 9 / 16), _even(in_w))
 
@@ -1640,8 +1669,12 @@ def scene_upscale(layout: SceneLayout, in_w: int, in_h: int) -> float:
     kind = _kind(layout)
     if kind == "STACKED":
         cw, ch, _, _ = _cam_crop(layout, in_w, in_h)
-        gw, _ = _aspect_crop(in_w, in_h, OUT_W, STACK_GAME_H)
-        return max(OUT_W / cw, STACK_CAM_H / ch, OUT_W / gw)
+        if layout.game_box is not None:
+            gw, gh, _, _ = _box_px(layout.game_box, in_w, in_h)
+            game = OUT_W / gw if not layout.game_fit else min(OUT_W / gw, STACK_GAME_H / gh)
+        else:
+            game = OUT_W / _aspect_crop(in_w, in_h, OUT_W, STACK_GAME_H)[0]
+        return max(OUT_W / cw, STACK_CAM_H / ch, game)
     if kind == "FACE_TRACK":
         return max(OUT_W / _track_w(in_w, in_h), OUT_H / _even(in_h))
     if kind == "SPLIT":
@@ -1689,6 +1722,8 @@ def scene_filter(
         zoom = _fmt(layout.zoom_level(1.0))
     flags = LANCZOS if scene_upscale(layout, in_w, in_h) > UPSCALE_SOFT else ""
     a, b = f"[{label_out}_a]", f"[{label_out}_b]"
+    if kind == "STACKED" and layout.game_box is not None:
+        return _template_filter(layout, in_w, in_h, label_in, label_out, zoom, flags)
     if kind == "STACKED":
         cw, ch, cx, cy = _cam_crop(layout, in_w, in_h)
         gw, gh = _aspect_crop(in_w, in_h, OUT_W, STACK_GAME_H)
@@ -1735,6 +1770,67 @@ def scene_filter(
             f"[{label_out}_top][{label_out}_bot]vstack,setsar=1[{label_out}]"
         )
     return _fit_blur(label_in, label_out, in_w, in_h, zoom, flags)
+
+
+def _template_filter(
+    layout: SceneLayout, in_w: int, in_h: int, label_in: str, label_out: str, zoom: str, flags: str
+) -> str:
+    """A stream profile's fixed STACKED template: the cam panel (the cam window, zoomed about
+    its anchor row), over the gameplay panel (its source box with the overlay `patches` in it
+    blurred; `game_fit`: shown whole over a blurred fill), and during `cam_beats` the whole
+    cam full-width over its own blurred fill (`full_cam_geometry`)."""
+    o = label_out
+    beats = layout.cam_beats
+    cw, ch, cx, cy = _cam_crop(layout, in_w, in_h)
+    gw, gh, gx, gy = _box_px(layout.game_box, in_w, in_h)  # type: ignore[arg-type]
+    parts = [f"[{label_in}]split={3 if beats else 2}[{o}_a][{o}_b]" + (f"[{o}_c]" if beats else "")]
+    cam_up = max(OUT_W / cw, STACK_CAM_H / ch)
+    parts.append(
+        f"[{o}_a]crop={cw}:{ch}:{cx}:{cy},{_fill(OUT_W, STACK_CAM_H, flags)}"
+        f"{_zoom(zoom, OUT_W, STACK_CAM_H, layout.anchor_px(STACK_CAM_H), flags)}"
+        f"{_sharpen(cam_up)}[{o}_cam]"
+    )
+    chain, cur = f"[{o}_b]crop={gw}:{gh}:{gx}:{gy}", f"{o}_g0"
+    parts.append(f"{chain}[{cur}]")
+    for k, patch in enumerate(layout.patches):
+        pw, ph, px, py = _box_px(patch, in_w, in_h)
+        px, py = min(max(px - gx, 0), max(gw - pw, 0)), min(max(py - gy, 0), max(gh - ph, 0))
+        pw, ph = min(pw, gw), min(ph, gh)
+        nxt = f"{o}_g{k + 1}"
+        parts.append(
+            f"[{cur}]split=2[{cur}a][{cur}b];[{cur}b]crop={pw}:{ph}:{px}:{py},{PATCH_BLUR}[{cur}p];"
+            f"[{cur}a][{cur}p]overlay={px}:{py}[{nxt}]"
+        )
+        cur = nxt
+    if layout.game_fit:
+        fh = _even(OUT_W * gh / gw)
+        fw = OUT_W
+        if fh > STACK_GAME_H:
+            fw, fh = _even(STACK_GAME_H * gw / gh), STACK_GAME_H
+        parts.append(
+            f"[{cur}]split=2[{o}_fb][{o}_ff];[{o}_fb]{_fill(OUT_W, STACK_GAME_H)},{BLUR}[{o}_fbo];"
+            f"[{o}_ff]scale={fw}:{fh}{flags}{_sharpen(fw / gw)}[{o}_ffo];"
+            f"[{o}_fbo][{o}_ffo]overlay=(W-w)/2:(H-h)/2[{o}_game]"
+        )
+    else:
+        parts.append(f"[{cur}]scale={OUT_W}:{STACK_GAME_H}{flags}{_sharpen(OUT_W / gw)}[{o}_game]")
+    if not beats:
+        parts.append(f"[{o}_cam][{o}_game]vstack,setsar=1[{o}]")
+        return ";".join(parts)
+    parts.append(f"[{o}_cam][{o}_game]vstack[{o}_st]")
+    rw, rh, rx, ry = _box_px(layout.cam_rect, in_w, in_h)  # type: ignore[arg-type]
+    fg_h, top = full_cam_geometry(layout, in_w, in_h)
+    when = "+".join(
+        f"between(t\\,{_fmt(a - layout.start)}\\,{_fmt(b - layout.start)})" for a, b in beats
+    )
+    parts.append(
+        f"[{o}_c]crop={rw}:{rh}:{rx}:{ry},split=2[{o}_cb][{o}_cf];"
+        f"[{o}_cb]{_fill(OUT_W, OUT_H)},{BLUR}[{o}_cbo];"
+        f"[{o}_cf]scale={OUT_W}:{_even(fg_h)}{LANCZOS}{_sharpen(OUT_W / rw)}[{o}_cfo];"
+        f"[{o}_cbo][{o}_cfo]overlay=0:{int(top)}[{o}_full];"
+        f"[{o}_st][{o}_full]overlay=0:0:enable='{when}',setsar=1[{o}]"
+    )
+    return ";".join(parts)
 
 
 def _shifted(
@@ -1839,6 +1935,48 @@ def face_track_px(
     return out
 
 
+def stacked_face_px(
+    layout: SceneLayout, in_w: int, in_h: int, steps: Sequence[Sequence[float]]
+) -> list[list[float | None]]:
+    """A template STACKED scene's head (`head_box`: top of the hair to the chin) as rendered,
+    every SAMPLE_STEP s: [output t, x0, top, x1, bottom, None] in output px -- in the cam
+    panel at the zoom in effect (eases counted, about the anchor row; clipped to the panel),
+    during a full-cam beat on the full-cam picture. Captions and Q4b keep off it (the whole
+    head, not just the eyes-to-mouth core: the cam panel is small). [] for other scenes."""
+    if _kind(layout) != "STACKED" or layout.head_box is None or layout.facecam is None:
+        return []
+    hx, hy, hw, hh = layout.head_box
+    fx, fy, fw, fh = layout.facecam
+    zoom = zoom_at_fn(steps or [(0.0, 1.0)], layout)
+    ay = layout.anchor_px(STACK_CAM_H)
+    full = None
+    if layout.cam_beats and layout.cam_rect is not None:
+        full = full_cam_geometry(layout, in_w, in_h)
+        fg_h, top = full
+        rx, ry, rw, rh = layout.cam_rect
+    out: list[list[float | None]] = []
+    n = max(math.ceil((layout.end - layout.start) / SAMPLE_STEP - 1e-9), 1)
+    for k in range(n + 1):
+        t = min(layout.start + k * SAMPLE_STEP, layout.end)
+        if full is not None and any(a <= t < b for a, b in layout.cam_beats):
+            row = [
+                (hx - rx) / rw * OUT_W, top + (hy - ry) / rh * fg_h,
+                (hx + hw - rx) / rw * OUT_W, top + (hy + hh - ry) / rh * fg_h,
+            ]  # fmt: skip
+        else:
+            z = zoom(t - layout.start)
+
+            def px(v: float, z: float = z) -> float:
+                return min(max(OUT_W / 2 + z * ((v - fx) / fw * OUT_W - OUT_W / 2), 0.0), OUT_W)
+
+            def py(v: float, z: float = z) -> float:
+                return min(max(ay + z * ((v - fy) / fh * STACK_CAM_H - ay), 0.0), STACK_CAM_H)
+
+            row = [px(hx), py(hy), px(hx + hw), py(hy + hh)]
+        out.append([round(t, 3), *(round(v) for v in row), None])
+    return out
+
+
 def rendered_zoom_steps(
     layouts: Sequence[SceneLayout], steps: Sequence[Sequence[float]]
 ) -> list[tuple[float, float]]:
@@ -1857,6 +1995,9 @@ def _panel_y(layout: SceneLayout, y: float, in_w: int, in_h: int) -> tuple[float
     if _kind(layout) == "SPLIT":
         sh = _aspect_crop(in_w, in_h, OUT_W, SPLIT_H)[1]
         return (y * in_h - (in_h - sh) // 2) / sh * SPLIT_H, SPLIT_H
+    if _kind(layout) == "STACKED" and layout.facecam is not None:  # the cam panel
+        _, fy, _, fh = layout.facecam
+        return (y - fy) / fh * STACK_CAM_H, STACK_CAM_H
     return y * OUT_H, OUT_H
 
 
@@ -1868,7 +2009,8 @@ def _headroom(layout: SceneLayout, in_w: int, in_h: int) -> tuple[float, float] 
     anchors at the top: zooming in then only moves it down."""
     if layout.face_box is None or layout.head_top is None:
         return None
-    if _kind(layout) not in ("FACE_TRACK", "SPLIT"):
+    template = _kind(layout) == "STACKED" and layout.head_box is not None
+    if _kind(layout) not in ("FACE_TRACK", "SPLIT") and not template:
         return None
     fy, fh = layout.face_box
     hp, ph = _panel_y(layout, layout.head_top, in_w, in_h)

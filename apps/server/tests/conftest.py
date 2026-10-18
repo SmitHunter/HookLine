@@ -11,6 +11,14 @@ from hookline.models import ClipPick, RubricScores, Segment, Sentence, Transcrip
 from hookline.transcript_text import split_sentences
 
 
+@pytest.fixture(autouse=True)
+def _few_profile_samples(monkeypatch: pytest.MonkeyPatch) -> None:
+    """run_job's VOD layout profile seeks once per sample: a handful is enough for tests."""
+    from hookline.pipeline import profile
+
+    monkeypatch.setattr(profile, "PROFILE_SAMPLES", 8)
+
+
 @pytest.fixture(scope="session")
 def fixture_video(tmp_path_factory: pytest.TempPathFactory) -> Path:
     d = tmp_path_factory.mktemp("my clips 🎮")

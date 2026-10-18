@@ -16,6 +16,15 @@ _SIL_START_RE = re.compile(r"silence_start:\s*(-?[\d.]+)")
 _SIL_END_RE = re.compile(r"silence_end:\s*(-?[\d.]+)")
 ENVELOPE_RATE = 16000
 ENVELOPE_HOP = 0.01
+# Voice likelihood per envelope frame (Q3b: game sound and music are not uncaptioned speech):
+# over a VOICE_WINDOW-sample window, the voice band's (VOICE_BAND Hz) share of the energy in
+# VOICE_BROAD Hz is >= VOICE_SHARE and the spectral flatness (geometric / arithmetic mean of
+# the power spectrum: ~1 for noise, near 0 for harmonic sound) <= VOICE_FLATNESS.
+VOICE_WINDOW = 512
+VOICE_BAND = (250.0, 4000.0)
+VOICE_BROAD = (60.0, 8000.0)
+VOICE_SHARE = 0.5
+VOICE_FLATNESS = 0.35
 
 
 @dataclass(frozen=True)
@@ -26,6 +35,7 @@ class Envelope:
     t0: float
     hop: float
     db: np.ndarray
+    voice: np.ndarray | None = None  # per frame: voice-like spectrum (`voice_frames`)
 
     def index(self, t: float) -> int:
         """The frame containing time `t`, clamped to the envelope."""
@@ -60,7 +70,28 @@ def energy_envelope(wav: Path, start: float, end: float, hop: float = ENVELOPE_H
     frames = pcm[: len(pcm) // n * n].reshape(-1, n)
     rms = np.sqrt((frames**2).mean(axis=1)) if len(frames) else np.zeros(0)
     db = np.maximum(20 * np.log10(np.maximum(rms, 1e-10)), _FLOOR_DB)
-    return Envelope(t0=start, hop=hop, db=db)
+    return Envelope(t0=start, hop=hop, db=db, voice=voice_frames(pcm, n, len(db)))
+
+
+def voice_frames(pcm: np.ndarray, hop: int, count: int, rate: int = ENVELOPE_RATE) -> np.ndarray:
+    """Per `hop`-sample frame (`count` of them) of mono `pcm`: whether its spectrum (a
+    VOICE_WINDOW Hann window centred on the frame) looks like a voice -- most of its energy in
+    the voice band and harmonic rather than noisy (VOICE_SHARE, VOICE_FLATNESS)."""
+    if count == 0:
+        return np.zeros(0, bool)
+    half = VOICE_WINDOW // 2
+    padded = np.pad(pcm, (half, half + VOICE_WINDOW))
+    starts = np.arange(count) * hop + hop // 2
+    idx = starts[:, None] + np.arange(VOICE_WINDOW)[None, :]
+    spec = np.abs(np.fft.rfft(padded[idx] * np.hanning(VOICE_WINDOW), axis=1)) ** 2
+    freqs = np.fft.rfftfreq(VOICE_WINDOW, 1 / rate)
+    broad = (freqs >= VOICE_BROAD[0]) & (freqs <= VOICE_BROAD[1])
+    band = (freqs >= VOICE_BAND[0]) & (freqs <= VOICE_BAND[1])
+    p = spec[:, broad] + 1e-12
+    total = p.sum(axis=1)
+    share = spec[:, band].sum(axis=1) / total
+    flat = np.exp(np.log(p).mean(axis=1)) / p.mean(axis=1)
+    return (share >= VOICE_SHARE) & (flat <= VOICE_FLATNESS)
 
 
 def _sample_rate(wav: Path) -> int:

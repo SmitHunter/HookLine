@@ -484,6 +484,27 @@ def test_q7_counts_guard_shift_steps_and_reads_the_guarded_zoom_steps():
     assert _check_pacing(side, 13.0).ok  # the shift at 9.0 is a framing change
 
 
+def test_q7_counts_full_cam_beats_as_framing_changes():
+    from hookline.quality import _check_pacing
+
+    lay = {"start": 0.0, "end": 14.0, "kind": "STACKED", "cam_beats": [[4.0, 6.5]]}
+    side = {"cut_times": [], "layout": [lay], "zoom_steps": [[0.0, 1.0], [11.0, 1.05]]}
+    assert _check_pacing(side, 14.0).ok  # 0 -> 4 (in) -> 6.5 (out) -> 11
+    assert not _check_pacing({**side, "layout": [{**lay, "cam_beats": []}]}, 14.0).ok
+
+
+def test_q4b_checks_the_stacked_head_region():
+    """A caption over the streamer's head in the cam panel fails Q4b (head, not eye line)."""
+    from hookline.quality import _check_face
+
+    lay = {"start": 0.0, "end": 4.0, "kind": "STACKED",
+           "face_px": [[t / 4, 300, 100, 780, 700, None] for t in range(17)]}  # fmt: skip
+    over = [("caption", 1.0, (300, 120, 700, 200), (0.5, 1.5))]
+    clear = [("caption", 1.0, (300, 720, 700, 800), (0.5, 1.5))]
+    assert not _check_face(over, [lay], []).ok
+    assert _check_face(clear, [lay], []).ok
+
+
 # --- wave G-select: Q8 bitrate bar follows the source ------------------------------------------
 
 
@@ -619,3 +640,18 @@ def test_q4b_holds_the_nearest_face_sample_to_the_scene_bounds():
     box = (300, 1150, 780, 1220)
     assert _face_share(box, _px_layout(None, rows), [], 6.5, (6.0, 7.0)) > 0.10
     assert _face_share(box, _px_layout(None, rows), [], 0.5, (0.2, 0.8)) > 0.10
+
+
+def test_event_window_does_not_join_separate_pages_with_the_same_text():
+    """Two "OH!" pages seconds apart are two windows (the later one was flagged against the
+    earlier one's full-cam face); a page's word-by-word events are one."""
+    from hookline.quality import _Event, _event_window
+
+    evs = [
+        _Event(17.6, 19.2, "Cap", "OH!"),
+        _Event(20.4, 23.5, "Cap", "OH!"),
+        _Event(24.2, 25.0, "Cap", "WE GOT HIM"),
+        _Event(25.0, 26.4, "Cap", "WE GOT HIM"),
+    ]
+    assert _event_window(evs, 21.0) == (20.4, 23.5)
+    assert _event_window(evs, 25.5) == (24.2, 26.4)

@@ -97,6 +97,7 @@ COVERAGE_MIN = 0.95
 SAFE_X, SAFE_Y = (60, 888), (290, 1250)
 FACE_OVERLAP_MAX = 0.10
 UNCAPTIONED_S = 0.3  # Q3b: the render reports voiced stretches longer than this (timing.py)
+PAGE_TOUCH_S = 0.05  # a caption group's events touch (word highlights); a gap starts another
 FACE_SAMPLE_HALF_S = 0.125  # a per-sample face (4 fps) stands for this long either side
 SPEECH_START_MAX = 0.5
 FIRST_WORDS_MIN = 0.6
@@ -471,15 +472,20 @@ def _face_share(
 
 
 def _event_window(events: list[_Event], t: float) -> tuple[float, float] | None:
-    """When the caption group (consecutive events with one text: its words light up in turn)
-    or hook event shown at `t` is on screen; None when nothing is."""
+    """When the caption group (consecutive, touching events with one text: its words light up
+    in turn) or hook event shown at `t` is on screen; None when nothing is. A later page with
+    the same text after a gap is another group."""
     hit = next((i for i, e in enumerate(events) if e.start <= t < e.end), None)
     if hit is None:
         return None
+
+    def joined(a: _Event, b: _Event) -> bool:
+        return a.text == b.text and b.start - a.end <= PAGE_TOUCH_S
+
     lo = hi = hit
-    while lo > 0 and events[lo - 1].text == events[hit].text:
+    while lo > 0 and joined(events[lo - 1], events[lo]):
         lo -= 1
-    while hi + 1 < len(events) and events[hi + 1].text == events[hit].text:
+    while hi + 1 < len(events) and joined(events[hi], events[hi + 1]):
         hi += 1
     return events[lo].start, events[hi].end
 
@@ -582,7 +588,7 @@ def _check_opening(
 
 def _check_pacing(side: dict, duration: float) -> CheckResult:
     """Q7: longest stretch without a cut, zoom step (as rendered, edge-guard holds applied),
-    edge-guard crop shift, reframe snap or scene (layout) change."""
+    edge-guard crop shift, reframe snap, scene (layout) change or full-cam beat edge."""
     thr = f"framing change every <= {PACE_MAX_GAP:g}s"
     changes = {float(t) for t in side.get("cut_times") or []}
     changes |= {float(st[0]) for st in side.get("zoom_steps") or []}
@@ -591,6 +597,9 @@ def _check_pacing(side: dict, duration: float) -> CheckResult:
         float(st[0]) for lay in side.get("layout") or [] for st in lay.get("shift_steps") or []
     }
     changes |= {float(t) for lay in side.get("layout") or [] for t in lay.get("snaps") or []}
+    changes |= {  # full-cam reaction beats: the cut to the cam and back
+        float(t) for lay in side.get("layout") or [] for b in lay.get("cam_beats") or [] for t in b
+    }
     pts = sorted({0.0, duration} | {t for t in changes if 0 < t < duration})
     gap, at = max((b - a, a) for a, b in pairwise(pts))
     detail = f"longest {gap:.1f}s from {at:.1f}s"

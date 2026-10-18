@@ -243,10 +243,16 @@ def test_ensure_true_peak_runs_on_hot_measurement(steady_quiet_video, tmp_path, 
     cmds = []
     real = loud_mod._run
     monkeypatch.setattr(loud_mod, "_run", lambda cmd: (cmds.append(cmd), real(cmd))[1])
+    assert ensure_true_peak(copy) == pytest.approx(0.0)  # the peak limiter did it
+    (cmd,) = cmds
+    assert cmd[cmd.index("-c:v") + 1] == "copy"
+    assert "alimiter=limit=" in cmd[cmd.index("-af") + 1]
+    # the limiter not enough: a volume trim from the original instead
+    tps = iter([-0.4, -1.0, -1.9])
+    cmds.clear()
     trim = ensure_true_peak(copy)
     assert trim == pytest.approx(-1.1)
-    (cmd,) = cmds
-    assert cmd[cmd.index("-c:v") + 1] == "copy" and "volume=-1.10dB" in cmd
+    assert len(cmds) == 2 and "volume=-1.10dB" in cmds[1]
 
 
 def test_render_runs_true_peak_check(
@@ -471,3 +477,21 @@ def test_dynamic_loudnorm_aims_the_whole_clip_at_the_target(monkeypatch, tmp_pat
     speech = [(k * 2.0, k * 2.0 + 1.5) for k in range(10)]
     plan = loud_mod.plan_loudness(tmp_path / "x.mkv", speech=speech)
     assert plan.mode == "dynamic" and "loudnorm=I=-14:" in plan.af  # no speech sway
+
+
+def test_ensure_true_peak_limits_a_lone_transient_without_losing_loudness(tmp_path):
+    """Wave G-layout: AAC rang 1.9 dB over the plan on one game transient (stream clip 01);
+    a whole-clip volume trim then cost Q1 (-15.1 LUFS). Only the peak is limited now."""
+    dst = tmp_path / "click.mp4"
+    _run(["ffmpeg", "-hide_banner", "-v", "error", "-y",
+          "-f", "lavfi", "-i", "color=c=gray:size=64x64:rate=25:duration=6",
+          "-f", "lavfi", "-i",
+          "aevalsrc='0.25*sin(2*PI*220*t)+0.7*between(t,3.000,3.0005)':s=48000:d=6",
+          "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+          "-shortest", str(dst)])  # fmt: skip
+    before = measure_loudness(dst)
+    assert before.tp > -1.2
+    ensure_true_peak(dst)
+    after = measure_loudness(dst)
+    assert after.tp <= -1.0
+    assert after.i == pytest.approx(before.i, abs=0.2)  # the loudness stays

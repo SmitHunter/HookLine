@@ -418,3 +418,40 @@ def test_snap_splices_skips_a_burst_whose_kept_word_has_its_own_onset_after_it()
     late = [*words[:3], _w(3.14, 3.5, "put")]
     keep2, out2 = snap_splices([(0.5, 2.0), (2.67, 4.0)], late, env, THR, fps=30, adjust=True)
     assert keep2[1][0] <= 2.67 + 1e-9 and out2[2] == late[2]
+
+
+def test_uncaptioned_speech_needs_a_voice_like_spectrum(tmp_path):
+    """Q3b (wave G-layout): a loud noise burst (game sound), a low rumble or a sustained tone
+    (a scream, chase music) with no word is not uncaptioned speech; a harmonic stretch with
+    formant-like energy in the voice band, rising and falling in syllables, is."""
+    import wave
+
+    from hookline.pipeline.timing import uncaptioned_speech
+
+    rate = 16000
+    t = np.arange(6 * rate) / rate
+    rng = np.random.default_rng(0)
+    sig = np.zeros_like(t)
+    noise = (t >= 0.5) & (t < 1.3)
+    sig[noise] = 0.3 * rng.standard_normal(noise.sum())
+    rumble = (t >= 1.5) & (t < 2.2)
+    sig[rumble] = 0.5 * np.sin(2 * np.pi * 60 * t[rumble])
+    voiced = (t >= 2.6) & (t < 3.4)
+    sustained = (t >= 4.0) & (t < 4.8)
+    for k in range(1, 30):  # f0 140 Hz, harmonics shaped by formants near 600 and 1500 Hz
+        f = 140 * k
+        gain = np.exp(-(((f - 600) / 250) ** 2)) + 0.6 * np.exp(-(((f - 1500) / 300) ** 2))
+        tone = 0.1 * gain * np.sin(2 * np.pi * f * t)
+        syllables = np.abs(np.sin(2 * np.pi * 2.0 * t)) ** 2  # ~4 syllables a second
+        sig[voiced] += (tone * syllables)[voiced]
+        sig[sustained] += tone[sustained]
+    wav = tmp_path / "mix.wav"
+    with wave.open(str(wav), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes((np.clip(sig, -1, 1) * 32767).astype(np.int16).tobytes())
+    env = energy_envelope(wav, 0.0, 6.0)
+    assert env.voice is not None and len(env.voice) == len(env.db)
+    (span,) = uncaptioned_speech([], env, THR, [(0.0, 6.0)])
+    assert span == (pytest.approx(2.6, abs=0.1), pytest.approx(3.4, abs=0.1))

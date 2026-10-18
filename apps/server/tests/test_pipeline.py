@@ -696,3 +696,31 @@ def test_a_failed_motion_analysis_is_retried_next_run(signals_inputs, monkeypatc
     out = run_mod._signals(job, src, wav, transcript, logs.append)
     assert out.motion and len(out.motion) >= 149
     assert "[4/6] signals: skipped (cached)" not in logs
+
+
+def test_run_job_builds_the_layout_profile_once_and_passes_it_with_scares(
+    fixture_video, fake_llm, settings_tmp, monkeypatch
+):
+    from hookline.pipeline import run as run_mod
+    from hookline.pipeline.profile import LayoutProfile
+
+    built, seen = [], []
+    prof = LayoutProfile(size=(320, 180))
+
+    def fake_profile(job_dir, src, detector):
+        built.append((job_dir.name, src.name))
+        return prof
+
+    def spy(*a, **k):
+        seen.append((k.get("profile"), k.get("scares")))
+        a[5].parent.mkdir(parents=True, exist_ok=True)  # dst
+        return {"layout": [], "removed_s": 0.0}
+
+    monkeypatch.setattr(run_mod, "layout_profile", fake_profile)
+    monkeypatch.setattr(run_mod, "render_clip", spy)
+    fake_llm.queue(make_payload_for(150, 2, 21))
+    s = settings_tmp.model_copy(update={"clips": 2, "captions": False})
+    run_job(str(fixture_video), s, fake_llm, FakeTranscriber(duration=150))
+    assert len(built) == 1 and built[0][1].startswith("source")
+    assert len(seen) == 2 and all(p is prof for p, _ in seen)
+    assert all(isinstance(sc, list) for _, sc in seen)  # the VOD's game transients

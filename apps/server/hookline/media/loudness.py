@@ -309,26 +309,45 @@ def plan_loudness(path: Path, speech: list[tuple[float, float]] | None = None) -
 
 TP_TRIM_ABOVE = -1.2
 TP_TRIM_TARGET = -1.5
+# The safety net's first try: a lookahead limiter at this ceiling (at LIMIT_RATE) on the
+# decoded audio takes off only the overshooting peaks -- AAC rings on a lone transient (a game
+# hit: stream clip 01 went 1.9 dB over its plan) -- so the clip keeps its loudness.
+TP_LIMIT_DB = -2.5
+
+
+def _reencode_audio(src: Path, dst: Path, af: str) -> None:
+    _run(
+        [
+            "ffmpeg", "-hide_banner", "-y", "-i", str(src),
+            "-map", "0:v", "-map", "0:a", "-c:v", "copy",
+            "-af", af,
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+            "-movflags", "+faststart", str(dst),
+        ]
+    )  # fmt: skip
 
 
 def ensure_true_peak(dst: Path) -> float | None:
     """Post-encode safety net: AAC can overshoot the limiter ceiling. When `dst`'s true peak
-    is above -1.2 dBTP, re-encode only its audio with a volume trim to land at about -1.5.
-    Returns the trim in dB (None when nothing was done)."""
+    is above -1.2 dBTP, re-encode only its audio: first through a peak limiter at TP_LIMIT_DB
+    (the loudness stays); if that still leaves the peak over -1.2 dBTP, with a volume trim
+    instead (from the original) to land at about -1.5. Returns the loudness change in dB
+    (None when nothing was done)."""
     m = measure_loudness(dst)
     if m is None or m.tp <= TP_TRIM_ABOVE:
         return None
-    trim = TP_TRIM_TARGET - m.tp
     tmp = dst.with_suffix(".trim" + dst.suffix)
-    _run(
-        [
-            "ffmpeg", "-hide_banner", "-y", "-i", str(dst),
-            "-map", "0:v", "-map", "0:a", "-c:v", "copy",
-            "-af", f"volume={trim:.2f}dB",
-            "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
-            "-movflags", "+faststart", str(tmp),
-        ]
-    )  # fmt: skip
+    lim = LIMITER.format(lim=10 ** (TP_LIMIT_DB / 20))
+    _reencode_audio(dst, tmp, f"aresample={LIMIT_RATE},{lim}")
+    after = measure_loudness(tmp)
+    if after is not None and after.tp <= TP_TRIM_ABOVE:
+        os.replace(tmp, dst)
+        log.info(
+            "audio: true-peak limit %.2f -> TP %.2f, I %.2f -> %.2f", m.tp, after.tp, m.i, after.i
+        )
+        return round(after.i - m.i, 2)
+    trim = TP_TRIM_TARGET - m.tp
+    _reencode_audio(dst, tmp, f"volume={trim:.2f}dB")
     os.replace(tmp, dst)
     after = measure_loudness(dst)
     log.info("audio: true-peak trim %.2f dB -> TP %s", trim, f"{after.tp:.2f}" if after else "?")
