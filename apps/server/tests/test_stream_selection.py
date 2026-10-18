@@ -464,6 +464,23 @@ def test_render_start_covers_a_first_word_whose_onset_moved_earlier():
     assert cover_first_word(pick(19.0, 30.0), raw, near).start == 19.0
 
 
+def test_render_cold_open_covers_a_first_word_whose_onset_moved_earlier():
+    # job e87398ed46 clip 05: DTW put "capitalism" at 2712.74, the audio has it from 2712.36;
+    # the teaser cut at 2712.74 clipped it to "-talism", so speech (captioned) began at 0.60 s
+    from hookline.pipeline.boundaries import cover_first_word
+
+    raw = [W(2711.92, 2712.07, "that"), W(2712.74, 2712.89, "capitalism"),
+           W(2713.8, 2714.35, "unchecked"), W(2718.0, 2718.33, "spaces.")]  # fmt: skip
+    near = [W(2711.92, 2712.28, "that"), W(2712.36, 2712.94, "capitalism"),
+            W(2713.33, 2714.35, "unchecked"), W(2718.0, 2718.33, "spaces.")]  # fmt: skip
+    p = pick(2689.14, 2718.33, cold_open=(2712.74, 2718.33))
+    out = cover_first_word(p, raw, near)
+    assert out.cold_open == (pytest.approx(2712.36), 2718.33)
+    assert out.start == 2689.14
+    unmoved = pick(2689.14, 2718.33, cold_open=(2712.36, 2718.33))
+    assert cover_first_word(unmoved, raw, near).cold_open == (2712.36, 2718.33)
+
+
 def test_q6_fails_when_the_first_word_is_clipped():
     from hookline.quality import _check_opening
 

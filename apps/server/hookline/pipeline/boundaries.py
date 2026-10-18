@@ -1136,10 +1136,21 @@ def recheck_opener(
 def cover_first_word(pick: ClipPick, raw: list[Word], near: list[Word]) -> ClipPick:
     """`pick` starting no later than its first word as refined against the audio: `near`
     (`raw` with onsets snapped, word for word) may move a word starting at the clip's start
-    earlier than it, and the clip would lose it ("The" of "The fuck was that?")."""
-    starts = [
-        n.start for r, n in zip(raw, near, strict=True) if pick.start - 1e-6 <= r.start < pick.end
-    ]
-    if not starts or min(starts) >= pick.start - 1e-6:
-        return pick
-    return pick.model_copy(update={"start": round(min(starts), 3)})
+    earlier than it, and the clip would lose it ("The" of "The fuck was that?"). A cold open
+    is covered the same way: the teaser is the clip's very first audio ("-talism" for
+    "capitalism" when the onset moved before the teaser's start)."""
+
+    def covered(start: float, end: float) -> float:
+        starts = [n.start for r, n in zip(raw, near, strict=True) if start - 1e-6 <= r.start < end]
+        if not starts or min(starts) >= start - 1e-6:
+            return start
+        return round(min(starts), 3)
+
+    update: dict = {}
+    if (start := covered(pick.start, pick.end)) != pick.start:
+        update["start"] = start
+    if pick.cold_open is not None:
+        a, b = pick.cold_open
+        if (first := covered(a, b)) != a:
+            update["cold_open"] = (first, b)
+    return pick.model_copy(update=update) if update else pick
