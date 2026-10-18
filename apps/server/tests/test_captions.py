@@ -1,3 +1,4 @@
+import re
 import subprocess
 from itertools import pairwise
 from pathlib import Path
@@ -670,3 +671,51 @@ def test_face_rects_use_the_measured_face_offset_and_zoom():
     zoomed = lay.model_copy(update={"zoom_cap": 1.12})
     ((z0, _, z1, _),) = face_rects(zoomed, 1.2)
     assert (z0 + z1) / 2 == pytest.approx(540 + 0.1 * 1080 * 1.12)
+
+
+# --- fix wave F: captions clear the face at every sample of their page --------------------
+
+
+def _page_y(text: str) -> list[tuple[float, float, int]]:
+    out = []
+    for line in text.splitlines():
+        if line.startswith("Dialogue:") and ",Cap," in line:
+            parts = line.split(",", 9)
+            y = int(re.search(r"\\pos\(\d+,(\d+)\)", parts[9]).group(1))
+            out.append((_secs(parts[1]), _secs(parts[2]), y))
+    return out
+
+
+def _secs(ts: str) -> float:
+    h, m, s = ts.split(":")
+    return int(h) * 3600 + int(m) * 60 + float(s)
+
+
+def test_build_ass_moves_only_the_pages_shown_over_a_head_dip():
+    from hookline.captions.ass import CAPTION_ABOVE, CAPTION_BELOW
+
+    words = [Word(start=0.2 + 0.4 * i, end=0.5 + 0.4 * i, text=f"w{i}.") for i in range(12)]
+    faces = []
+    for k in range(24):
+        t = k * 0.25 + 0.125
+        low = 2.0 <= t <= 2.4  # the head dips: the core reaches the 1180 caption band
+        y0, y1 = (1090, 1480) if low else (600, 980)
+        faces.append((t, 300.0, float(y0), 780.0, float(y1), y0 + 70.0))
+    text = build_ass(words, "", 6.0, faces=faces)
+    pages = _page_y(text)
+    moved = [(a, b, y) for a, b, y in pages if y != 1180]
+    assert moved and all(b > 1.9 and a < 2.5 for a, b, _ in moved)
+    for a, b, y in pages:
+        for t, _, y0, _, y1, eye in faces:
+            if a - 0.125 <= t <= b + 0.125:
+                top, bottom = y - CAPTION_ABOVE, y + CAPTION_BELOW
+                assert bottom <= min(y0, eye) or top >= y1, (a, b, y, t)
+
+
+def test_caption_y_for_counts_the_per_sample_faces():
+    lay = SceneLayout(
+        start=0, end=6, kind="FACE_TRACK", face_box=(0.3, 0.2), track_x=[(0, 0.5)],
+        face_px=[[t / 4, 300, 1000, 780, 1400, 1080] for t in range(24)],
+    )  # fmt: skip
+    # the median box (576-960 px) leaves 1180 free, the per-sample faces (1000-1400) do not
+    assert caption_y_for([lay], late=True) != 1180

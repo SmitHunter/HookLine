@@ -95,6 +95,8 @@ HOOK_MAX_LINES, HOOK_MAX_WORDS, HOOK_UNTIL = 2, 7, 3.0
 COVERAGE_MIN = 0.95
 SAFE_X, SAFE_Y = (60, 888), (290, 1250)
 FACE_OVERLAP_MAX = 0.10
+UNCAPTIONED_S = 0.3  # Q3b: the render reports voiced stretches longer than this (timing.py)
+FACE_SAMPLE_HALF_S = 0.125  # a per-sample face (4 fps) stands for this long either side
 SPEECH_START_MAX = 0.5
 FIRST_WORDS_MIN = 0.6
 PACE_MAX_GAP = 5.0
@@ -398,6 +400,20 @@ def _check_coverage(caps: list[_Event], words: list[Word] | None) -> CheckResult
     return CheckResult("Q3", cov >= COVERAGE_MIN, round(cov, 4), thr, detail)
 
 
+def _check_uncaptioned(side: dict) -> CheckResult:
+    """Q3b (a warning, never a failure): voiced stretches the render found with no word in
+    the transcript (`uncaptioned_speech`, output s) -- speech the viewer hears uncaptioned."""
+    thr = f"no voiced stretch > {UNCAPTIONED_S:g}s without a caption"
+    spans = side.get("uncaptioned_speech")
+    if spans is None:
+        return CheckResult("Q3b", True, None, thr, "not recorded (render before fix wave F)")
+    if not spans:
+        return CheckResult("Q3b", True, 0, thr, "none")
+    where = ", ".join(f"{a:.2f}-{b:.2f}s" for a, b in spans)
+    total = round(sum(b - a for a, b in spans), 3)
+    return CheckResult("Q3b", True, total, thr, f"uncaptioned speech at {where}", warn=True)
+
+
 def _check_safe_zone(boxes: list[Box | None]) -> CheckResult:
     thr = f"x in {list(SAFE_X)}, y in {list(SAFE_Y)}"
     drawn = [b for b in boxes if b is not None]
@@ -408,32 +424,66 @@ def _check_safe_zone(boxes: list[Box | None]) -> CheckResult:
     return CheckResult("Q4", out == 0, out, thr, f"{len(drawn)} boxes; worst {worst}")
 
 
-def _face_share(box: Box, layouts: list[dict], steps: list, t: float) -> float:
+def _face_share(
+    box: Box,
+    layouts: list[dict],
+    steps: list,
+    t: float,
+    window: tuple[float, float] | None = None,
+) -> float:
     """Largest share of `box` covered by a face core (detector box minus its top 20%,
-    hairline/forehead; see `face_rects`) of the scene at `t`, scaled by the zoom step in
-    effect at `t`."""
-    lay = _layout_at(layouts, t)
-    if lay is None:
-        return 0.0
+    hairline/forehead; see `face_rects`): every rendered face sample (`face_px`, eye line
+    counted) of the scenes shown during `window` (the box's time on screen; default `t`
+    alone), else the median face of the scene at `t` scaled by the zoom step in effect."""
+    a, b = window or (t, t)
+    rects = [
+        (s[1], min(s[2], s[5]), s[3], s[4])
+        for lay in layouts
+        if lay["start"] - 1e-6 <= b and a < lay["end"]
+        for s in lay.get("face_px") or []
+        if a - FACE_SAMPLE_HALF_S <= s[0] <= b + FACE_SAMPLE_HALF_S
+    ]
+    if not rects:
+        lay = _layout_at(layouts, t)
+        if lay is None or lay.face_px:
+            return 0.0
+        rects = face_rects(lay, zoom_at(steps, t))
     x0, y0, x1, y1 = box
     area = (x1 - x0 + 1) * (y1 - y0 + 1)
     share = 0.0
-    for fx0, fy0, fx1, fy1 in face_rects(lay, zoom_at(steps, t)):
+    for fx0, fy0, fx1, fy1 in rects:
         ov = max(0.0, min(x1, fx1) - max(x0, fx0)) * max(0.0, min(y1, fy1) - max(y0, fy0))
         share = max(share, ov / area)
     return share
 
 
+def _event_window(events: list[_Event], t: float) -> tuple[float, float] | None:
+    """When the caption group (consecutive events with one text: its words light up in turn)
+    or hook event shown at `t` is on screen; None when nothing is."""
+    hit = next((i for i, e in enumerate(events) if e.start <= t < e.end), None)
+    if hit is None:
+        return None
+    lo = hi = hit
+    while lo > 0 and events[lo - 1].text == events[hit].text:
+        lo -= 1
+    while hi + 1 < len(events) and events[hi + 1].text == events[hit].text:
+        hi += 1
+    return events[lo].start, events[hi].end
+
+
 def _check_face(
-    samples: list[tuple[str, float, Box | None]], layouts: list[dict], steps: list
+    samples: list[tuple[str, float, Box | None, tuple[float, float] | None]],
+    layouts: list[dict],
+    steps: list,
 ) -> CheckResult:
     """Q4b: the share of each caption text box (cap band), hook box and EARLIER-tag box
-    (what, t, box) that covers the face (zoomed as at t)."""
+    (what, t, box, time on screen) that covers the face: every per-sample rendered face
+    while the box is up, else the median face zoomed as at t."""
     worst, where = 0.0, None
-    for what, t, box in samples:
+    for what, t, box, window in samples:
         if box is None:
             continue
-        share = _face_share(box, layouts, steps, t)
+        share = _face_share(box, layouts, steps, t, window)
         if share > worst:
             worst, where = share, f"{what} at {t:.1f}s"
     detail = f"worst {worst:.0%} of a box on the face core ({where})" if where else "no overlap"
@@ -519,7 +569,7 @@ def _check_opening(
 
 def _check_pacing(side: dict, duration: float) -> CheckResult:
     """Q7: longest stretch without a cut, zoom step (as rendered, edge-guard holds applied),
-    edge-guard crop shift or scene (layout) change."""
+    edge-guard crop shift, reframe snap or scene (layout) change."""
     thr = f"framing change every <= {PACE_MAX_GAP:g}s"
     changes = {float(t) for t in side.get("cut_times") or []}
     changes |= {float(st[0]) for st in side.get("zoom_steps") or []}
@@ -527,6 +577,7 @@ def _check_pacing(side: dict, duration: float) -> CheckResult:
     changes |= {
         float(st[0]) for lay in side.get("layout") or [] for st in lay.get("shift_steps") or []
     }
+    changes |= {float(t) for lay in side.get("layout") or [] for t in lay.get("snaps") or []}
     pts = sorted({0.0, duration} | {t for t in changes if 0 < t < duration})
     gap, at = max((b - a, a) for a, b in pairwise(pts))
     detail = f"longest {gap:.1f}s from {at:.1f}s"
@@ -589,12 +640,19 @@ def audit_clip(
             if hooks:
                 hook_heights = _measure_frames(hook_ass, title_times, _hook_black)
                 hook_grey = _measure_frames(hook_ass, hook_times, box_bbox, GREY)
-    face_samples = [("caption", t, box) for t, (_, box) in zip(cap_times, cap_black, strict=True)]
-    face_samples += [("hook", t, box) for t, box in zip(hook_times, hook_grey, strict=True)]
+    face_samples = [
+        ("caption", t, box, _event_window(caps, t))
+        for t, (_, box) in zip(cap_times, cap_black, strict=True)
+    ]
+    face_samples += [
+        ("hook", t, box, _event_window(hooks, t))
+        for t, box in zip(hook_times, hook_grey, strict=True)
+    ]
     return [
         _check_loudness(mp4),
         _check_caption_size([hs for hs, _ in cap_black], bool(words)),
         _check_coverage(caps, words),
+        _check_uncaptioned(sidecar),
         _check_safe_zone([*cap_grey, *hook_grey]),
         _check_face(face_samples, layouts, steps),
         _check_hook(hooks, hook_heights, duration),

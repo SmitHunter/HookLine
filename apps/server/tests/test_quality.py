@@ -32,7 +32,7 @@ SENTENCES = [
     "Nobody saw it coming.",
     "And that was the end.",
 ]
-CHECK_IDS = ["Q1", "Q2", "Q3", "Q4", "Q4b", "Q5", "Q6", "Q7", "Q8"]
+CHECK_IDS = ["Q1", "Q2", "Q3", "Q3b", "Q4", "Q4b", "Q5", "Q6", "Q7", "Q8"]
 
 
 def _words(t0: float = 0.2) -> list[Word]:
@@ -482,3 +482,47 @@ def test_q7_counts_guard_shift_steps_and_reads_the_guarded_zoom_steps():
     held = _check_pacing({**side, "layout": [{**lay, "shift_steps": []}]}, 13.0)
     assert not held.ok and held.value == pytest.approx(8.5)  # a guard hold, honestly reported
     assert _check_pacing(side, 13.0).ok  # the shift at 9.0 is a framing change
+
+
+# --- fix wave F: per-sample faces (Q4b), reframe snaps (Q7), uncaptioned speech (Q3b) ------
+
+
+def _dip_layout(dip: bool) -> list[dict]:
+    """A face clear of the 1180 caption line (median box at y 480-960) whose per-sample core
+    dips over it at 2.25-2.5 s (a head dip between the page's sampled frames)."""
+    samples = []
+    for k in range(int(DUR * 4)):
+        t = k * 0.25 + 0.125
+        low = dip and 2.25 <= t <= 2.5
+        y0, y1 = (1100, 1500) if low else (576, 960)
+        samples.append([t, 300, y0, 780, y1, y0 + 80])
+    return [
+        {"start": 0.0, "end": DUR, "kind": "FACE_TRACK", "face_box": [0.25, 0.25],
+         "face_px": samples}
+    ]  # fmt: skip
+
+
+def test_q4b_checks_per_sample_faces_over_each_whole_page(good_mp4, tmp_path):
+    ass = _ass(tmp_path)
+    by = _by_id(audit_clip(good_mp4, _sidecar(layout=_dip_layout(True)), ass))
+    assert not by["Q4b"].ok and by["Q4b"].value > 0.10, by["Q4b"]
+    assert _by_id(audit_clip(good_mp4, _sidecar(layout=_dip_layout(False)), ass))["Q4b"].ok
+
+
+def test_q7_counts_reframe_snaps():
+    from hookline.quality import _check_pacing
+
+    lay = {"start": 0.0, "end": 20.0, "kind": "FACE_TRACK", "shift_steps": [], "snaps": []}
+    side = {"cut_times": [], "layout": [lay], "zoom_steps": [[0.0, 1.0], [4.5, 1.072]]}
+    assert not _check_pacing(side, 13.0).ok
+    snapped = {**side, "layout": [{**lay, "snaps": [9.0]}]}
+    assert _check_pacing(snapped, 13.0).ok  # a reframe snap is a framing change
+
+
+def test_q3b_warns_on_uncaptioned_speech(good_mp4, tmp_path):
+    ass = _ass(tmp_path)
+    by = _by_id(audit_clip(good_mp4, _sidecar(uncaptioned_speech=[[1.0, 1.6]]), ass))
+    assert by["Q3b"].ok and by["Q3b"].status == "warn" and "1.00-1.60" in by["Q3b"].detail
+    assert _by_id(audit_clip(good_mp4, _sidecar(uncaptioned_speech=[]), ass))["Q3b"].status == (
+        "pass"
+    )
