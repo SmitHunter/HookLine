@@ -662,8 +662,8 @@ def render_clip(
     unrolled = _first_start(refined)
     refined = _lead_ins(refined, env, near, fps)  # wave H: cause sound, frame-0 pre-roll
     lead = unrolled - _first_start(refined)
-    # Frame-grid bounds make the cut timeline exact, so remapped caption times stay in sync.
-    # dead air trusts a refined word end only so far past the transcript's
+    # dead air keeps each word up to its refined end, trusted at most PROTECT_S past the
+    # transcript's end (`protected_words`)
     protected = protected_words(raw, near)
     untailed = keep_ranges(
         refined.segments(),
@@ -684,6 +684,7 @@ def render_clip(
         timed = clamp_word_ends(timed, env, voice_db)  # wave H: no caption held past the voice
     elif untailed:
         tailed = min_tail(untailed, near)  # no tail on a noisy bed: still room for the fade
+    # frame-grid bounds make the cut timeline exact, so remapped caption times stay in sync
     keep = snap_ranges(tailed, fps, keep_gaps=[*refined.drops, *(idle_gaps or [])])
     # words starting in the tail (no audible onset: see `tail_end`) are not captioned
     heard = [i for i, w in enumerate(timed) if not untailed or w.start < untailed[-1][1] - 1e-6]
@@ -847,19 +848,23 @@ def render_clip(
         return master_wav
 
     tmp = dst.with_suffix(".tmp.mp4")
-    _run(
-        [
-            "ffmpeg", "-hide_banner", "-y", "-i", str(inter),
-            # always a script: zoom/track expressions can outgrow the Windows command line
-            *filter_graph_args(graph, work_dir / f"{name}.graph.txt", force=True),
-            "-map", out_label, *audio_map,
-            *encoder_args(encoder or pick_encoder()), "-pix_fmt", "yuv420p",
-            *audio_args,
-            "-c:a", "aac", "-b:a", "192k", "-ar", "48000",  # the one lossy audio encode
-            "-movflags", "+faststart",
-            str(tmp),
-        ]
-    )  # fmt: skip
+    script = work_dir / f"{name}.graph.txt"
+    try:
+        _run(
+            [
+                "ffmpeg", "-hide_banner", "-y", "-i", str(inter),
+                # always a script: zoom/track expressions can outgrow the Windows command line
+                *filter_graph_args(graph, script, force=True),
+                "-map", out_label, *audio_map,
+                *encoder_args(encoder or pick_encoder()), "-pix_fmt", "yuv420p",
+                *audio_args,
+                "-c:a", "aac", "-b:a", "192k", "-ar", "48000",  # the one lossy audio encode
+                "-movflags", "+faststart",
+                str(tmp),
+            ]
+        )  # fmt: skip
+    finally:
+        script.unlink(missing_ok=True)
     os.replace(tmp, dst)
     if audio and audio.mode != "skip":
         ensure_true_peak(dst, master=audio_master)

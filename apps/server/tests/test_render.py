@@ -988,3 +988,46 @@ def test_mix_format_pins_every_channel_count_to_a_layout(monkeypatch):
             render_mod, "_run", lambda cmd, c=channels: sp.CompletedProcess(cmd, 0, c + "\n", "")
         )
         assert render_mod.mix_format(Path("x.mkv")).endswith(f"channel_layouts={layout}")
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_render_clip_removes_its_filter_script_after_the_encode(
+    fixture_video, fixture_wav, fixture_words, sample_pick, settings, tmp_path, monkeypatch, fail
+):
+    from hookline.media.ffmpeg import FFmpegError
+    from hookline.pipeline import render as render_mod
+
+    real = render_mod._run
+
+    def run(cmd):
+        if fail and "-/filter_complex" in cmd:
+            raise FFmpegError("ffmpeg exited with code 1")
+        return real(cmd)
+
+    monkeypatch.setattr(render_mod, "_run", run)
+    s = settings.model_copy(update={"vertical": False, "captions": False})
+    work = tmp_path / "r"
+    if fail:
+        with pytest.raises(FFmpegError):
+            render_clip(
+                fixture_video,
+                fixture_wav,
+                sample_pick,
+                fixture_words,
+                work,
+                tmp_path / "x.mp4",
+                s,
+                None,
+            )
+    else:
+        render_clip(
+            fixture_video,
+            fixture_wav,
+            sample_pick,
+            fixture_words,
+            work,
+            tmp_path / "x.mp4",
+            s,
+            None,
+        )
+    assert not list(work.glob("*.graph.txt"))
