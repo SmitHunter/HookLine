@@ -26,6 +26,7 @@ from hookline.pipeline.boundaries import (
     PAYOFF_SCARE_S,
     edit_gaps,
     fit_to_signals,
+    keep_payoff_side,
 )
 from hookline.pipeline.chat import chat_keywords, chat_rate, try_fetch_chat
 from hookline.pipeline.ingest import IngestError, find_source, ingest, job_id_for
@@ -35,6 +36,7 @@ from hookline.pipeline.profile import LayoutProfile, layout_profile
 from hookline.pipeline.render import render_clip, voiced_words
 from hookline.pipeline.select import NoClipsSelectedError, select_clips
 from hookline.pipeline.signals import (
+    SCREEN_MARKER_MIN_S,
     SIGNALS_VERSION,
     Signals,
     flash_seconds,
@@ -43,14 +45,15 @@ from hookline.pipeline.signals import (
     loud_seconds,
     onset_times,
     scare_times,
+    screen_runs,
     seconds_of,
 )
 from hookline.transcribe import Transcriber
 from hookline.transcribe.base import words_to_transcript
 from hookline.vision.faces import FaceDetector
 
-PICKS_SCHEMA = 7  # bump when picks change shape or meaning, so old picks.json re-select
-PACKAGE_SCHEMA = 3  # bump when the packaging pass changes, so old package.json re-runs
+PICKS_SCHEMA = 8  # bump when picks change shape or meaning, so old picks.json re-select
+PACKAGE_SCHEMA = 4  # bump when the packaging pass changes, so old package.json re-runs
 PAYOFF_ALLOWANCE_S = 5.0  # a clip may run this far over max_clip_s (select's payoff extension)
 
 
@@ -145,10 +148,12 @@ def _package(
     llm: LLMBackend,
     settings: Settings,
     log: Callable[[str], None],
+    screens: list[tuple[float, float]] | None = None,
 ) -> list[ClipPick]:
     """Packaged picks: cached in package.json, keyed by the exact picks it was made from, so a
     re-run neither re-calls Claude nor reuses packaging for different picks. A failed pass
-    keeps the selection-time packaging and is retried on the next run."""
+    keeps the selection-time packaging and is retried on the next run. `screens` (death /
+    loading screens) are marked in the words the packager reads."""
     ppath = job_dir / "package.json"
     dump = [p.model_dump(mode="json") for p in picks]
     digest = hashlib.sha1(json.dumps(dump, sort_keys=True).encode()).hexdigest()
@@ -163,7 +168,7 @@ def _package(
             log("warning: package.json is corrupt; re-running packaging")
     log("[5/6] select: packaging started")
     raw: list[dict] = []
-    packaged = package_clips(picks, words, llm, settings, raw_sink=raw)
+    packaged = package_clips(picks, words, llm, settings, raw_sink=raw, screens=screens)
     atomic_write_text(job_dir / "package_raw.json", json.dumps(raw, indent=2, ensure_ascii=False))
     if packaged is picks:
         log("warning: packaging pass failed; using the selection-time packaging")
@@ -375,6 +380,32 @@ def _layout_profile(
     return prof
 
 
+def _one_side_of_deaths(
+    picks: list[ClipPick], words: list[Word], signals: Signals, log: Callable[[str], None]
+) -> list[ClipPick]:
+    """Each pick on one side of any death screen it spans (`boundaries.keep_payoff_side`),
+    before packaging describes it; a pick with no viable side is dropped (all kept as they are
+    when that would drop every one). Logs the drop_lines selection ignored, and each change."""
+    out: list[ClipPick] = []
+    for i, pick in enumerate(picks, 1):
+        for note in pick.ignored_drops:
+            log(f"clip {i:02d}: {note}")
+        side = keep_payoff_side(pick, words, signals)
+        if side is None:
+            log(f"clip {i:02d}: spans a death screen with no viable side; dropped")
+            continue
+        if side is not pick:
+            log(
+                f"clip {i:02d}: spans a death screen; kept {side.start:.2f}-{side.end:.2f} "
+                f"(was {pick.start:.2f}-{pick.end:.2f})"
+            )
+        out.append(side)
+    if not out:
+        log("warning: every pick spans a death screen with no viable side; all kept")
+        return picks
+    return out
+
+
 def run_job(
     source: str,
     settings: Settings,
@@ -441,6 +472,8 @@ def run_job(
     if not settings.chat:
         signals = signals.model_copy(update={"chat": None, "chat_kinds": None})
 
+    # death / loading screens: marked for the selector and the packager, and no pick spans one
+    screens = screen_runs(signals, min_s=SCREEN_MARKER_MIN_S)
     ppath = job_dir / "picks.json"
     key = _picks_key(settings, tkey)
     picks = _load_picks(ppath, key, log)
@@ -457,6 +490,7 @@ def run_job(
                 raw_sink=raw_payloads,
                 markers=heat_markers(signals),
                 heat_seconds=heat_seconds(signals),
+                screens=screens,
             )
         finally:  # kept even when selection fails, for debugging what Claude returned
             atomic_write_text(
@@ -478,7 +512,8 @@ def run_job(
         log(f"[5/6] select: done ({len(picks)} clips)")
 
     words = transcript.words()
-    picks = _package(job_dir, picks, words, llm, settings, log)
+    picks = _one_side_of_deaths(picks, words, signals, log)
+    picks = _package(job_dir, picks, words, llm, settings, log, screens)
 
     log(f"[6/6] render: started ({len(picks)} clips)")
     out_dir = settings.output_dir / job_id

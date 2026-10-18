@@ -36,7 +36,7 @@ from hookline.pipeline.deadair import MIN_PIECE_S
 # the opening / closing piece next to a drop's jump cut needs this much speech (a short line
 # at a clip's edge reads fine; a sliver between two jump cuts does not: MIN_PIECE_S)
 MIN_EDGE_PIECE_S = 0.8
-from hookline.pipeline.signals import CLIP_MARKER, SCARE_MARKER
+from hookline.pipeline.signals import CLIP_MARKER, SCARE_MARKER, SCREEN_MARKER
 from hookline.transcript_text import (
     compact_transcript,
     ends_statement,
@@ -69,7 +69,13 @@ footage the clip does not show; the viewer sees only the speakers. For a cold-op
 `hook_text` must complement the teaser line, not contradict or repeat it. Tease the payoff \
 without spoiling it: never give away the reveal, outcome or punchline the clip ends on, and \
 do not just repeat the first spoken line. Never use template phrases such as "Then this", \
-"Wait for it", "You won't believe" or "Watch till the end".
+"Wait for it", "You won't believe" or "Watch till the end". Never an entity plus a generic \
+label ("Marla's bakery ad: the last line", "The night shift, mid-rush"): say what is at stake. \
+Put the who, where and what (a person, a show, a game's name) in `title`, `hashtags` and \
+`search_title`, and never lead two hooks in one batch with the same name.
+- Never add a date, an ordinal ("first", "second", "last") or a superlative ("biggest", \
+"worst") that the source does not say about that same thing: "her first job" does not make \
+"the first bakery in town".
 - `post_caption`: the caption under the post, 1–2 lines, that ends with a question inviting \
 comments: a specific question with two plausible answers, so viewers pick a side. Template \
 questions are banned: "Agree or disagree?", "Thoughts?", "What do you think?" and \
@@ -109,7 +115,10 @@ usual rate, and `🔊loud` means the audio got far louder than normal. An emoji 
 `<<CLIP_MARKER>>` means chat is asking for a clip. `<<SCARE_MARKER>>` means something \
 sudden happened in the video itself, at or just before that line: a sharp game sound (a \
 stinger, a crash, a scream) or a flash on screen. A reaction line marked with it is reacting \
-to that event, which is the cause the viewer must see. Treat them as evidence of \
+to that event, which is the cause the viewer must see. `<<SCREEN_MARKER>> Ns` means the \
+picture sat on a death, loading or menu screen (or a fade) for about N seconds at or just \
+before that line: in a game, the player died or the game reset there, and the lines after it \
+belong to a new attempt. Treat the reaction markers as evidence of \
 emotional intensity, not a requirement: a moment without markers can still be great, and a \
 marked one can still be a poor clip.
 
@@ -198,6 +207,18 @@ seconds after the payoff: the scream, the escape, the "I made it!". Never run on
 death, loading or menu screen, a respawn or a new attempt at the same section: a long pause \
 after a death or a win usually means one of those, and the next lines ("Okay, again.", \
 "Which way now?") belong to a new attempt, not to this clip.
+- Never span a death or respawn. A clip may end on the death itself (the scream, the \
+reaction to dying, which may carry `<<SCREEN_MARKER>>`), but no other line after \
+`start_line` may carry it: past the screen the player respawns and tries again, and a clip \
+across it splices two attempts into one.
+- On a stream of one game, return at most one clip per encounter or section. Repeated \
+attempts at the same chase, puzzle or fight are one moment: pick the attempt that ends in \
+success or the climax (the escape, the win, the boss going down), not the third failed try, \
+and spread the other candidates across the rest of the stream.
+- A climax can carry a weak start. When the natural opener of the winning attempt is a bare \
+instruction or filler ("Okay, left, left."), use the payoff line itself as `cold_open_words` \
+(invented: "We actually did it! It's down!") and start on the attempt, rather than marking \
+the clip skip.
 - When the streamer is answering chat, the viewer never saw the question. Put the question in \
 `hook_text` so the answer lands.
 
@@ -306,6 +327,7 @@ pick a moment that overlaps a range you are told to avoid.
 SYSTEM_PROMPT = (
     SYSTEM_PROMPT.replace("<<CLIP_MARKER>>", CLIP_MARKER)
     .replace("<<SCARE_MARKER>>", SCARE_MARKER)
+    .replace("<<SCREEN_MARKER>>", SCREEN_MARKER)
     .replace("<<PACKAGING_RULES>>\n", PACKAGING_RULES)
 )
 
@@ -368,6 +390,8 @@ SELECTION_SCHEMA: dict = _object(
 _COLD_OPEN_MAX_S = 6.0
 _COLD_OPEN_MIN_S = 1.0  # shorter teasers extend back within their sentence, else drop
 _COLD_OPEN_MIN_MATCH = 0.8
+_COLD_OPEN_REPEAT_S = 10.0  # a teaser said again this close in the body is dropped
+_COLD_OPEN_REPEAT_MATCH = 0.9
 _BEAT_SNAP_S = 3.0
 _REACTION_PEAK_MIN_S = 12.0
 _CHUNK_OVERLAP_S = 120.0
@@ -423,6 +447,9 @@ _LEAD_INS += ("i was like", "he goes", "she goes", "they said", "he said", "she 
 _OPENER_FILLERS = ("um", "uh", "yeah", "okay", "ok", "well", "like", "oh", "anyway")
 _OPENER_FILLERS += ("i mean", "you know")
 _CONTEXT_OPENERS = {"and", "so", "but", "because", "which"}
+# A reply or correction with its comma ("No, game time!"): it answers a turn the viewer never
+# heard. ("Yeah," / "Okay," are opener fillers, stripped from a clip's start.)
+REPLY_OPENERS = ("no", "nope", "yes")
 # Matched on the lowercased text after fillers. "I like pizza" is fine; "I was like, ..." and
 # "I like, ..." quote a conversation. A self-quote with content ("I said, Hi, I'm here about
 # the broken boiler.") is deliberately allowed: it works cold.
@@ -445,6 +472,7 @@ _MAX_DROP_LINES = 3
 # repeats >= 2 of the question's content words (words not in _FUNCTION_WORDS).
 _ANSWER_OPENERS = ("no", "yes", "yeah", "nope", "sure", "absolutely", "not really")
 _ANSWER_MIN_SHARED = 2
+_WH_WORDS = ("what", "when", "where", "who", "why", "how", "which")
 _FUNCTION_WORDS = {"i", "you", "he", "she", "it", "we", "they", "me", "him", "her", "us"}
 _FUNCTION_WORDS |= {"them", "my", "your", "his", "its", "our", "their", "this", "that"}
 _FUNCTION_WORDS |= {"a", "an", "the", "and", "or", "but", "so", "of", "to", "in", "on", "at"}
@@ -565,23 +593,58 @@ def dedupe_overlaps(picks: list[ClipPick], max_overlap: float = 0.5) -> list[Cli
     return kept
 
 
-def diversify(ranked: list[ClipPick]) -> list[ClipPick]:
+def _gap(a: ClipPick, b: ClipPick) -> float:
+    """Seconds between two picks' spans (0 when they overlap)."""
+    return max(0.0, max(a.start, b.start) - min(a.end, b.end))
+
+
+def _same_death_stretch(
+    a: ClipPick, b: ClipPick, screens: list[tuple[float, float]] | None
+) -> bool:
+    """Whether a chain of death / loading screens (`screens`) links the two picks: at least
+    one screen between them and no step (pick end, screen, ..., pick start) longer than
+    DEATH_STRETCH_GAP_S -- the same stretch of repeated attempts."""
+    first, second = sorted((a, b), key=lambda p: p.start)
+    between = sorted((lo, hi) for lo, hi in screens or [] if first.end <= lo and hi <= second.start)
+    if not between:
+        return False
+    cur = first.end
+    for lo, hi in between:
+        if lo - cur > DEATH_STRETCH_GAP_S:
+            return False
+        cur = hi
+    return second.start - cur <= DEATH_STRETCH_GAP_S
+
+
+# A pick this close to a higher-ranked one (or in the same stretch of repeated deaths) is
+# most likely the same encounter of a one-game stream: it ranks below the distinct picks.
+NEAR_PICK_S = 180.0
+DEATH_STRETCH_GAP_S = 120.0
+
+
+def diversify(
+    ranked: list[ClipPick], screens: list[tuple[float, float]] | None = None
+) -> list[ClipPick]:
     """Within each verdict tier (`post` first, then the rest), keep rank order but move every
-    pick whose `category` an earlier pick of that tier already has (case-insensitive) below
-    the tier's picks of not-yet-seen categories."""
-    post = [p for p in ranked if p.verdict == "post"]
-    return _diversify_tier(post) + _diversify_tier([p for p in ranked if p.verdict != "post"])
-
-
-def _diversify_tier(ranked: list[ClipPick]) -> list[ClipPick]:
-    seen: set[str] = set()
-    fresh: list[ClipPick] = []
-    repeats: list[ClipPick] = []
-    for p in ranked:
+    pick below the tier's more distinct picks by how much it repeats the picks ranked above it
+    (in either tier): one step for a `category` an earlier pick of its tier already has
+    (case-insensitive), one more for a span within NEAR_PICK_S of a higher-ranked pick or in
+    the same stretch of repeated deaths (`screens`: death / loading screens) as one."""
+    order = [p for p in ranked if p.verdict == "post"]
+    order += [p for p in ranked if p.verdict != "post"]
+    repeats: dict[int, int] = {}
+    seen: dict[bool, set[str]] = {True: set(), False: set()}
+    for i, p in enumerate(order):
+        tier = seen[p.verdict == "post"]
         key = p.category.strip().lower()
-        (repeats if key and key in seen else fresh).append(p)
-        seen.add(key)
-    return fresh + repeats
+        near = any(
+            _gap(p, q) <= NEAR_PICK_S or _same_death_stretch(p, q, screens) for q in order[:i]
+        )
+        repeats[id(p)] = int(bool(key) and key in tier) + int(near)
+        tier.add(key)
+    post = [p for p in order if p.verdict == "post"]
+    rest = [p for p in order if p.verdict != "post"]
+    return [p for tier in (post, rest) for p in sorted(tier, key=lambda p: repeats[id(p)])]
 
 
 def polish_pick(transcript: Transcript) -> ClipPick:
@@ -603,6 +666,28 @@ def polish_pick(transcript: Transcript) -> ClipPick:
 
 def _clamped_scores(raw: _RawScores) -> RubricScores:
     return RubricScores(**{k: min(max(getattr(raw, k), 0), hi) for k, hi in _SCORE_MAX.items()})
+
+
+# A surprising fact that invites arguments (comment_risk medium / high) is not a 20+ hook: it
+# lands only for viewers who accept it.
+CONTESTED_FACT_HOOK_MAX = 15
+
+
+def _capped_scores(raw: "_RawClip") -> RubricScores:
+    """`_clamped_scores`, with `hook` capped at CONTESTED_FACT_HOOK_MAX for a surprising_fact
+    whose comment_risk is not low (logged)."""
+    scores = _clamped_scores(raw.scores)
+    contested = raw.hook_type == "surprising_fact" and raw.comment_risk in ("medium", "high")
+    if contested and scores.hook > CONTESTED_FACT_HOOK_MAX:
+        logger.info(
+            "clip %r: surprising_fact with %s comment_risk; hook %d capped at %d",
+            raw.title,
+            raw.comment_risk,
+            scores.hook,
+            CONTESTED_FACT_HOOK_MAX,
+        )
+        return scores.model_copy(update={"hook": CONTESTED_FACT_HOOK_MAX})
+    return scores
 
 
 def _tokens(text: str) -> list[str]:
@@ -946,15 +1031,42 @@ def _cold_open(
             )
             return None
         t0 = words[back].start
+    if _recurs(words, t0, words[k].end):
+        _drop_cold_open(
+            raw,
+            log,
+            f"{text!r} recurs in the body within {_COLD_OPEN_REPEAT_S:.0f}s: the viewer would hear "
+            "it three times",
+        )
+        return None
     return t0, words[k].end
+
+
+def _recurs(words: list[Word], t0: float, t1: float) -> bool:
+    """Whether the teaser spoken over [t0, t1] (`words` of the clip) is said again outside
+    it, within _COLD_OPEN_REPEAT_S before or after: an in-order match of >= 90% of its tokens
+    within as many consecutive tokens."""
+    want = [t for w in words if t0 - 1e-6 <= w.start < t1 for t in _tokens(w.text)]
+    if not want:
+        return False
+    before = [w for w in words if t0 - _COLD_OPEN_REPEAT_S <= w.start < t0 - 1e-6]
+    after = [w for w in words if t1 - 1e-6 <= w.start <= t1 + _COLD_OPEN_REPEAT_S]
+    for side in (before, after):
+        toks = _flat_tokens(side)[0]
+        for i in range(max(len(toks) - len(want) + 1, 0)):
+            window = toks[i : i + len(want)]
+            blocks = SequenceMatcher(None, want, window, autojunk=False).get_matching_blocks()
+            if sum(b.size for b in blocks) >= _COLD_OPEN_REPEAT_MATCH * len(want) - 1e-9:
+                return True
+    return False
 
 
 def _bad_opener(words: list[Word]) -> bool:
     """A first sentence that leans on context the viewer never saw: it opens on a quote mark,
     or (after fillers such as "um" / "yeah", and after a bare And/So followed by a 0.3 s pause,
     which the filler trimmer removes) on And/So/But/Because/Which or a quoted conversation
-    ("he goes ...", "they said ...", "I was like, no."). A first-person self-quote whose quoted
-    part has >= 4 words ("I was like, so you want me to drive all night?") is not weak."""
+    ("he goes ...", "they said ...", "I was like, no."), or a reply / correction with its comma
+    ("No, game time!"). A first-person self-quote whose quoted part has >= 4 words ("I was like, so you want me to drive all night?") is not weak."""
     text = " ".join(w.text.strip() for w in words).strip()
     if not text:
         return False
@@ -979,6 +1091,8 @@ def _bad_opener(words: list[Word]) -> bool:
         return False
     if norms[i] in _CONTEXT_OPENERS:
         return True
+    if norms[i] in REPLY_OPENERS and words[i].text.rstrip().endswith(","):
+        return True  # a reply or correction ("No, game time!") to a turn the viewer missed
     rest = " ".join(w.text.strip() for w in words[i:]).lower().replace("’", "'")
     m = _QUOTED_OPENER_RE.match(rest)
     if m and rest.startswith(("i ", "i'm ", "we ")):  # a self-quote with content works cold
@@ -1282,9 +1396,10 @@ def _strip_start_filler(words: list[Word]) -> int:
 
 def _answers(question: str, toks: list[str]) -> bool:
     """Whether a line with tokens `toks` answers `question`: it opens on an answer word ("No,",
-    "Yes,", "Not really.") or repeats >= 2 of the question's content words (one shared word,
+    "Yes,", "Not really."; not for a wh-question: "What's the time?" / "Yeah, ...") or repeats >= 2 of the question's content words (one shared word,
     as in "Did I go?" / "We go there...", is chance)."""
-    if any(toks[: len(a.split())] == a.split() for a in _ANSWER_OPENERS):
+    wh = _tokens(question)[:1] and _tokens(question)[0].startswith(_WH_WORDS)
+    if not wh and any(toks[: len(a.split())] == a.split() for a in _ANSWER_OPENERS):
         return True
     content = {t for t in _tokens(question) if t not in _FUNCTION_WORDS}
     return len(content & set(toks)) >= _ANSWER_MIN_SHARED
@@ -1313,6 +1428,7 @@ def _drop_lines(
     cold_open: tuple[float, float] | None,
     log: bool,
     start: float | None = None,
+    notes: list[str] | None = None,
 ) -> list[int]:
     """The declared drop_lines that are actually cut: at most 3 lines strictly inside
     L{first}..L{last}, none holding the cold-open teaser, no question whose next kept line
@@ -1320,13 +1436,16 @@ def _drop_lines(
     later drop is ignored), nor an opening or closing piece with less than MIN_EDGE_PIECE_S
     of speech (from its first word's start to its last word's end; the opening piece from the
     clip's `start`, default L{first}'s start) before or after the jump cut (the first or last
-    drop is ignored). With `log`, every ignored line is logged (warning)."""
+    drop is ignored). With `log`, every ignored line is logged (warning); `notes` collects
+    each one's reason (without the clip's title)."""
     sents = src.sentences
     t0 = sents[first].start if start is None else start
 
     def warn(msg: str, *args: object) -> None:
         if log:
             logger.warning(msg, *args)
+        if notes is not None:  # every message starts "clip %r: "
+            notes.append(msg.removeprefix("clip %r: ") % args[1:])
 
     lines = sorted(set(raw.drop_lines))
     outside = [d for d in lines if not first < d < last]
@@ -1447,12 +1566,13 @@ def _drop_plan(
     src: _Source,
     start: float | None = None,
     log: bool = False,
+    notes: list[str] | None = None,
 ) -> tuple[list[tuple[float, float]], tuple[float, float] | None]:
     """(source ranges cut for drop_lines, cold-open teaser) of the clip L{first}..L{last}
     starting at `start` (default: L{first}'s start), exactly as `_to_pick` uses them. The
     teaser holds its lines back from the drops unless the clip plus teaser would then exceed
     _hard_max: the teaser is discarded and those drops stand. `log` logs each
-    decision (once, from `_to_pick`)."""
+    decision (once, from `_to_pick`); `notes` collects the ignored drop_lines' reasons."""
     sents = src.sentences
     t0 = sents[first].start if start is None else start
     cold = _cold_open(raw, first, last, src, log=log)
@@ -1463,7 +1583,7 @@ def _drop_plan(
         if main + (cold[1] - cold[0]) > max_s:
             _drop_cold_open(raw, log, f"would push the clip over the {max_s:.0f}s maximum length")
             cold = None
-    lines = _drop_lines(raw, first, last, src, cold, log=log, start=t0)
+    lines = _drop_lines(raw, first, last, src, cold, log=log, start=t0, notes=notes)
     if log:
         for d in lines:
             logger.info("clip %r: dropped L%d (%r)", raw.title, d, sents[d].text)
@@ -1513,7 +1633,7 @@ def _assemble(
         title=_check_title(raw.title, _flat_tokens(words)[0], raw.title),
         hook_text=raw.hook_text,
         reason=raw.reason,
-        scores=_clamped_scores(raw.scores),
+        scores=_capped_scores(raw),
         cold_open=cold_open,
         edit_beats=_snap_beats(raw, words, start, end),
         first_words=" ".join(w.text for w in opening) if opening else src.sentences[first].text,
@@ -1656,8 +1776,9 @@ def _to_pick(raw: _RawClip, src: _Source) -> ClipPick | None:
         return None
     if any(min(pick.end, e) - max(pick.start, s) > 0 for s, e in src.exclude):
         return None
-    _drop_plan(raw, start_line, last, src, pick.start, log=True)  # the kept clip's decisions
-    return pick
+    notes: list[str] = []  # the kept clip's decisions
+    _drop_plan(raw, start_line, last, src, pick.start, log=True, notes=notes)
+    return pick.model_copy(update={"ignored_drops": notes}) if notes else pick
 
 
 def _ask(
@@ -1717,10 +1838,13 @@ def select_clips(
     raw_sink: list[dict] | None = None,
     markers: dict[int, list[str]] | None = None,
     heat_seconds: set[int] | None = None,
+    screens: list[tuple[float, float]] | None = None,
 ) -> list[ClipPick]:
     """Pick up to `settings.clips` post/maybe clips, sorted by start. If `raw_sink` is given,
     each raw LLM payload is appended to it. `markers` (second -> heat markers) annotate the
-    transcript lines Claude reads. Raises NoClipsSelectedError if every candidate was `skip`."""
+    transcript lines Claude reads; `screens` (death / loading screens, source s) let
+    `diversify` spread the picks across a stream's encounters. Raises NoClipsSelectedError if
+    every candidate was `skip`."""
     if transcript.duration < settings.short_input_s:
         return [polish_pick(transcript)]
 
@@ -1773,7 +1897,7 @@ def select_clips(
                 max_s=settings.max_clip_s,
             )
             raws.extend(_ask(llm, prompt, settings, label, raw_sink).clips)
-        best = diversify(dedupe_overlaps(valid(raws)))[: settings.clips]
+        best = diversify(dedupe_overlaps(valid(raws)), screens)[: settings.clips]
     else:
         prompt = build_prompt(
             compact,
@@ -1784,9 +1908,9 @@ def select_clips(
             max_s=settings.max_clip_s,
         )
         first = _ask(llm, prompt, settings, raw_sink=raw_sink).clips
-        best = diversify(dedupe_overlaps(valid(first)))[: settings.clips]
+        best = diversify(dedupe_overlaps(valid(first)), screens)[: settings.clips]
         if len(first) < settings.clips:  # too few returned (not: too few kept after skips)
-            best = _follow_up(best, compact, llm, settings, src, valid, raw_sink)
+            best = _follow_up(best, compact, llm, settings, src, valid, raw_sink, screens)
 
     if returned and all(r.verdict == "skip" for r in returned):
         raise NoClipsSelectedError(ALL_SKIP_MESSAGE)
@@ -1803,6 +1927,7 @@ def _follow_up(
     src: _Source,
     valid: Callable[[list[_RawClip]], list[ClipPick]],
     raw_sink: list[dict] | None = None,
+    screens: list[tuple[float, float]] | None = None,
 ) -> list[ClipPick]:
     """One extra call for the missing picks, steering away from what is already accepted."""
     missing = settings.clips - len(best)
@@ -1825,4 +1950,4 @@ def _follow_up(
     except LLMError as e:
         logger.warning("follow-up clip selection failed; keeping %d clip(s): %s", len(best), e)
         return best
-    return diversify(dedupe_overlaps(best + valid(more)))[: settings.clips]
+    return diversify(dedupe_overlaps(best + valid(more)), screens)[: settings.clips]

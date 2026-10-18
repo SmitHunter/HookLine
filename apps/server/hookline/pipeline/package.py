@@ -43,8 +43,10 @@ PACKAGING_SYSTEM_PROMPT = (
 You are the packaging editor for vertical short-form clips (TikTok, YouTube Shorts, Reels). \
 The clips are already cut. For each clip you get its final spoken words, numbered, in the \
 order the viewer hears them: a cold-open teaser (if any) plays first, then the clip; \
-`[cut]` marks a jump cut where lines were removed. A word marked `(?)` is one the \
-transcriber was unsure of. Lines marked CONTEXT ONLY are source text from just before the \
+`[cut]` marks a jump cut where lines were removed. `[death screen]` marks a death, loading \
+or respawn screen inside the clip: in a game the player died or the game reset there, so \
+never describe the clip as a clean escape, a win or one unbroken run across it. A word marked \
+`(?)` is one the transcriber was unsure of. Lines marked CONTEXT ONLY are source text from just before the \
 clip (and, for a teaser, the full sentence it is cut from): the viewer never hears them, so \
 use them to understand who is speaking, where and about what, never as words of the clip. \
 You also get the packaging written when the clip was chosen, before its boundaries were \
@@ -138,6 +140,7 @@ _GENERIC_HASHTAGS |= {"video", "clips", "clip", "mindset", "success", "lifestyle
 _MAX_HASHTAGS = 5
 _TRAILING_PUNCT_RE = re.compile(r"[.,!?;:…]+$")
 _LEADING_PUNCT_RE = re.compile(r'^["“‘«(\[¿¡]+')  # opening quotes; never an apostrophe
+_OPENING_QUOTES = '"“‘«(['
 
 
 class _RawFix(BaseModel):
@@ -172,17 +175,34 @@ def clip_words(pick: ClipPick, words: list[Word]) -> list[Word]:
     return [w for seg in pick.segments() for w in words if _in(w, seg)]
 
 
-def _segment_texts(pick: ClipPick, words: list[Word]) -> list[tuple[str, list[str]]]:
-    """(label, numbered words) per segment, numbering continuing across segments."""
+DEATH_SCREEN_TAG = "[death screen]"
+DEATH_SCREEN_SHOWN_S = 1.0  # a screen is marked when at least this much of it is in a segment
+
+
+def _segment_texts(
+    pick: ClipPick, words: list[Word], screens: list[tuple[float, float]] | None = None
+) -> list[tuple[str, list[str]]]:
+    """(label, numbered words) per segment, numbering continuing across segments; a death /
+    loading screen (`screens`, source s) shown for DEATH_SCREEN_SHOWN_S or more in a segment is
+    marked DEATH_SCREEN_TAG where it starts (unnumbered)."""
     out: list[tuple[str, list[str]]] = []
     i = 0
     for k, seg in enumerate(pick.segments()):
         label = "Teaser (plays first)" if pick.cold_open and k == 0 else "Clip"
+        shown = sorted(
+            lo
+            for lo, hi in screens or []
+            if min(hi, seg[1]) - max(lo, seg[0]) >= DEATH_SCREEN_SHOWN_S - 1e-6
+        )
         numbered = []
         for w in (w for w in words if _in(w, seg)):
+            while shown and shown[0] <= w.start:
+                numbered.append(DEATH_SCREEN_TAG)
+                shown.pop(0)
             flag = "(?)" if w.prob < LOW_PROB else ""
             numbered.append(f"{i}:{w.text}{flag}")
             i += 1
+        numbered += [DEATH_SCREEN_TAG] * len(shown)
         if out and label == out[-1][0] == "Clip":
             out[-1][1].extend(["[cut]", *numbered])
         else:
@@ -214,7 +234,10 @@ def _teaser_source(pick: ClipPick, words: list[Word], sentences: list[Sentence])
 
 
 def build_packaging_prompt(
-    picks: list[ClipPick], words: list[Word], sentences: list[Sentence] | None = None
+    picks: list[ClipPick],
+    words: list[Word],
+    sentences: list[Sentence] | None = None,
+    screens: list[tuple[float, float]] | None = None,
 ) -> str:
     if sentences is None:
         sentences = selection_lines(words)
@@ -242,7 +265,7 @@ def build_packaging_prompt(
                 f"{_text(source)}"
             )
         lines.append("Final words:")
-        lines += [f"{label}: {' '.join(ws)}" for label, ws in _segment_texts(p, words)]
+        lines += [f"{label}: {' '.join(ws)}" for label, ws in _segment_texts(p, words, screens)]
         parts.append("\n".join(lines))
     return "\n\n".join(parts)
 
@@ -331,19 +354,64 @@ def _repeats_opening(hook: str, opening: list[str]) -> bool:
     return shared / len(content) >= _HOOK_REPEAT_SHARE - 1e-9
 
 
-def _choose_hook(pick: ClipPick, raw: _RawPackage, final: list[Word]) -> str:
+def _proper_names(words: list[Word]) -> set[str]:
+    """Lowercased tokens the source capitalises mid-sentence ("I think Grimbo is ..."): names
+    of people, places, shows and games."""
+    out: set[str] = set()
+    for prev, w in zip([None, *words], words, strict=False):
+        text = w.text.strip().lstrip(_OPENING_QUOTES)
+        if not text[:1].isupper() or prev is None or ends_sentence(prev.text):
+            continue
+        for t in _tokens(text):
+            if t not in _FUNCTION_WORDS and t != "i" and len(t) > 1:
+                out.add(t.removesuffix("'s"))
+    return out
+
+
+def _entities(hook: str, names: set[str]) -> set[str]:
+    """The source's proper names (`_proper_names`) the hook uses."""
+    return {t.removesuffix("'s") for t in _tokens(hook)} & names
+
+
+def _entity_label(hook: str, names: set[str]) -> bool:
+    """An entity plus a generic label: the hook leads with a name ("Grimbo's vent ad: the last
+    line") and labels it, after a colon or dash or as a possessive, instead of stating what is
+    at stake."""
+    toks = _tokens(hook)
+    if not toks or toks[0].removesuffix("'s") not in names:
+        return False
+    return toks[0].endswith("'s") or any(c in hook for c in (":", "—", " – ", " - "))
+
+
+def _choose_hook(
+    pick: ClipPick,
+    raw: _RawPackage,
+    final: list[Word],
+    source: list[str] | None = None,
+    names: set[str] | None = None,
+    used: set[str] | None = None,
+) -> str:
     """The packaged hook_text, else its alternative, else the selection-time hook: the first
-    that is 1-7 words and does not repeat the first two spoken sentences (each rejection
-    logged). When every one repeats, the selection-time hook is kept (logged)."""
+    that is 1-7 words, does not repeat the first two spoken sentences, claims no date, ordinal
+    or superlative the `source` tokens do not say, and names no entity an earlier hook of the
+    batch used (`used`); among those, one that is not an entity plus a generic label
+    (`_entity_label`) wins over one that is (the selection hook over a labelling packaged
+    one). Each rejection logged. When every one fails, the selection-time hook is kept
+    (logged)."""
     label = pick.title
     opening = _opening_tokens(final)
-    for name, text in (("hook_text", raw.hook_text), ("alt_hook_text", raw.alt_hook_text)):
+    names, used = names or set(), used or set()
+    found: list[tuple[str, str]] = []
+    candidates = [("hook_text", raw.hook_text), ("alt_hook_text", raw.alt_hook_text)]
+    candidates.append(("selection hook_text", pick.hook_text))
+    for name, text in candidates:
         hook = " ".join(text.split())
+        reused = _entities(hook, names) & used
+        bad = unsupported_specifics(hook, source) if source is not None else []
         if not hook:
             log = logger.warning if name == "hook_text" else logger.info
             log("clip %r: packaged %s is empty", label, name)
-            continue
-        if len(hook.split()) > _HOOK_MAX_WORDS:
+        elif len(hook.split()) > _HOOK_MAX_WORDS:
             logger.warning(
                 "clip %r: packaged %s %r is over %d words",
                 label,
@@ -355,17 +423,73 @@ def _choose_hook(pick: ClipPick, raw: _RawPackage, final: list[Word]) -> str:
             logger.warning(
                 "clip %r: packaged %s %r repeats the first spoken sentences", label, name, hook
             )
+        elif bad:
+            logger.warning(
+                "clip %r: packaged %s %r has unsupported specifics %s", label, name, hook, bad
+            )
+        elif reused:
+            logger.warning(
+                "clip %r: %s %r names %s, already in another hook of the batch",
+                label,
+                name,
+                hook,
+                sorted(reused),
+            )
         else:
-            return hook
-    if _repeats_opening(pick.hook_text, opening):
-        logger.warning(
-            "clip %r: the selection hook_text %r repeats the opening too; kept",
-            label,
-            pick.hook_text,
+            found.append((name, hook))
+    plain = [f for f in found if not _entity_label(f[1], names)]
+    if not found:
+        logger.warning("clip %r: no hook passes the checks; kept the selection hook_text", label)
+        return pick.hook_text
+    name, hook = (plain or found)[0]
+    if plain and plain[0] != found[0]:
+        logger.info(
+            "clip %r: %r is an entity plus a label; kept %s %r", label, found[0][1], name, hook
         )
-    else:
-        logger.info("clip %r: kept the selection hook_text %r", label, pick.hook_text)
-    return pick.hook_text
+    elif name == "selection hook_text":
+        logger.info("clip %r: kept the selection hook_text %r", label, hook)
+    return hook
+
+
+_ORDINALS = {"first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth"}
+_ORDINALS |= {"ninth", "tenth"}  # not "last": "the last door" is figurative
+_ORDINAL_RE = re.compile(r"^\d+(?:st|nd|rd|th)$")
+_YEAR_RE = re.compile(r"^(?:1[5-9]\d\d|20\d\d)s?$")
+_MONTHS = {"january", "february", "april", "june", "july", "september", "october"}
+_MONTHS |= {"november", "december"}  # "may", "march", "august" are ordinary words too
+_SUPERLATIVES = {"best", "worst", "most", "least"}
+_SUPERLATIVE_RE = re.compile(r"^[a-z]{2,}est$")
+_NOT_SUPERLATIVE = {"interest", "forest", "honest", "modest", "request", "contest", "protest"}
+_NOT_SUPERLATIVE |= {"suggest", "digest", "harvest", "invest", "arrest", "manifest", "quest"}
+_NOT_SUPERLATIVE |= {"conquest", "priest", "guest", "chest", "test", "west", "rest", "nest"}
+_NOT_SUPERLATIVE |= {"earnest", "unrest", "attest", "detest", "midwest", "inquest", "crest"}
+_ORDINAL_NEAR = 2  # an ordinal is supported when the source says it this close before its noun
+
+
+def unsupported_specifics(text: str, source: list[str]) -> list[str]:
+    """Tokens of `text` that claim a specific the `source` tokens (in order) do not say: a
+    year or month not in the source, a superlative ("biggest", "worst") not in it, or an
+    ordinal ("first", "last", "3rd") the source never says within _ORDINAL_NEAR words before
+    the same next content word ("first deployment" does not support "First Gulf War")."""
+    have = set(source)
+    toks = _tokens(text)
+    out: list[str] = []
+    for i, t in enumerate(toks):
+        if _YEAR_RE.match(t) or t in _MONTHS:
+            ok = t in have
+        elif t in _ORDINALS or _ORDINAL_RE.match(t):
+            noun = next((x for x in toks[i + 1 :] if x not in _FUNCTION_WORDS), None)
+            ok = any(
+                s == t and (noun is None or noun in source[j + 1 : j + 1 + _ORDINAL_NEAR])
+                for j, s in enumerate(source)
+            )
+        elif t in _SUPERLATIVES or (_SUPERLATIVE_RE.match(t) and t not in _NOT_SUPERLATIVE):
+            ok = t in have
+        else:
+            continue
+        if not ok:
+            out.append(t)
+    return out
 
 
 def _grounded(tag: str, source: set[str]) -> bool:
@@ -399,15 +523,43 @@ def _merge_hashtags(
     return out
 
 
-def _apply(pick: ClipPick, raw: _RawPackage, final: list[Word], context: list[Word]) -> ClipPick:
+def _supported(name: str, text: str, fallback: str, source: list[str], label: str) -> str:
+    """`text`, or `fallback` (logged) when it claims a date, ordinal or superlative the source
+    does not say (`unsupported_specifics`)."""
+    bad = unsupported_specifics(text, source)
+    if not bad:
+        return text
+    logger.warning(
+        "clip %r: packaged %s %r has unsupported specifics %s; kept %r",
+        label,
+        name,
+        text,
+        bad,
+        fallback,
+    )
+    return fallback
+
+
+def _apply(
+    pick: ClipPick,
+    raw: _RawPackage,
+    final: list[Word],
+    context: list[Word],
+    names: set[str] | None = None,
+    used: set[str] | None = None,
+) -> ClipPick:
     label = pick.title
-    hook = _choose_hook(pick, raw, final)
+    order = [t for w in [*context, *final] for t in _tokens(w.text)]
+    hook = _choose_hook(pick, raw, final, order, names or set(), used or set())
     title = _check_title(raw.title, _flat_tokens(final)[0], label) or pick.title
-    source = {t for w in [*context, *final] for t in _tokens(w.text)}
+    title = _supported("title", title, pick.title, order, label)
+    source = set(order)
     packaged = _clean_hashtags(raw.hashtags, label)
     tags = _merge_hashtags(packaged, pick.hashtags, source, label) or pick.hashtags
     caption = _check_caption(raw.post_caption, label) or pick.post_caption
+    caption = _supported("post_caption", caption, pick.post_caption, order, label)
     search = _search_title(raw.search_title, pick.search_title, label) or pick.search_title
+    search = _supported("search_title", search, pick.search_title, order, label)
     return pick.model_copy(
         update={
             "hook_text": hook,
@@ -443,8 +595,10 @@ def package_clips(
     llm: LLMBackend,
     settings: Settings,
     raw_sink: list[dict] | None = None,
+    screens: list[tuple[float, float]] | None = None,
 ) -> list[ClipPick]:
-    """Re-package every pick from its final words in one call. Returns a new list (clips the
+    """Re-package every pick from its final words in one call (`screens`: death / loading
+    screens, source s, marked in the words). Returns a new list (clips the
     pass rates `skip` removed, unless that would remove them all); on any failure, logs a
     warning and returns `picks` itself, so callers can tell nothing was packaged."""
     if not picks:
@@ -457,7 +611,8 @@ def package_clips(
         context_words(p, words, sentences) + _teaser_source(p, words, sentences) for p in picks
     ]
     try:
-        answer = _ask(llm, build_packaging_prompt(picks, words, sentences), settings, raw_sink)
+        prompt = build_packaging_prompt(picks, words, sentences, screens)
+        answer = _ask(llm, prompt, settings, raw_sink)
     except Exception as e:  # noqa: BLE001 - packaging is polish; it must never fail the job
         logger.warning("packaging pass failed; keeping the selection-time packaging: %s", e)
         return picks
@@ -471,10 +626,13 @@ def package_clips(
         )
         return picks
     by_clip = {a.clip: a for a in answer.clips}
-    out = [
-        _apply(p, by_clip[n], f, c)
-        for n, (p, f, c) in enumerate(zip(picks, finals, contexts, strict=True), 1)
-    ]
+    names = _proper_names([w for ws in (*finals, *contexts) for w in ws])
+    used: set[str] = set()  # names already in a hook of this batch
+    out = []
+    for n, (p, f, c) in enumerate(zip(picks, finals, contexts, strict=True), 1):
+        packaged = _apply(p, by_clip[n], f, c, names, used)
+        used |= _entities(packaged.hook_text, names)
+        out.append(packaged)
     kept = [p for p in out if p.verdict != "skip"]
     for p in out:
         if p.verdict == "skip":

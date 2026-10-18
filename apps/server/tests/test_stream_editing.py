@@ -615,15 +615,16 @@ def test_static_runs_computed_once_per_words_list(monkeypatch):
 
 
 def test_payoff_skipped_after_a_punchline_when_the_scare_is_late():
-    # I6: stream 03 ended on "...gonna run?" and was extended into "Who? Who? Dodge!"
+    # stream 03 ended on "...gonna run?" and was extended into "Who? Who? Dodge!": a punchline
+    # takes a scare only within 1.5 s of its last word
     from hookline.pipeline.boundaries import extend_payoff
 
     words = [*sentence(10, "Why would I wanna run? You gonna run?")]
     end = words[-1].end + 0.2
     late = sig(scares=[end + 4.5])
     assert extend_payoff(pick(10, end), words, late, max_s=60).end == end
-    near = sig(scares=[end + 3.0])
-    assert extend_payoff(pick(10, end), words, near, max_s=60).end == pytest.approx(end + 5.5)
+    near = sig(scares=[end + 1.0])
+    assert extend_payoff(pick(10, end), words, near, max_s=60).end == pytest.approx(end + 3.5)
     # mid-sentence: the late scare is still the payoff
     open_end = words[:-1]
     e2 = open_end[-1].end + 0.2
@@ -636,9 +637,9 @@ def test_payoff_shrink_never_ends_mid_word():
 
     words = [W(10 + i * 0.5, 10 + i * 0.5 + 0.4, "w") for i in range(40)]  # to 29.9
     words += [W(32.3, 33.9, "aaah"), W(36.5, 37.0, "ok.")]
-    p = extend_payoff(pick(10, 30.0), words, sig(scares=[32.0]), max_s=23.6)
+    p = extend_payoff(pick(10, 30.0), words, sig(scares=[32.0]), max_s=24.0)
     assert not any(w.start < p.end < w.end for w in words)
-    assert p.end == pytest.approx(32.3)
+    assert p.end == pytest.approx(34.0)  # the catch: >= 1.5 s after the scare, off a word
 
 
 def test_held_word_voice_joined_across_a_short_breath():

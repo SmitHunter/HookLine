@@ -200,7 +200,7 @@ def test_picks_cache_key_mismatch_reselects(fixture_video, fake_llm, settings_tm
     job = s.workspace_dir / job_id_for(str(fixture_video))
     saved = json.loads((job / "picks.json").read_text(encoding="utf-8"))
     assert saved["key"] == {
-        "schema": 7,
+        "schema": 8,
         "clips": 1,
         "select_model": s.select_model,
         "min_clip_s": s.min_clip_s,
@@ -545,14 +545,14 @@ def test_run_job_passes_loud_seconds_to_render(fixture_video, fake_llm, settings
     assert seen == [set(range(20, 25))]
 
 
-def test_picks_schema_is_7_and_schema_6_picks_are_reselected(settings, tmp_path):
+def test_picks_schema_is_8_and_schema_7_picks_are_reselected(settings, tmp_path):
     from hookline.pipeline.run import PACKAGE_SCHEMA, PICKS_SCHEMA, _load_picks, _picks_key
 
-    # scare markers and the gameplay cause/payoff rules change the picks
-    assert PICKS_SCHEMA == 7 and _picks_key(settings, {})["schema"] == 7
-    assert PACKAGE_SCHEMA == 3  # context, hook/hashtag/search-title checks
+    # death-screen markers, encounter spreading and ignored drop_lines change the picks
+    assert PICKS_SCHEMA == 8 and _picks_key(settings, {})["schema"] == 8
+    assert PACKAGE_SCHEMA == 4  # death screens in the words, hook and specifics rules
     key = _picks_key(settings, {})
-    old = {**key, "schema": 6}
+    old = {**key, "schema": 7}
     ppath = tmp_path / "picks.json"
     ppath.write_text(json.dumps({"key": old, "picks": []}), encoding="utf-8")
     logs: list[str] = []

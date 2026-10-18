@@ -557,6 +557,17 @@ def first_words_match(first_words: str, spoken: str) -> float:
     return SequenceMatcher(None, want, got, autojunk=False).ratio()
 
 
+def first_word_clipped(first_words: str, main: list[Word]) -> str | None:
+    """The first word of `first_words` (leading filler openers stripped) when the clip's
+    opening does not start on it: the render cut it ("fuck was that?" for "The fuck was
+    that?"); None when it is heard."""
+    want = _strip_fillers(_tokens(first_words))
+    got = _strip_fillers(_tokens(" ".join(w.text for w in main)))
+    if not want or not got or got[0] == want[0]:
+        return None
+    return want[0]
+
+
 def _check_opening(
     words: list[Word] | None,
     first_words: str,
@@ -585,9 +596,13 @@ def _check_opening(
     start = words[0].start
     main = [w for w in words if seam is None or w.start >= seam - 0.05]
     match = first_words_match(first_words, " ".join(w.text for w in main))
-    ok = start <= SPEECH_START_MAX and match >= FIRST_WORDS_MIN
+    # the clip's very first word (a cold open's main span may start on a lead-in)
+    clipped = first_word_clipped(first_words, main) if seam is None else None
+    ok = start <= SPEECH_START_MAX and match >= FIRST_WORDS_MIN and clipped is None
     label = "declared first_words" if declared else "first_words"
     detail = f"speech at {start:.2f}s; {label} match {match:.0%}"
+    if clipped is not None:
+        detail += f"; first word {clipped!r} clipped"
     if seam is not None:
         detail += f" after the seam at {seam:.2f}s"
     if not first_words.strip():

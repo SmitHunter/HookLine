@@ -1988,6 +1988,12 @@ def test_gameplay_prompt_uses_no_phrases_from_the_test_stream():
         "i don't want a hug",
         "run button",
         "just go",
+        "game plan",
+        "game time",
+        "dodge",
+        "not today",
+        "wrong turn",
+        "the doll that talks back",
     ):
         assert needle not in low, needle
 

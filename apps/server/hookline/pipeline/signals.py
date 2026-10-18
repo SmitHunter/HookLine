@@ -19,6 +19,11 @@ _KIND_SHARE = 0.4
 _CLIP_MIN_REQUESTS = 3
 CLIP_MARKER = "\u2702\ufe0fclip"
 SCARE_MARKER = "\u26a1scare"
+# A death / loading / menu screen or fade (`screen_runs`, talked over or not) of at least
+# SCREEN_MARKER_MIN_S, marked `\u2b1bscreen Ns` on the transcript line at or after it: the selector
+# sees where a game reset (a death, a respawn) and never splices two attempts across it.
+SCREEN_MARKER = "\u2b1bscreen"
+SCREEN_MARKER_MIN_S = 3.0
 # signals.json format; a cached file below this version has its onsets recomputed (2: motion,
 # onsets and game-audio transients; 3: exact onset times, 0.3 s speech pad; 4: per-frame
 # screen flags; 5: screen chroma, cam masked). The VOD
@@ -376,6 +381,13 @@ def _scare_markers(signals: Signals) -> dict[int, str]:
     return out
 
 
+def _screen_markers(signals: Signals) -> dict[int, str]:
+    return {
+        int(lo): f"{SCREEN_MARKER} {round(hi - lo)}s"
+        for lo, hi in screen_runs(signals, min_s=SCREEN_MARKER_MIN_S)
+    }
+
+
 def heat_seconds(signals: Signals) -> set[int]:
     """Every second inside a loud run or a chat-spike run (not only each run's first second),
     and every scare second."""
@@ -386,12 +398,14 @@ def heat_seconds(signals: Signals) -> set[int]:
 
 
 def heat_markers(signals: Signals) -> dict[int, list[str]]:
-    """Second -> markers, only at the first second of each run of heat."""
+    """Second -> markers, only at the first second of each run of heat, and at the start of
+    each death / loading screen (`SCREEN_MARKER`)."""
     found = [_chat_markers(signals.chat, signals.chat_kinds)] if signals.chat else []
     if signals.chat_kinds and signals.chat:
         found.append(_clip_markers(signals.chat_kinds, len(signals.chat)))
     found.append(_loud_markers(signals.loudness))
     found.append(_scare_markers(signals))
+    found.append(_screen_markers(signals))
     markers: dict[int, list[str]] = {}
     for source in found:
         for sec, label in source.items():

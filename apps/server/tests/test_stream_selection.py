@@ -1,0 +1,492 @@
+"""Stream selection: death / respawn screens shown to the selector and the packager, clips kept
+on one side of a death screen, spread across encounters, punchline and catch endings, opener
+re-checks after a start move, reaction openers backed onto their cause sound, cold-open
+repeats, hook rules and unsupported packaging specifics."""
+
+import logging
+
+import pytest
+
+from hookline.models import ClipPick, RubricScores, Word
+from hookline.pipeline.signals import SIGNALS_VERSION, Signals
+
+FULL = 0b1111  # every frame of a second is a screen frame (4 fps)
+
+
+def pick(start, end, **kw):
+    scores = RubricScores(
+        hook=0, context=0, payoff=0, emotion=0, length_fit=0, pacing=0, loop=0, safety=0
+    )
+    base = {"title": "t", "hook_text": "h", "reason": "r", "scores": scores}
+    return ClipPick(start=start, end=end, **{**base, **kw})
+
+
+def W(start, end, text="word"):
+    return Word(start=start, end=end, text=text)
+
+
+def sentence(start, text, step=0.3):
+    toks = text.split()
+    return [W(start + i * step, start + i * step + step * 0.8, t) for i, t in enumerate(toks)]
+
+
+def sig(n=200, screen=(), scares=(), onsets=None, loud=()):
+    """`n` s of busy gameplay; `screen` (lo, hi) second ranges are full screen seconds;
+    `onsets` every audio onset (default: the scares); `loud` loud seconds."""
+    mask = [0] * n
+    for lo, hi in screen:
+        for s in range(lo, hi):
+            mask[s] = FULL
+    every = list(scares) if onsets is None else sorted({*onsets, *scares})
+    loudness = [-20.0] * n
+    for s in loud:
+        loudness[s] = 0.0
+    return Signals(
+        duration=n,
+        loudness=loudness,
+        version=SIGNALS_VERSION,
+        motion=[20.0] * n,
+        onsets=[int(t) for t in every],
+        transients=[int(t) for t in scares],
+        onset_times=every,
+        transient_times=list(scares),
+        screen=mask,
+    )
+
+
+# --- the selector sees death screens ----------------------------------------------------------
+
+
+def test_screen_runs_are_marked_on_the_transcript():
+    from hookline.pipeline.signals import SCREEN_MARKER, heat_markers
+
+    m = heat_markers(sig(screen=[(30, 46), (80, 82)]))
+    assert m[30] == [f"{SCREEN_MARKER} 16s"]
+    assert 80 not in m  # a 2 s flicker is no death screen
+    assert SCREEN_MARKER == "⬛screen"
+
+
+def test_selection_prompt_covers_deaths_encounters_and_climax_cold_opens():
+    from hookline.pipeline.select import SYSTEM_PROMPT
+    from hookline.pipeline.signals import SCREEN_MARKER
+
+    assert SCREEN_MARKER in SYSTEM_PROMPT
+    for needle in (
+        "Never span a death or respawn",
+        "at most one clip per encounter",
+        "ends in success or the climax",
+        "use the payoff line itself as `cold_open_words`",
+    ):
+        assert needle in SYSTEM_PROMPT, needle
+
+
+def _ranked(*spans, verdict="maybe"):
+    return [pick(a, b, category="gaming", verdict=verdict, title=f"c{a}") for a, b in spans]
+
+
+def test_diversify_demotes_a_pick_within_180s_of_a_higher_one():
+    from hookline.pipeline.select import diversify
+
+    a, b, c = _ranked((1000, 1030), (1100, 1130), (2000, 2030))
+    assert diversify([a, b, c]) == [a, c, b]
+
+
+def test_diversify_demotes_a_pick_in_the_same_stretch_of_repeated_deaths():
+    from hookline.pipeline.select import diversify
+
+    a, b, c = _ranked((1000, 1030), (1300, 1330), (3000, 3030))
+    deaths = [(1050.0, 1066.0), (1120.0, 1136.0), (1190.0, 1206.0), (1260.0, 1276.0)]
+    assert diversify([a, b, c], deaths) == [a, c, b]
+    assert diversify([a, b, c]) == [a, b, c]  # 270 s apart and no deaths between: distinct
+
+
+# --- a death screen inside a clip -----------------------------------------------------------------
+
+
+def _two_attempts():
+    """Attempt one (10-29 s), a 10 s death screen (30-40), attempt two (41-60)."""
+    words = [*sentence(10, "Okay here we go again."), *sentence(14, "Run run run run!")]
+    words += [*sentence(20, "He is right behind me now."), *sentence(26, "Oh no no no!")]
+    words += [*sentence(41, "Alright second try now."), *sentence(46, "Left then right.")]
+    words += [*sentence(52, "I made it out of there."), *sentence(57, "Never again.")]
+    return words
+
+
+def test_a_death_screen_inside_a_clip_keeps_the_side_holding_the_payoff(caplog):
+    from hookline.pipeline.boundaries import keep_payoff_side
+
+    words = _two_attempts()
+    p = pick(10.0, 58.0, first_words="Okay here we go again.", declared_first_words="x")
+    with caplog.at_level(logging.INFO):
+        out = keep_payoff_side(p, words, sig(screen=[(30, 40)]))
+    assert out.start == pytest.approx(41.0) and out.end == 58.0
+    assert out.first_words == "Alright second try now." and out.declared_first_words == ""
+    assert "death" in caplog.text
+    # the scares and the heat are on attempt one, and it ends on the death: that side
+    hot = sig(screen=[(30, 40)], scares=[22.0, 27.0, 28.5], loud=range(20, 30))
+    out = keep_payoff_side(p, words, hot)
+    assert (out.start, out.end) == (10.0, 30.0)
+    assert out.last_words == "Oh no no no!"
+
+
+def test_a_death_screen_with_no_viable_side_rejects_the_clip(caplog):
+    from hookline.pipeline.boundaries import keep_payoff_side
+
+    words = [*sentence(10, "Okay go."), *sentence(40, "Again.")]
+    with caplog.at_level(logging.WARNING):
+        assert keep_payoff_side(pick(10.0, 45.0), words, sig(screen=[(14, 38)])) is None
+    assert "rejected" in caplog.text
+
+
+def test_short_screens_and_screens_at_the_edges_leave_the_clip_alone():
+    from hookline.pipeline.boundaries import keep_payoff_side
+
+    words = _two_attempts()
+    p = pick(10.0, 58.0)
+    assert keep_payoff_side(p, words, sig(screen=[(30, 34)])) is p  # 4 s: not a death
+    assert keep_payoff_side(p, words, sig(screen=[(55, 70)])) is p  # runs past the end
+
+
+def test_a_reaction_said_over_the_death_screen_stays_with_the_side_before():
+    from hookline.pipeline.boundaries import keep_payoff_side
+
+    words = [w for w in _two_attempts() if w.start < 30] + sentence(30.4, "Are you kidding me?")
+    words += sentence(41, "Alright.")
+    hot = sig(screen=[(30, 40)], scares=[22.0, 27.0, 29.6])
+    out = keep_payoff_side(pick(10.0, 42.0), words, hot)
+    assert out.start == 10.0 and out.end == pytest.approx(words[-2].end)
+
+
+def test_packaging_is_told_where_the_death_screens_are(fake_llm, settings):
+    from hookline.pipeline.package import PACKAGING_SYSTEM_PROMPT, package_clips
+
+    words = _two_attempts()
+    fake_llm.queue({"clips": []})
+    package_clips([pick(10.0, 58.0)], words, fake_llm, settings, screens=[(30.0, 40.0)])
+    prompt = fake_llm.calls[0]["prompt"]
+    clip = next(x for x in prompt.splitlines() if x.startswith("Clip:"))
+    assert "no!" in clip.split("[death screen]")[0].lower()
+    assert "Alright" in clip.split("[death screen]")[1]
+    assert "`[death screen]`" in PACKAGING_SYSTEM_PROMPT
+
+
+# --- spreading picks across a stream -------------------------------------------------------------
+
+
+def test_select_clips_demotes_picks_near_each_other(fake_llm, settings):
+    from hookline.pipeline.select import select_clips
+    from tests.conftest import _synthetic_transcript
+    from tests.test_select import raw  # 3 s sentence grid
+
+    tr = _synthetic_transcript(900.0)
+    s = settings.model_copy(update={"clips": 2})
+    a = raw(30, 60, total=60, category="gaming")
+    b = raw(120, 150, total=55, category="gaming")
+    c = raw(600, 630, total=40, category="gaming")
+    fake_llm.queue({"clips": [a, b, c]})
+    assert [round(p.start) for p in select_clips(tr, fake_llm, s)] == [30, 600]
+
+
+# --- punchline and catch endings -------------------------------------------------------------------
+
+
+def test_punchline_guard_measures_from_the_last_word_not_the_padded_end():
+    from hookline.pipeline.boundaries import extend_payoff
+
+    words = sentence(10, "You think the run button would make him run?")
+    last = words[-1].end
+    padded = last + 0.4
+    # the scare 1.8 s after the last word (1.4 s after the padded end): no extension
+    assert extend_payoff(pick(10, padded), words, sig(scares=[last + 1.8]), 60).end == padded
+    # within 1.5 s of the last word and nothing new said: extended to keep the catch
+    out = extend_payoff(pick(10, padded), words, sig(scares=[last + 1.2]), 60)
+    assert out.end >= last + 1.2 + 1.5 - 1e-6
+
+
+def test_punchline_never_extends_into_a_new_sentence():
+    from hookline.pipeline.boundaries import extend_payoff
+
+    words = sentence(10, "You think the run button would make him run?")
+    last = words[-1].end
+    more = [*words, *sentence(last + 1.0, "Who? Who? Dodge!")]
+    p = pick(10, last + 0.2)
+    assert extend_payoff(p, more, sig(scares=[last + 1.2]), 60) is p
+
+
+def test_a_closing_scare_keeps_its_catch():
+    from hookline.pipeline.boundaries import extend_payoff
+
+    words = [*sentence(10, "We are running away now"), W(28.0, 30.0, "nooo")]  # a shout
+    # a death screen right after the catch, nobody reacting: 0.5 s of it
+    out = extend_payoff(pick(10, 30.0), words, sig(scares=[37.8], screen=[(38, 50)]), 60)
+    assert out.end == pytest.approx(38.3)
+    # the streamer reacts over the death screen: the cam shows it, >= 1.5 s kept
+    react = [*words, W(38.0, 38.9, "Nooo!")]
+    out = extend_payoff(pick(10, 30.0), react, sig(scares=[37.8], screen=[(38, 50)]), 60)
+    assert out.end >= 37.8 + 1.5 - 1e-6
+    # never a 0.3 s sliver of the catch: when 1.5 s after it does not fit, no extension
+    dense = [W(10 + i * 0.5, 10 + i * 0.5 + 0.4, "w") for i in range(40)]  # to 29.9 s
+    base = pick(10, 30.0)
+    assert extend_payoff(base, dense, sig(scares=[32.0]), max_s=22.6) is base
+    assert extend_payoff(base, dense, sig(scares=[32.0]), max_s=24.0).end >= 33.5 - 1e-6
+
+
+def test_a_voiced_closing_reaction_over_a_death_screen_is_not_cut():
+    from hookline.pipeline.boundaries import static_gaps
+
+    words = [*sentence(10, "We are running away now"), W(38.0, 38.9, "Nooo!")]
+    s = sig(scares=[37.8], screen=[(38, 50)])
+    assert static_gaps(pick(10, 39.6), words, s) == []
+    # an interior screen is still cut
+    assert static_gaps(pick(10, 60), [*words, *sentence(52, "Okay again.")], s)
+
+
+# --- opener re-check after a start move ----------------------------------------------------------
+
+
+def test_a_start_moved_onto_a_reply_moves_to_the_next_good_opener(caplog):
+    from hookline.pipeline.boundaries import fit_to_signals
+
+    s = sig(screen=[(53, 69)])
+    words = [*sentence(67.6, "Game plan! Game plan!"), *sentence(69.5, "No, game time!")]
+    words += [*sentence(70.6, "Game time!"), *sentence(80, "I do not want a hug!")]
+    words += [*sentence(92, "He is right there.")]
+    with caplog.at_level(logging.INFO):
+        p = fit_to_signals(pick(67.6, 94.0), words, s, max_s=50.0)
+    assert p.start == pytest.approx(70.6) and p.first_words == "Game time!"
+    assert "reply" in caplog.text
+
+
+def test_a_reply_opener_moves_back_to_its_question_within_3s():
+    from hookline.pipeline.boundaries import recheck_opener
+
+    words = [*sentence(20, "Did you call her?"), *sentence(21.6, "No, I never did.")]
+    words += [*sentence(24, "She called me first."), *sentence(40, "That was it.")]
+    p = recheck_opener(pick(21.6, 41.0, first_words="No, I never did."), words, sig())
+    assert p.start == pytest.approx(20.0)
+    assert p.first_words.startswith("Did you call her?")
+    # a clean opener is left alone
+    clean = pick(24.0, 41.0)
+    assert recheck_opener(clean, words, sig()) is clean
+
+
+def test_reply_openers_are_weak_at_selection():
+    from hookline.pipeline.select import _bad_opener
+    from tests.test_select import _seq
+
+    assert _bad_opener(_seq("No, game time!"))
+    assert _bad_opener(_seq("Nope, not this one."))
+    assert not _bad_opener(_seq("No one saw it coming."))
+
+
+# --- reaction openers back onto their cause sound -----------------------------------------------
+
+
+def test_a_reaction_opener_backs_off_to_the_previous_audio_onset(caplog):
+    from hookline.pipeline.boundaries import include_cause_sound
+
+    words = [*sentence(10, "Okay let me look around."), *sentence(17.1, "Hey.")]
+    words += [*sentence(19.1, "The fuck was that?"), *sentence(22, "I hate this place.")]
+    p = pick(19.1, 45.0, first_words="The fuck was that?", declared_first_words="The fuck")
+    with caplog.at_level(logging.INFO):
+        out = include_cause_sound(p, words, sig(onsets=[16.9]))
+    assert out.start == pytest.approx(16.8)
+    assert out.first_words == "Hey. The fuck was that?"
+    assert "cause sound" in caplog.text
+    # a sound with no words after it: the clip starts just before it
+    out = include_cause_sound(p, words[:5] + words[6:], sig(onsets=[17.5]))
+    assert out.start == pytest.approx(17.4) and out.first_words == "The fuck was that?"
+
+
+def test_a_reaction_opener_without_a_nearby_onset_or_with_a_scare_is_left():
+    from hookline.pipeline.boundaries import include_cause_sound
+
+    words = [*sentence(10, "Okay let me look around."), *sentence(19.1, "What the hell?")]
+    p = pick(19.1, 45.0)
+    assert include_cause_sound(p, words, sig(onsets=[14.0])) is p  # over 4 s before
+    assert include_cause_sound(p, words, sig(scares=[17.0])) is p  # include_cause's job
+    calm = pick(10.0, 45.0)
+    assert include_cause_sound(calm, words, sig(onsets=[8.0])) is calm  # not a reaction
+
+
+# --- cold opens, drop lines, hook caps ---------------------------------------------------------------
+
+
+def test_cold_open_dropped_when_its_line_recurs_in_the_body_within_10s(fake_llm, settings, caplog):
+    from tests.test_select import _FILLER, _guard_item, _one
+
+    line = "I really do not want a hug!"
+    tr, item = _guard_item({15: line, 16: line}, _FILLER.format(n=10), cold_open_words=line)
+    (p,) = _one(tr, fake_llm, settings, item, caplog)
+    assert p.cold_open is None and "recurs" in caplog.text
+
+
+def test_surprising_fact_with_comment_risk_caps_the_hook_at_15(fake_llm, settings):
+    from tests.test_select import _FILLER, _guard_item, _one
+
+    for risk, hook in (("medium", 15), ("high", 15), ("low", 22)):
+        tr, item = _guard_item({}, _FILLER.format(n=10), hook_type="surprising_fact")
+        item.update(comment_risk=risk)
+        item["scores"]["hook"] = 22
+        (p,) = _one(tr, fake_llm, settings, item)
+        assert p.scores.hook == hook, risk
+
+
+def test_ignored_drop_lines_are_recorded_with_the_reason(fake_llm, settings):
+    from tests.test_select import _FILLER, _guard_item, _one
+
+    tr, item = _guard_item({}, _FILLER.format(n=10), drop_lines=[10, 25])
+    (p,) = _one(tr, fake_llm, settings, item)
+    assert any("L10" in n and "not inside" in n for n in p.ignored_drops)
+
+
+def test_a_yes_word_does_not_answer_a_wh_question(fake_llm, settings):
+    from tests.test_select import _FILLER, _guard_item, _one
+
+    over = {13: "What is the time?", 14: "Yeah, that is not scary at all."}
+    tr, item = _guard_item(over, _FILLER.format(n=10), drop_lines=[13])
+    (p,) = _one(tr, fake_llm, settings, item)
+    assert len(p.drops) == 1 and p.ignored_drops == []
+
+
+# --- hooks and packaging specifics ---------------------------------------------------------------
+
+
+def _pkg_words():
+    words = sentence(0.0, "I think Grimbo is behind the vent.", step=0.5)
+    words += sentence(10.0, "Okay we go left at the big door.", step=0.5)
+    words += sentence(20.0, "He grabbed me right at the end.", step=0.5)
+    words += sentence(40.0, "Grimbo is back and he is fast.", step=0.5)
+    words += sentence(50.0, "Run to the lift right now.", step=0.5)
+    return words
+
+
+def _answer(n, **kw):
+    item = {
+        "clip": n,
+        "hook_text": "One door left to reach",
+        "alt_hook_text": "",
+        "title": "Left at the big door",
+        "post_caption": "He went left at the door. Right call or panic?",
+        "hashtags": ["horrorgame", "grimbo", "jumpscare"],
+        "search_title": "Grimbo Chase Left at the Big Door",
+        "verdict": "post",
+        "caption_fixes": [],
+    }
+    item.update(kw)
+    return item
+
+
+def _pkg(fake_llm, settings, answers, picks=None):
+    from hookline.pipeline.package import package_clips
+
+    picks = picks or [
+        pick(10.0, 25.0, hook_text="Grabbed at the last door", verdict="post"),
+        pick(40.0, 54.0, hook_text="He is back and faster", verdict="post"),
+    ]
+    fake_llm.queue({"clips": answers})
+    return package_clips(picks, _pkg_words(), fake_llm, settings)
+
+
+def test_a_name_is_used_in_at_most_one_hook_per_batch(fake_llm, settings):
+    a = _answer(1, hook_text="Grimbo waits behind the door")
+    b = _answer(2, hook_text="Grimbo closes in fast", alt_hook_text="Forty metres to the lift")
+    one, two = _pkg(fake_llm, settings, [a, b])
+    assert one.hook_text == "Grimbo waits behind the door"
+    assert two.hook_text == "Forty metres to the lift"
+
+
+def test_an_entity_plus_label_hook_falls_back_to_the_selection_hook(fake_llm, settings):
+    a = _answer(1, hook_text="Grimbo's vent ad: the last line", alt_hook_text="Grimbo: the door")
+    b = _answer(2, hook_text="Nobody makes it to the lift")
+    one, two = _pkg(fake_llm, settings, [a, b])
+    assert one.hook_text == "Grabbed at the last door"
+    assert two.hook_text == "Nobody makes it to the lift"
+
+
+def test_unsupported_specifics_in_packaging_fall_back(fake_llm, settings, caplog):
+    a = _answer(
+        1,
+        hook_text="The scariest door in 1998",
+        alt_hook_text="He goes left at the door",
+        title="First Grimbo escape ever",
+        search_title="First Grimbo Escape in the Vents, 1998",
+        post_caption="The worst door in the game. Left or right?",
+    )
+    with caplog.at_level(logging.WARNING):
+        one, _ = _pkg(fake_llm, settings, [a, _answer(2, hook_text="Nobody makes the lift")])
+    assert one.hook_text == "He goes left at the door"
+    assert one.title == "t" and one.search_title == "" and one.post_caption == ""
+    assert "unsupported" in caplog.text
+
+
+def test_supported_specifics_are_kept():
+    from hookline.pipeline.package import unsupported_specifics
+
+    source = [
+        "this",
+        "was",
+        "our",
+        "first",
+        "deployment",
+        "to",
+        "the",
+        "gulf",
+        "in",
+        "1991",
+        "the",
+        "worst",
+        "year",
+    ]
+    assert unsupported_specifics("Their first deployment, 1991", source) == []
+    assert unsupported_specifics("The worst year", source) == []
+    assert unsupported_specifics("First Gulf War deployment", source) == ["first"]
+    assert unsupported_specifics("An honest interest in the forest", source) == []
+
+
+def test_packaging_prompt_states_the_hook_and_specifics_rules():
+    from hookline.pipeline.package import PACKAGING_SYSTEM_PROMPT
+
+    for needle in ("generic label", "never lead two hooks", "ordinal"):
+        assert needle in PACKAGING_SYSTEM_PROMPT, needle
+
+
+# --- the first declared word is never clipped -------------------------------------------------------
+
+
+def test_render_start_covers_a_first_word_whose_onset_moved_earlier():
+    from hookline.pipeline.boundaries import cover_first_word
+
+    raw = [W(17.1, 17.25, "Hey."), W(19.08, 19.23, "The"), W(19.48, 19.63, "fuck")]
+    near = [W(17.1, 17.25, "Hey."), W(19.0, 19.48, "The"), W(19.48, 19.76, "fuck")]
+    p = pick(19.08, 30.0)
+    assert cover_first_word(p, raw, near).start == pytest.approx(19.0)
+    assert cover_first_word(pick(19.0, 30.0), raw, near).start == 19.0
+
+
+def test_q6_fails_when_the_first_word_is_clipped():
+    from hookline.quality import _check_opening
+
+    words = [W(0.1, 0.3, "fuck"), W(0.4, 0.6, "was"), W(0.7, 1.2, "that?")]
+    res = _check_opening(words, "The fuck was that?", None, actual_first_words="The fuck was that?")
+    assert not res.ok and "clipped" in res.detail
+    good = [W(0.0, 0.1, "The"), *words]
+    assert _check_opening(good, "The fuck was that?", None).ok
+
+
+def test_run_keeps_one_side_of_each_death_screen_before_packaging():
+    from hookline.pipeline.run import _one_side_of_deaths
+
+    words = _two_attempts()
+    keep = pick(10.0, 58.0)
+    gone = pick(10.0, 45.0)
+    logs: list[str] = []
+    s = sig(screen=[(14, 38)])  # wholly inside both; only the first has a viable side
+    out = _one_side_of_deaths([keep, gone], words, s, logs.append)
+    assert [(p.start, p.end) for p in out] == [(41.0, 58.0)]
+    assert any("dropped" in x for x in logs)
+    # never drops every pick
+    assert _one_side_of_deaths([gone], words, s, logs.append) == [gone]
+    noted = pick(10.0, 58.0, ignored_drops=["L48 ignored: it is a question"])
+    _one_side_of_deaths([noted], words, sig(), logs.append)
+    assert any("L48 ignored" in x for x in logs)

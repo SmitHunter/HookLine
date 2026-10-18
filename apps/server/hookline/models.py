@@ -122,6 +122,8 @@ class ClipPick(BaseModel):
     caption_fixes: list[CaptionFix] = []
     # Where the opener guard moved the start (None when it did not).
     opener_moved: OpenerMove | None = None
+    # Claude's drop_lines that were not cut, each with the reason ("L48 ... ignored: ...").
+    ignored_drops: list[str] = []
 
     @property
     def duration(self) -> float:

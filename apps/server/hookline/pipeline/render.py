@@ -59,7 +59,7 @@ from hookline.media.reframe import (
 )
 from hookline.media.subtitles import fonts_dir, subtitles_filter
 from hookline.models import ClipPick, Word
-from hookline.pipeline.boundaries import refine_boundaries
+from hookline.pipeline.boundaries import cover_first_word, refine_boundaries
 from hookline.pipeline.deadair import cut_gaps, keep_ranges, remap_words, snap_ranges
 from hookline.pipeline.layout import (
     SCARE_POST_S,
@@ -662,6 +662,8 @@ def render_clip(
         )  # fmt: skip
     else:
         near = snap_onsets(refine_word_ends(raw, env, voice_db), env, voice_db)
+    # an onset snapped before the start keeps its word (never clip the first word)
+    pick = cover_first_word(pick, raw, near)
     refined = refine_boundaries(pick, near, silences, loud_seconds=loud_seconds)
     fps = probe_fps(src)
     unrolled = _first_start(refined)
