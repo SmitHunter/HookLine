@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Literal, Protocol
 
 import numpy as np
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from hookline.media.ffmpeg import FFmpegError, probe_duration, probe_size
 from hookline.vision.faces import Crop, Face, sample_frames
@@ -36,6 +36,7 @@ TRACK_EASE_S = 1.0  # ... beyond it, eases to the scene's median face x over thi
 HAIR_SHARE = 0.5  # head top ~ face box top - half a face height (hair)
 HEAD_QUANTILE = 0.1  # the head top budgeted for: this low quantile of the samples (highest)
 ZOOM_TOP = 1.2  # the highest zoom step level (a punch); see reframe.ZOOM_PUNCH
+FACE_CORE_TOP = 0.2  # top share of a face box (hairline/forehead) outside the face core
 SAMPLE_EVERY = 0.25  # face samples every 0.25 s (4 fps): the tracking edge guard needs them
 # Gaze lead room: a FACE_TRACK crop shifts up to LEAD of its width toward where the subject
 # looks (median landmark yaw over the scene): none under YAW_DEAD, the full lead from YAW_FULL.
@@ -57,6 +58,14 @@ class SceneLayout(BaseModel):
     # the crop centre (share of crop width, + right), for caption placement and the audit.
     shift_steps: list[tuple[float, float]] = []
     face_dx: float | None = None
+    # Fix wave F: per track keyframe the face's (top y, height, eye line y) normalized (eye
+    # None when unknown); the reframe snaps (output s, framing changes for Q7); the rendered
+    # face core per sample [output s, x0, top, x1, bottom, eye y] in output px (caption
+    # placement and Q4b); word gaps (output s) a snap prefers -- render-time only, not saved.
+    track_face: list[tuple[float, float, float | None]] = []
+    snaps: list[float] = []
+    face_px: list[list[float]] = []
+    gaps: list[tuple[float, float]] = Field(default=[], exclude=True)
     split_x: tuple[float, float] | None = None
     face_box: tuple[float, float] | None = None  # median face (y, h), normalized; captions
     face_w: float | None = None  # median face width (FACE_TRACK), normalized to source width
@@ -200,8 +209,9 @@ def classify_scene(
             start=start,
             end=end,
             kind="FACE_TRACK",
-            track_x=[(t, x) for t, x, _ in track],
-            track_w=[w for _, _, w in track],
+            track_x=[(t, x) for t, x, *_ in track],
+            track_w=[w for _, _, w, *_ in track],
+            track_face=[(y, h, eye) for *_, y, h, eye in track],
             lead=gaze_lead([f.yaw for _, f in largest]),
             face_box=_median_box([(f.y, f.h) for _, f in largest]),
             face_w=statistics.median(f.w for _, f in largest),
@@ -233,24 +243,28 @@ def gaze_lead(yaws: list[float | None]) -> float:
     return math.copysign(LEAD * ramp, yaw) if ramp else 0.0
 
 
-def _track_keyframes(kept: list[tuple[float, list[Face]]]) -> list[tuple[float, float, float]]:
-    """(t, centre x, width) of the largest face per sample. A sample with no face (none passed
-    MIN_SCORE) HOLDS the last good x (and width) rather than following whatever else is in
-    frame; after TRACK_HOLD_S without a face it eases to the scene's median face x over
-    TRACK_EASE_S. Samples before the first face add nothing (the first x holds back to the
-    scene start), so the track only interpolates between valid samples and hold points."""
+Keyframe = tuple[float, float, float, float, float, float | None]  # t, x, w, y, h, eye y
+
+
+def _track_keyframes(kept: list[tuple[float, list[Face]]]) -> list[Keyframe]:
+    """(t, centre x, width, top y, height, eye line y) of the largest face per sample. A
+    sample with no face (none passed MIN_SCORE) HOLDS the last good face rather than following
+    whatever else is in frame; after TRACK_HOLD_S without a face its x eases to the scene's
+    median face x over TRACK_EASE_S. Samples before the first face add nothing (the first x
+    holds back to the scene start), so the track only interpolates between valid samples and
+    hold points."""
     xs = [max(faces, key=lambda f: f.w * f.h).cx for _, faces in kept if faces]
     median = statistics.median(xs) if xs else 0.5
-    out: list[tuple[float, float, float]] = []
-    last: tuple[float, float, float] | None = None
+    out: list[Keyframe] = []
+    last: Keyframe | None = None
     for t, faces in sorted(kept, key=lambda s: s[0]):
         if faces:
             face = max(faces, key=lambda f: f.w * f.h)
-            last = (t, face.cx, face.w)
+            last = (t, face.cx, face.w, face.y, face.h, face.eye_y)
             out.append(last)
         elif last is not None:
             ease = min(max((t - last[0] - TRACK_HOLD_S) / TRACK_EASE_S, 0.0), 1.0)
-            out.append((t, last[1] + (median - last[1]) * ease, last[2]))
+            out.append((t, last[1] + (median - last[1]) * ease, *last[2:]))
     return out
 
 

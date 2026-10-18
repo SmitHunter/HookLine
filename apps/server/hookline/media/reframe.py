@@ -7,11 +7,12 @@ from collections import Counter
 from collections.abc import Callable, Sequence
 from itertools import pairwise
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
 
 from hookline.media.ffmpeg import FFmpegError, _run, probe_duration, probe_size
-from hookline.pipeline.layout import ZOOM_TOP, SceneLayout
+from hookline.pipeline.layout import FACE_CORE_TOP, ZOOM_TOP, SceneLayout
 from hookline.vision.faces import sample_frames
 
 log = logging.getLogger(__name__)
@@ -32,10 +33,25 @@ GUARD_JITTER = 0.02  # a guarded face leaves this much (source width) each side 
 GUARD_PASSES = 5  # guard_zoom iterates to a fixed point in at most this many passes
 BEAT_SLIDE = 1.5  # a beat's crop pulse may start up to this much later where it fits ...
 SAMPLE_STEP = 0.25  # ... tried at this spacing (the face sampling interval)
+MAX_CADENCE = 12  # stretches over ZOOM_MAX_GAP filled after the guard, at most this many
 MERGE_S = 0.1  # a crop pulse this close to a zoom step moves onto it: one framing change
 FIT_SLACK = 0.98  # plan_zoom's face-fit cap stays this far inside the guard's limit
 FACE_CORE = 0.8  # share of the face box width kept inside the crop for unguarded close-ups
 KEYFRAME_TOL = 0.5  # px: track keyframes this close to the line through their neighbours go
+# Reframe snaps (fix wave F): the rendered crop never pans faster than MAX_PAN_PX source px/s
+# at a PAN_REF_W-wide source (scaled with the width). A move that needs more becomes an
+# instant reframe (a framing cut) at the moment the face would leave the margin, moved back
+# to a word gap within SNAP_GAP_S when the new framing already fits there; it frames the face
+# for up to SNAP_LOOKAHEAD s ahead. SNAP_EPS is the expression's one-step ramp.
+MAX_PAN_PX = 150.0
+PAN_REF_W = 1920
+MAX_PAN = MAX_PAN_PX / PAN_REF_W  # share of the source width per second
+SNAP_GAP_S = 0.3
+SNAP_LOOKAHEAD = 1.0
+SNAP_EPS = 0.001
+SNAP_SETTLED = 0.01  # a face moving less than this over the lookahead has settled (centred)
+RESYNC = 0.25  # an off-plan crop rejoins the plan within this share of a sample's reach
+PAN_TOL = 2 * KEYFRAME_TOL / PAN_REF_W  # held / limited crops keep this inside the margin
 BLUR = "boxblur=20:2"
 MIN_SCENE = 1 / 30
 
@@ -370,10 +386,21 @@ def _contain(c: float, lo: float, hi: float, room: float) -> float:
 
 
 ZoomAt = float | Callable[[float], float]
+OffsetAt = Callable[[float], float] | None  # extra rendered crop offset (share of src width)
+Gaps = Sequence[tuple[float, float]]
 
 
 def _zoom_fn(zoom: ZoomAt) -> Callable[[float], float]:
     return zoom if callable(zoom) else (lambda _t: float(zoom))
+
+
+class _Track(NamedTuple):
+    """`_track_plan`'s result: per sample (t, plan centre) and guard flag, and the reframe
+    snaps as (scene time, index of the first sample after it)."""
+
+    points: list[tuple[float, float]]
+    flags: list[bool]
+    snaps: list[tuple[float, int]]
 
 
 def _track_faces(
@@ -406,14 +433,36 @@ def _track_plan(
     widths: list[float] | None = None,
     lead: float = 0.0,
     zoom_top: ZoomAt = 1.0,
+    offset: OffsetAt = None,
+    gaps: Gaps = (),
 ) -> tuple[list[tuple[float, float]], list[bool]]:
-    """((t, crop centre), guard flag) per sample, normalized to the source width.
+    """((t, crop centre), guard flag) per sample: `_plan_track` without the snap list."""
+    plan = _plan_track(keyframes, in_w, crop_w, face_w, widths, lead, zoom_top, offset, gaps)
+    return plan.points, plan.flags
+
+
+def _plan_track(
+    keyframes: list[tuple[float, float]],
+    in_w: int,
+    crop_w: int,
+    face_w: float | None,
+    widths: list[float] | None = None,
+    lead: float = 0.0,
+    zoom_top: ZoomAt = 1.0,
+    offset: OffsetAt = None,
+    gaps: Gaps = (),
+) -> _Track:
+    """Per sample (t, crop centre) and guard flag, normalized to the source width, plus the
+    reframe snaps.
 
     The centre is an EMA (TRACK_ALPHA per TRACK_ALPHA_DT s) chasing a deadbanded target over
     the median-of-3 face position (`_track_faces`: single stray detections are ignored); the
     target jumps only when the face moves more than TRACK_DEADBAND. `zoom_top` is the rendered
     zoom at each sample (a constant, or a function of the keyframe time): the crop as seen at
-    that zoom is what the face must stay inside.
+    that zoom is what the face must stay inside. `offset` (a function of the keyframe time,
+    share of the source width) is a crop offset the renderer adds on top (a flat scene's step
+    shift): the guard and the frame bounds see the crop where it renders; the returned
+    centres exclude it.
 
     Edge guard: when the face box comes within GUARD_MARGIN of the visible crop's edge, the
     centre moves at once to hold that margin and the EMA restarts there; the sample is
@@ -421,36 +470,43 @@ def _track_plan(
     EMA keeps its deadband and the centre only moves as far as keeping the face core
     (FACE_CORE of its width) inside the visible crop. Then `lead` (signed share of the crop
     width: gaze lead room) shifts the centre, never past the guard margin, and the frame
-    bounds clamp it."""
+    bounds clamp it.
+
+    Finally the path is limited to MAX_PAN (`_limit_pans`): a faster move becomes a reframe
+    snap (preferring a word gap in `gaps`, keyframe time). The hard constraint holds on the
+    final path: at every sample the face (core) keeps the margin at least as well as on the
+    guarded centre."""
     ts, xs, ws = _track_faces(keyframes, face_w, widths)
     zoom = _zoom_fn(zoom_top)
     cw = crop_w / in_w
     lo_c, hi_c = (cw / 2, 1 - cw / 2) if cw < 1 else (0.5, 0.5)
-    out: list[tuple[float, float]] = []
+    out: list[float] = []
     flags: list[bool] = []
     target = smoothed = 0.0
+    offs = [offset(t) if offset else 0.0 for t in ts]
     for i, (t, x, w) in enumerate(zip(ts, xs, ws, strict=True)):
+        off = offs[i]
         if i == 0:
-            target = smoothed = x
+            target = smoothed = x - off
         else:
-            if abs(x - target) > TRACK_DEADBAND:
-                target = x
+            if abs(x - off - target) > TRACK_DEADBAND:
+                target = x - off
             alpha = 1 - (1 - TRACK_ALPHA) ** (max(t - ts[i - 1], 0.0) / TRACK_ALPHA_DT)
             smoothed += alpha * (target - smoothed)
         visible = cw / max(zoom(t), 1e-6)
         room = visible * (0.5 - GUARD_MARGIN)
         lo, hi = x - w / 2, x + w / 2
-        c = min(max(smoothed, lo_c), hi_c)
+        c = min(max(smoothed + off, lo_c), hi_c)  # where the crop renders
         guard = _guardable(w, room)
         if guard:
             guard = lo < c - room - 1e-9 or hi > c + room + 1e-9
             if guard:
-                smoothed, target = _contain(c, lo, hi, room), x
+                smoothed, target = _contain(c, lo, hi, room) - off, x - off
         else:  # a tight close-up: only the face core is kept inside the visible crop
             lo, hi = x - w * FACE_CORE / 2, x + w * FACE_CORE / 2
             room = visible / 2
-            smoothed = _contain(c, lo, hi, room)
-        c = min(max(smoothed, lo_c), hi_c)
+            smoothed = _contain(c, lo, hi, room) - off
+        c = min(max(smoothed + off, lo_c), hi_c)
         if lead and hi - lo <= 2 * room:
             # toward the gaze, never backwards, leaving GUARD_JITTER before a guarded margin
             slack = GUARD_JITTER if _guardable(w, visible * (0.5 - GUARD_MARGIN)) else 0.0
@@ -460,9 +516,183 @@ def _track_plan(
             else:
                 shift = max(shift, min(hi - room + slack - c, 0.0))
             c = min(max(c + shift, lo_c), hi_c)
-        out.append((t, c))
+        out.append(c)
         flags.append(guard)
-    return out, flags
+    rooms = [_room(w, cw / max(zoom(t), 1e-6)) for t, w in zip(ts, ws, strict=True)]
+    path, snaps = _limit_pans(ts, out, xs, rooms, gaps, (lo_c, hi_c))
+    points = [(t, c - off) for t, c, off in zip(ts, path, offs, strict=True)]
+    return _Track(points, flags, snaps)
+
+
+def _room(w: float, visible: float) -> tuple[float, float, float]:
+    """(face width the guard keeps in the margin, half-room, face core width) at a sample: a
+    guardable face and the guard margin (its core: FACE_CORE of it), else a close-up's face
+    core inside the whole visible crop (both widths the core)."""
+    room = visible * (0.5 - GUARD_MARGIN)
+    if _guardable(w, room):
+        return w, room, w * FACE_CORE
+    return w * FACE_CORE, visible / 2, w * FACE_CORE
+
+
+def _over(c: float, x: float, w: float, room: float) -> float:
+    """How far (share of the source width) the face [x - w/2, x + w/2] pokes out of
+    [c - room, c + room]; 0 when inside."""
+    return max(0.0, (c - room) - (x - w / 2), (x + w / 2) - (c + room))
+
+
+class _PanFit:
+    """The face (filtered centres; (width, half-room, core width) per sample) against the
+    guarded plan, at fractional sample indices (linear between samples)."""
+
+    def __init__(
+        self,
+        ts: list[float],
+        plan: list[float],
+        xs: list[float],
+        rooms: list[tuple[float, float, float]],
+        frame: tuple[float, float] = (-math.inf, math.inf),
+    ):
+        self.ts, self.plan, self.xs, self.rooms, self.frame = ts, plan, xs, rooms, frame
+
+    def at(self, i: float, core: bool = False) -> tuple[float, float, float, float]:
+        """(face x, width -- the core's with `core` --, half-room, plan centre) at
+        fractional sample index `i`."""
+        k = min(max(math.floor(i), 0), len(self.xs) - 1)
+        u = i - k
+        n = 2 if core else 0
+        r0, x0, p0 = self.rooms[k], self.xs[k], self.plan[k]
+        if u <= 1e-9 or k + 1 >= len(self.xs):
+            return x0, r0[n], r0[1], p0
+        r1, x1, p1 = self.rooms[k + 1], self.xs[k + 1], self.plan[k + 1]
+
+        def mix(a: float, b: float) -> float:
+            return a + (b - a) * u
+
+        return mix(x0, x1), mix(r0[n], r1[n]), mix(r0[1], r1[1]), mix(p0, p1)
+
+    def fits(self, c: float, i: float, core: bool = False) -> bool:
+        """Whether centre `c` keeps the face (its core: the hard constraint) inside the
+        margin at index `i`, never worse than the plan does (where the plan pokes out -- a
+        face against the frame edge -- that much is allowed) and inside the frame. Off the
+        plan, PAN_TOL to spare: the drawn path may round by that."""
+        x, w, room, ref = self.at(i, core)
+        lo, hi = self.frame
+        if not lo - 1e-9 <= c <= hi + 1e-9:
+            return False
+        return _over(c, x, w, room - PAN_TOL) <= _over(ref, x, w, room) + 1e-9
+
+    def index(self, t: float) -> float:
+        """Fractional sample index of time `t` (clamped to the samples)."""
+        ts = self.ts
+        if t <= ts[0]:
+            return 0.0
+        for k in range(len(ts) - 1):
+            if ts[k] <= t <= ts[k + 1]:
+                span = ts[k + 1] - ts[k]
+                return k + ((t - ts[k]) / span if span > 0 else 0.0)
+        return float(len(ts) - 1)
+
+
+def _limit_pans(
+    ts: list[float],
+    plan: list[float],
+    xs: list[float],
+    rooms: list[tuple[float, float, float]],
+    gaps: Gaps = (),
+    frame: tuple[float, float] = (-math.inf, math.inf),
+) -> tuple[list[float], list[tuple[float, int]]]:
+    """The rendered crop centres (`plan`: the guarded, clamped centres) limited to MAX_PAN
+    between samples, and the snaps. On the plan, a sample within reach is followed (off it,
+    after a hold or snap, the crop rejoins once the plan comes within RESYNC of a reach).
+    Else, in order: hold where the whole face keeps the margin, pan at MAX_PAN where it does,
+    pan or hold where its core does (the hard constraint), else snap (`_snap_target`,
+    `_snap_time`)."""
+    if not plan:
+        return [], []
+    fit = _PanFit(ts, plan, xs, rooms, frame)
+    path = [plan[0]]
+    snaps: list[tuple[float, int]] = []
+    on_plan = True  # the last sample showed the plan
+    for i in range(1, len(plan)):
+        prev = path[-1]
+        reach = MAX_PAN * max(ts[i] - ts[i - 1], 0.0) + 1e-9
+        if abs(plan[i] - prev) <= (reach if on_plan else RESYNC * reach):
+            path.append(plan[i])
+            on_plan = True
+            continue
+        on_plan = False
+        pan = prev + min(max(plan[i] - prev, -reach), reach)
+        options = [(prev, False), (pan, False), (pan, True), (prev, True)]
+        kept = next((c for c, core in options if fit.fits(c, i, core)), None)
+        if kept is not None:
+            path.append(kept)
+            continue
+        target = _snap_target(i, fit)
+        floor = snaps[-1][0] if snaps else -math.inf
+        when, first = _snap_time(i, fit, prev, target, gaps, floor)
+        if snaps and first <= snaps[-1][1]:  # never moved back over the previous snap
+            when, first = _snap_time(i, fit, prev, target, (), floor)
+        path.append(target)
+        for k in range(first, i):
+            path[k] = target
+        snaps.append((round(when, 3), first))
+    return path, snaps
+
+
+def _snap_target(i: int, fit: _PanFit) -> float:
+    """Where a snap at sample `i` lands: inside the frame and the centres that keep the face
+    core in the margin from sample i on, for up to SNAP_LOOKAHEAD s (while one centre still
+    does for all of them): for a face still on the move, the side of that range that leaves
+    it room ahead; for a settled face, as near its mean position as allowed. The plan when no
+    centre holds even sample i."""
+    ts, plan = fit.ts, fit.plan
+    lo, hi = fit.frame
+    seen: list[float] = []
+    j = i
+    while j < len(ts) and ts[j] - ts[i] <= SNAP_LOOKAHEAD + 1e-9:
+        x, w, room, _ = fit.at(j, core=True)
+        a, b = x + w / 2 - room + PAN_TOL, x - w / 2 + room - PAN_TOL
+        if max(lo, a) > min(hi, b) + 1e-12:
+            break
+        lo, hi = max(lo, a), min(hi, b)
+        seen.append(x)
+        j += 1
+    if not seen:
+        return plan[i]
+    motion = seen[-1] - (seen[0] if len(seen) > 1 else fit.xs[i - 1])
+    if abs(motion) > SNAP_SETTLED:
+        target = hi if motion > 0 else lo
+    else:
+        target = min(max(sum(seen) / len(seen), lo), hi)
+    return target if fit.fits(target, i, core=True) else plan[i]
+
+
+def _snap_time(
+    i: int, fit: _PanFit, prev: float, target: float, gaps: Gaps, floor: float = -math.inf
+) -> tuple[float, int]:
+    """(snap time, index of the first sample showing `target`) for a snap that must have
+    happened by sample `i`: about the moment the held crop `prev` stops holding the face core
+    (linear between samples, after sample i - 1; no earlier than `target` holds it), moved
+    back to the latest point of a word gap within SNAP_GAP_S before it (never within MERGE_S
+    of the previous snap, `floor`) when `target` holds the core from there on (samples it
+    passes take `target`)."""
+    ts = fit.ts
+    t0, t1 = ts[i - 1], ts[i]
+    grid = [t0 + (t1 - t0) * k / 20 for k in range(1, 21)]  # after the last shown sample
+    when = next((t for t in grid if not fit.fits(prev, fit.index(t), core=True)), t1)
+    when = next((t for t in grid if t >= when and fit.fits(target, fit.index(t), True)), t1)
+    best = None
+    for a, b in gaps:
+        g = min(b, when)
+        if g < a - 1e-9 or g < max(when - SNAP_GAP_S, floor + MERGE_S) - 1e-9 or g >= when - 1e-9:
+            continue
+        span = [g, *(t for t in ts if g < t <= t1)]
+        if all(fit.fits(target, fit.index(u), core=True) for u in span):
+            best = g if best is None else max(best, g)
+    if best is not None:
+        when = best
+    first = next(k for k in range(len(ts)) if ts[k] >= when - 1e-9)
+    return when, min(first, i)
 
 
 def _drop_collinear(pts: list[tuple[float, float]], tol: float) -> list[tuple[float, float]]:
@@ -526,14 +756,18 @@ def track_x_expr(
     widths: list[float] | None = None,
     lead: float = 0.0,
     zoom_top: ZoomAt = 1.0,
+    offset: OffsetAt = None,
+    gaps: Gaps = (),
 ) -> str:
     """ffmpeg expression (in `t`) for the crop's left edge: piecewise-linear over the smoothed,
-    edge-guarded, lead-shifted and clamped keyframes (normalized centre x; `_track_plan`),
-    keyframes on a straight line dropped. `widths` are the faces' per-keyframe widths
-    (normalized; else `face_w`, else 0); `zoom_top` is the rendered zoom (a constant, or a
-    function of the keyframe time: `zoom_at_fn`); the guard keeps the face inside the crop as
-    seen there. Commas are NOT escaped."""
-    pts = _track_lefts(keyframes, in_w, crop_w, face_w, widths, lead, zoom_top)
+    edge-guarded, lead-shifted, pan-limited and clamped keyframes (normalized centre x;
+    `_plan_track`), each reframe snap a one-step jump, keyframes on a straight line dropped.
+    `widths` are the faces' per-keyframe widths (normalized; else `face_w`, else 0);
+    `zoom_top` is the rendered zoom (a constant, or a function of the keyframe time:
+    `zoom_at_fn`); the guard keeps the face inside the crop as seen there. With `offset` (the
+    renderer adds it, then clamps) the edge is left unclamped. `gaps`: word gaps (keyframe
+    time) a snap prefers. Commas are NOT escaped."""
+    pts = _track_lefts(keyframes, in_w, crop_w, face_w, widths, lead, zoom_top, offset, gaps)
     if not pts:
         return _fmt(max(in_w - crop_w, 0) / 2)
     return _pwl_expr(_drop_collinear(pts, KEYFRAME_TOL))
@@ -547,11 +781,12 @@ def track_guard_spans(
     widths: list[float] | None = None,
     lead: float = 0.0,
     zoom_top: ZoomAt = 1.0,
+    offset: OffsetAt = None,
 ) -> list[tuple[float, float]]:
     """When the edge guard acts (keyframe time base), to hold the zoom at its base: each run
     of guarded samples, from ZOOM_EASE s before its first (the zoom is at base by then) to one
     sample spacing after its last; spans closer than GUARD_MERGE_S merge."""
-    plan, flags = _track_plan(keyframes, in_w, crop_w, face_w, widths, lead, zoom_top)
+    plan, flags = _track_plan(keyframes, in_w, crop_w, face_w, widths, lead, zoom_top, offset)
     ts = [t for t, _ in plan]
     spans: list[tuple[float, float]] = []
     for i, flag in enumerate(flags):
@@ -564,6 +799,69 @@ def track_guard_spans(
         else:
             spans.append((a, b))
     return [(round(a, 3), round(b, 3)) for a, b in spans]
+
+
+def track_snaps(
+    keyframes: list[tuple[float, float]],
+    in_w: int,
+    crop_w: int,
+    face_w: float | None = None,
+    widths: list[float] | None = None,
+    lead: float = 0.0,
+    zoom_top: ZoomAt = 1.0,
+    offset: OffsetAt = None,
+    gaps: Gaps = (),
+) -> list[float]:
+    """Times (keyframe time base) of the track's reframe snaps (`_limit_pans`)."""
+    plan = _plan_track(keyframes, in_w, crop_w, face_w, widths, lead, zoom_top, offset, gaps)
+    return [t for t, _ in plan.snaps]
+
+
+def _step_offset(
+    layout: SceneLayout, steps: Sequence[Sequence[float]] | None, in_w: int, in_h: int
+) -> OffsetAt:
+    """A flat FACE_TRACK scene's step shift as rendered (`_shifted`): `step_shift` of the crop
+    width (as a share of the source width) after every other zoom step, as a function of
+    scene time; None when the scene has none."""
+    if not layout.step_shift or not steps:
+        return None
+    shift = layout.step_shift * _track_w(in_w, in_h) / in_w
+    times = sorted(float(st[0]) for st in steps)
+
+    def at(t: float) -> float:
+        n = sum(1 for a in times if a <= t + layout.start + 1e-9)
+        return shift if n and (n - 1) % 2 else 0.0
+
+    return at
+
+
+def _track_kw(
+    layout: SceneLayout, in_w: int, in_h: int, steps: Sequence[Sequence[float]] | None
+) -> dict:
+    """`_plan_track` arguments for a FACE_TRACK scene rendered under zoom `steps` (scene time
+    base): its keyframes, face widths, lead, the zoom it renders at, its step shift and the
+    word gaps inside it."""
+    return {
+        "keyframes": [(t - layout.start, x) for t, x in layout.track_x],
+        "in_w": in_w,
+        "crop_w": _track_w(in_w, in_h),
+        "face_w": layout.face_w,
+        "widths": layout.track_w or None,
+        "lead": layout.lead,
+        "zoom_top": zoom_at_fn(steps or [(0.0, 1.0)], layout),
+        "offset": _step_offset(layout, steps, in_w, in_h),
+        "gaps": [(a - layout.start, b - layout.start) for a, b in layout.gaps],
+    }
+
+
+def scene_snaps(
+    layout: SceneLayout, in_w: int, in_h: int, steps: Sequence[Sequence[float]]
+) -> list[float]:
+    """Output times of a FACE_TRACK scene's reframe snaps as rendered under `steps` (framing
+    changes: the sidecar records them for Q7); [] for other scenes."""
+    if _kind(layout) != "FACE_TRACK" or not layout.track_x:
+        return []
+    return [round(t + layout.start, 3) for t in track_snaps(**_track_kw(layout, in_w, in_h, steps))]
 
 
 def guarded_steps(
@@ -656,11 +954,11 @@ class _SceneFit:
         self.lay, self.in_w = lay, in_w
         self.zoom = zoom_at_fn(steps, lay)
         self.cw = _track_w(in_w, in_h)
-        rel = [(t - lay.start, x) for t, x in lay.track_x]
-        self.plan, _ = _track_plan(
-            rel, in_w, self.cw, lay.face_w, lay.track_w or None, lay.lead, self.zoom
-        )
-        self.ts, self.xs, self.ws = _track_faces(rel, lay.face_w, lay.track_w or None)
+        kw = _track_kw(lay, in_w, in_h, steps)
+        off = kw["offset"] or (lambda _t: 0.0)
+        # the rendered centres: the plan plus a flat scene's step shift
+        self.plan = [(t, c + off(t)) for t, c in _plan_track(**kw).points]
+        self.ts, self.xs, self.ws = _track_faces(kw["keyframes"], lay.face_w, kw["widths"])
         half = self.cw / in_w / 2
         self.frame = (half, 1 - half) if half < 0.5 else (0.5, 0.5)
 
@@ -702,18 +1000,41 @@ class _SceneFit:
 
 
 def _join_spans(
-    spans: list[tuple[float, float]], times: Sequence[float]
+    spans: list[tuple[float, float]],
+    times: Sequence[float],
+    rises: Sequence[tuple[float, float]] = (),
 ) -> list[tuple[float, float]]:
     """Spans sorted and merged where they overlap, each start pulled back to a step or cut
-    within CUT_QUIET before it (no zoom-in just before a hold)."""
+    within CUT_QUIET before it (no zoom-in just before a hold). `rises` are (beat punch time,
+    time the level before it rose above base): a span starting at most CUT_QUIET after such a
+    beat starts at that rise instead, so the beat never becomes a zoom-out."""
     out: list[tuple[float, float]] = []
-    for a, b in sorted(spans):
-        a = min([a, *(t for t in times if a - CUT_QUIET <= t < a)])
+    for a0, b in sorted(spans):
+        a = min([a0, *(t for t in times if a0 - CUT_QUIET <= t < a0)])
+        a = min([a, *(r for p, r in rises if a0 - CUT_QUIET - 1e-9 <= p <= a0 + 1e-9)])
         if out and a <= out[-1][1] + 1e-9:
             out[-1] = (out[-1][0], max(b, out[-1][1]))
         else:
             out.append((a, b))
     return [(round(a, 3), round(b, 3)) for a, b in out]
+
+
+def _beat_rises(
+    sched: list[tuple[float, float]], scene: tuple[float, float]
+) -> list[tuple[float, float]]:
+    """(punch time, time the level before it rose above base) for each beat punch in the
+    scene that a base hold starting at it would turn into a zoom-out (the scene start when the
+    level was already up there)."""
+    out = []
+    for i, (t, v) in enumerate(sched):
+        if v != ZOOM_PUNCH or not scene[0] < t < scene[1]:
+            continue
+        if not i or sched[i - 1][1] <= 1.0:
+            continue  # a punch from base: a hold there zooms nothing out
+        base = [j for j in range(i) if sched[j][1] <= 1.0]
+        rise = sched[base[-1] + 1][0] if base else sched[0][0]
+        out.append((t, max(rise, scene[0])))
+    return out
 
 
 def _inside(t: float, spans: Sequence[tuple[float, float]]) -> bool:
@@ -738,21 +1059,22 @@ def _guard_scene(
     sched: list[tuple[float, float]],
     cut_times: Sequence[float],
 ) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
-    """`guard_zoom` for one FACE_TRACK scene: (steps, its shift_steps)."""
-    cw = _track_w(in_w, in_h)
-    rel = [(t - lay.start, x) for t, x in lay.track_x]
-    kw = {"face_w": lay.face_w, "widths": lay.track_w or None, "lead": lay.lead}
+    """`guard_zoom` for one FACE_TRACK scene: (steps, its shift_steps). The guard sees the
+    crop where it renders: a flat scene's step shift included (`_step_offset`)."""
     cuts = sorted(c for c in cut_times if lay.start < c < lay.end)
     times = sorted({*(t for t, _ in sched if lay.start < t < lay.end), *cuts})
+    rises = _beat_rises(sched, (lay.start, lay.end))
+
+    def spans_at(steps: list[tuple[float, float]]) -> list[tuple[float, float]]:
+        kw = _track_kw(lay, in_w, in_h, steps)
+        del kw["gaps"]
+        return [(a + lay.start, b + lay.start) for a, b in track_guard_spans(**kw)]
+
     spans: list[tuple[float, float]] = []
     held = sched
     for _ in range(GUARD_PASSES):
-        found = [
-            (a + lay.start, min(b + lay.start, lay.end))
-            for a, b in track_guard_spans(rel, in_w, cw, zoom_top=zoom_at_fn(held, lay), **kw)
-            if a + lay.start < lay.end
-        ]
-        grown = _join_spans(spans + found, times)
+        found = [(a, min(b, lay.end)) for a, b in spans_at(held) if a < lay.end]
+        grown = _join_spans(spans + found, times, rises)
         if grown == spans:
             break
         spans = grown
@@ -764,14 +1086,9 @@ def _guard_scene(
         )  # fmt: skip
         spans = [(spans[0][0], lay.end)]
 
-    def spans_at(steps: list[tuple[float, float]]) -> list[tuple[float, float]]:
-        zoom = zoom_at_fn(steps, lay)
-        found = track_guard_spans(rel, in_w, cw, zoom_top=zoom, **kw)
-        return [(a + lay.start, b + lay.start) for a, b in found]
-
     return _hold_spans(
         sched, spans, cuts, lambda steps: _SceneFit(lay, in_w, in_h, steps),
-        (lay.start, lay.end), spans_at,
+        (lay.start, lay.end), spans_at, lay.gaps,
     )  # fmt: skip
 
 
@@ -782,6 +1099,7 @@ def _hold_spans(
     make_fit: Callable[[list[tuple[float, float]]], "_SceneFit"],
     scene: tuple[float, float],
     spans_at: Callable[[list[tuple[float, float]]], list[tuple[float, float]]] | None = None,
+    word_gaps: Sequence[tuple[float, float]] = (),
 ) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
     """The placement pass of `guard_zoom` for a scene (output times in `scene`):
     (steps, shift_steps). `make_fit` builds a `_SceneFit` for a schedule.
@@ -838,7 +1156,12 @@ def _hold_spans(
             break
         placed = [st for st in placed if st not in bad]
         levels = [st for st in levels if st not in bad]
-    held = _dedupe(levels)
+    if spans_at is not None:
+        levels = _punch_in(levels, sched, cuts, scene, spans_at)
+    beats = [t for t, v in sched if v == ZOOM_PUNCH and start < t < end]
+    held = _no_beat_zoom_out(_dedupe(levels), beats)
+    if spans_at is not None:
+        held = _fill_cadence(held, cuts, scene, spans_at, word_gaps, spans)
     fit = make_fit(held)
     pulses: list[tuple[float, float, float]] = []  # (start, end, sign)
     shifts: list[tuple[float, float]] = []
@@ -875,10 +1198,15 @@ def _hold_spans(
                     return True
         return False
 
+    def changes(t: float) -> bool:
+        return _level_at(held, t) != _level_at([st for st in held if st[0] < t - 1e-9], t)
+
     for a, b in spans:
         before = _level_at([st for st in held if st[0] < a - 1e-9], a)
         sign = fit.direction(a, b)
         for t in (t for t in times if a <= t < b and (t > a + 1e-9 or before == 1.0)):
+            if t > a + 1e-9 and changes(t):
+                continue  # a punch the guard allowed (`_punch_in`) is its framing change
             pulse(t, sign, free=False)
     for t in times:  # outside the holds, every cut and step keeps a framing change
         if _inside(t, spans) or any(a - 1e-9 <= t < b for a, b, _ in pulses):
@@ -890,7 +1218,177 @@ def _hold_spans(
         sign = fit.direction(t, t + CUT_QUIET)
         tries = [t + k * SAMPLE_STEP for k in range(int(slide / SAMPLE_STEP + 1e-9) + 1)]
         any(pulse(u, sign, free=True) for u in tries)  # a beat may slide later to fit
+    # the cadence: a stretch still over ZOOM_MAX_GAP without a framing change gets a pulse at
+    # a word gap in it (the level changes `_fill_cadence` could place are already in)
+    for _ in range(MAX_CADENCE):
+        marks = _marks(held, cuts, scene, [t for t, _ in shifts])
+        long = [(a, b) for a, b in pairwise(marks) if b - a > ZOOM_MAX_GAP + 1e-9]
+        if not any(
+            any(pulse(u, fit.direction(a, b), free=True) for u in _cadence_times(a, b, word_gaps))
+            for a, b in long
+        ):
+            break
     return held, sorted(shifts)
+
+
+def _marks(
+    steps: Sequence[tuple[float, float]],
+    cuts: Sequence[float],
+    scene: tuple[float, float],
+    extra: Sequence[float] = (),
+) -> list[float]:
+    """The scene's framing changes (as Q7 counts them): its bounds, cuts, zoom steps and
+    `extra` (crop shifts) inside it, sorted."""
+    a, b = scene
+    inside = [*cuts, *(t for t, _ in steps), *extra]
+    return sorted({a, b, *(t for t in inside if a < t < b)})
+
+
+def _cadence_times(a: float, b: float, word_gaps: Sequence[tuple[float, float]]) -> list[float]:
+    """Where to try a framing change splitting a stretch (a, b) that runs over ZOOM_MAX_GAP:
+    mid-points of the word gaps in it, at least CUT_QUIET from either end -- those leaving
+    both pieces within ZOOM_MAX_GAP first, longer pauses first, then nearest the middle --
+    then even times around the middle."""
+    lo, hi, mid = a + CUT_QUIET, b - CUT_QUIET, (a + b) / 2
+
+    def splits(t: float) -> bool:
+        return t - a <= ZOOM_MAX_GAP + 1e-9 and b - t <= ZOOM_MAX_GAP + 1e-9
+
+    pauses = [(gb - ga, round((ga + gb) / 2, 3)) for ga, gb in word_gaps]
+    pauses = [(n, t) for n, t in pauses if lo <= t <= hi]
+    pauses.sort(key=lambda p: (not splits(p[1]), -round(p[0], 2), abs(p[1] - mid)))
+    even = [round(mid + k * SAMPLE_STEP * s, 3) for k in range(7) for s in (1, -1)]
+    seen: list[float] = []
+    for t in [t for _, t in pauses] + [t for t in even if lo <= t <= hi]:
+        if t not in seen:
+            seen.append(t)
+    return seen
+
+
+def _violations(
+    steps: list[tuple[float, float]],
+    spans_at: Callable[[list[tuple[float, float]]], list[tuple[float, float]]],
+) -> set[tuple[float, float]]:
+    """Guard spans (`spans_at` under `steps`) inside which a level above base is in effect."""
+    bad = set()
+    for a, b in spans_at(steps):
+        if _level_at(steps, a) != 1.0 or any(v != 1.0 for u, v in steps if a < u < b):
+            bad.add((a, b))
+    return bad
+
+
+def _fill_cadence(
+    steps: list[tuple[float, float]],
+    cuts: Sequence[float],
+    scene: tuple[float, float],
+    spans_at: Callable[[list[tuple[float, float]]], list[tuple[float, float]]],
+    word_gaps: Sequence[tuple[float, float]] = (),
+    holds: Sequence[tuple[float, float]] = (),
+) -> list[tuple[float, float]]:
+    """`steps` (deduplicated) with a level change in every stretch of the scene longer than
+    ZOOM_MAX_GAP without a framing change, outside the guard's `holds` (there a pulse does
+    it), at a word gap (`_cadence_times`): the other level
+    from there on, else a ZOOM_IN for CUT_QUIET * 2 s back to it, kept only where the guard
+    fires nowhere a level above base is in effect that it did not before."""
+    out = list(steps)
+    end = scene[1]
+    for _ in range(MAX_CADENCE):
+        long = [(a, b) for a, b in pairwise(_marks(out, cuts, scene)) if b - a > ZOOM_MAX_GAP]
+        current = _violations(out, spans_at) if long else set()
+        placed = False
+        for a, b in long:
+            for t in _cadence_times(a, b, word_gaps):
+                if _inside(t, holds):
+                    continue
+                before = _level_at([st for st in out if st[0] < t - 1e-9], t)
+                tries = [[(t, ZOOM_IN if before == 1.0 else 1.0)]]
+                back = round(t + 2 * CUT_QUIET, 3)
+                if before == 1.0 and back < min(b, end) - CUT_QUIET:
+                    tries.append([(t, ZOOM_IN), (back, 1.0)])
+                for add in tries:
+                    trial = _dedupe([*out, *add])
+                    if _violations(trial, spans_at) <= current:
+                        out, placed = trial, True
+                        break
+                if placed:
+                    break
+            if placed:
+                break
+        if not placed:
+            break
+    return out
+
+
+def _no_beat_zoom_out(
+    steps: list[tuple[float, float]], beats: Sequence[float]
+) -> list[tuple[float, float]]:
+    """`steps` (deduplicated) where no beat is a zoom-out: while a beat shows a lower level
+    than just before it, the latest zoom-in before it is dropped (that earlier change gives
+    way to the beat; levels only ever come down, so no hold is broken)."""
+    out = list(steps)
+    for t in sorted(beats):
+        for _ in range(len(out)):
+            before = [st for st in out if st[0] < t - 1e-9]
+            if _level_at(out, t) >= _level_at(before, t) or len(before) < 2:
+                break
+            rise = next(
+                (k for k in range(len(before) - 1, 0, -1) if before[k][1] > before[k - 1][1]),
+                None,
+            )
+            if rise is None:
+                break
+            del out[rise]
+            out = _dedupe(out)
+    return out
+
+
+def _punch_in(
+    levels: list[tuple[float, float]],
+    sched: list[tuple[float, float]],
+    cuts: Sequence[float],
+    scene: tuple[float, float],
+    spans_at: Callable[[list[tuple[float, float]]], list[tuple[float, float]]],
+) -> list[tuple[float, float]]:
+    """`levels` with a punch-in at every beat (a ZOOM_PUNCH step of `sched`) that is not one
+    yet and every cut without a level change, where the guard allows it: ZOOM_PUNCH, else
+    ZOOM_IN, above the level before it, for PUNCH_HOLD + ZOOM_EASE s (ended early by the next
+    level step, cut or the scene end, where the level returns), kept only if the guard
+    (`spans_at`, on the whole new schedule) fires nowhere a level above base is in effect
+    that it did not before. Never a zoom-out."""
+    start, end = scene
+    beats = {t for t, v in sched if v == ZOOM_PUNCH and start <= t < end}
+    out = sorted(levels)
+
+    def violations(steps: list[tuple[float, float]]) -> set[tuple[float, float]]:
+        return _violations(steps, spans_at)
+
+    current: set[tuple[float, float]] | None = None
+    for t in [*sorted(beats), *sorted(c for c in cuts if c not in beats)]:  # beats first
+        lv = _dedupe(out)
+        before = _level_at([st for st in lv if st[0] < t - 1e-9], t)
+        now = _level_at(lv, t)
+        if (now > before) if t in beats else (now != before):
+            continue  # already a punch-in (a beat) or a framing change (a cut)
+        later = [u for u, _ in lv if u > t + 1e-9] + [c for c in cuts if c > t + 1e-9]
+        stop = min([*later, t + ZOOM_EASE + PUNCH_HOLD, end])
+        if stop - t < ZOOM_MIN_STEP - 1e-9:
+            continue
+        back = _level_at(lv, stop - 1e-6)
+        for lvl in (ZOOM_PUNCH, ZOOM_IN):
+            if lvl <= before + 1e-9:
+                continue
+            if any(abs(stop - b) < 1e-9 for b in beats) and lvl >= _level_at(lv, stop) - 1e-9:
+                continue  # its return would land on a beat: the beat must still rise
+            trial = [st for st in out if abs(st[0] - t) >= 1e-9] + [(t, lvl)]
+            if not any(abs(u - stop) < 1e-9 for u, _ in out):
+                trial.append((round(stop, 3), back))
+            sd = _dedupe(trial)
+            if current is None:
+                current = violations(lv)
+            if violations(sd) <= current:
+                out, current = sorted(trial), None
+                break
+    return out
 
 
 def _track_lefts(
@@ -901,17 +1399,41 @@ def _track_lefts(
     widths: list[float] | None = None,
     lead: float = 0.0,
     zoom_top: ZoomAt = 1.0,
+    offset: OffsetAt = None,
+    gaps: Gaps = (),
 ) -> list[tuple[float, float]]:
-    """(t, crop left px) of `track_x_expr`, before collinear keyframes are dropped."""
+    """(t, crop left px) of `track_x_expr`, before collinear keyframes are dropped: each snap
+    holds the previous left until SNAP_EPS before it, then jumps. Clamped to the frame unless
+    the renderer adds an `offset` (it clamps after)."""
     hi = max(in_w - crop_w, 0)
-    plan, _ = _track_plan(keyframes, in_w, crop_w, face_w, widths, lead, zoom_top)
-    return [(t, min(max(c * in_w - crop_w / 2, 0.0), hi)) for t, c in plan]
+    plan = _plan_track(keyframes, in_w, crop_w, face_w, widths, lead, zoom_top, offset, gaps)
+
+    def left(c: float) -> float:
+        px = c * in_w - crop_w / 2
+        return px if offset else min(max(px, 0.0), hi)
+
+    pts = [(t, left(c)) for t, c in plan.points]
+    out: list[tuple[float, float]] = []
+    snaps = {first: when for when, first in plan.snaps}
+    for k, pt in enumerate(pts):
+        when = snaps.get(k)
+        if when is not None and k > 0 and when - SNAP_EPS > pts[k - 1][0] + 1e-9:
+            out += [(when - SNAP_EPS, pts[k - 1][1]), (when, pt[1])]
+        out.append(pt)
+    return out
 
 
-def _fill_gap(a: float, b: float, max_gap: float, boundaries: Sequence[float]) -> list[float]:
+def _fill_gap(
+    a: float,
+    b: float,
+    max_gap: float,
+    boundaries: Sequence[float],
+    word_gaps: Sequence[tuple[float, float]] = (),
+) -> list[float]:
     """Filler step times splitting (a, b) into pieces no longer than `max_gap`; each sits at
-    its even-split nominal time, or at the nearest sentence end within BOUNDARY_SNAP of it
-    (never within CUT_QUIET of either end: a beat step next to a cut reads as fidgety)."""
+    the nearest sentence end within BOUNDARY_SNAP of its even-split nominal time, else in the
+    middle of the longest word gap there (a pause in an unpunctuated run), else at the nominal
+    time (never within CUT_QUIET of either end: a beat step next to a cut reads as fidgety)."""
     out: list[float] = []
     cur = a
     while b - cur > max_gap + 1e-9:
@@ -920,7 +1442,17 @@ def _fill_gap(a: float, b: float, max_gap: float, boundaries: Sequence[float]) -
         lo = max(nominal - BOUNDARY_SNAP, cur + CUT_QUIET)
         hi = min(nominal + BOUNDARY_SNAP, cur + max_gap)
         near = [x for x in boundaries if lo <= x <= hi and b - x >= CUT_QUIET]
-        cur = min(near, key=lambda x: abs(x - nominal)) if near else nominal
+        pauses = [
+            (gb - ga, round((ga + gb) / 2, 3))
+            for ga, gb in word_gaps
+            if lo <= (ga + gb) / 2 <= hi and b - (ga + gb) / 2 >= CUT_QUIET
+        ]
+        if near:
+            cur = min(near, key=lambda x: abs(x - nominal))
+        elif pauses:
+            cur = max(pauses, key=lambda p: (round(p[0], 2), -abs(p[1] - nominal)))[1]
+        else:
+            cur = nominal
         out.append(cur)
     return out
 
@@ -932,13 +1464,15 @@ def zoom_schedule(
     max_gap: float = ZOOM_MAX_GAP,
     boundaries: Sequence[float] = (),
     changes: Sequence[float] = (),
+    word_gaps: Sequence[tuple[float, float]] = (),
 ) -> list[tuple[float, float]]:
     """Zoom steps `(t, scale)` over an output timeline of `duration` s, starting `(0, 1.0)`.
 
     Every cut in (0, duration) gets a step at its exact time, so no cut is a bare jump cut.
     The base level alternates 1.0 / ZOOM_IN at each cut and at filler times keeping every gap
     (cuts and scene `changes` included) <= `max_gap` (fillers prefer `boundaries`, i.e.
-    sentence ends, within BOUNDARY_SNAP s of their nominal time). An emphasis time punches to
+    sentence ends, within BOUNDARY_SNAP s of their nominal time, else the longest `word_gaps`
+    pause there). An emphasis time punches to
     ZOOM_PUNCH and returns to the base level PUNCH_HOLD s after its ease completes.
 
     No beat step (punch, release, filler) lands within CUT_QUIET s of a cut or scene change:
@@ -952,13 +1486,15 @@ def zoom_schedule(
     marks = sorted({*cuts, *(round(c, 3) for c in changes if 0 < c < duration)})
     punches: list[float] = []
     for e in sorted(emphasis_times):
-        if not ZOOM_MIN_STEP <= e < duration:
+        if not 0.0 <= e < duration:
             continue
         near = [c for c in marks if abs(c - e) < CUT_QUIET]
         if near:
             e = min(near, key=lambda c: abs(c - e))
             if e < ZOOM_MIN_STEP:
                 continue  # its cut is too close to the start: that cut's own step stands
+        elif e < ZOOM_MIN_STEP:
+            e = 0.0  # a beat on the opening words punches from the first frame
         if not punches or e >= punches[-1] + punch_len + ZOOM_MIN_STEP:
             punches.append(e)
     events: list[tuple[float, str]] = []
@@ -967,7 +1503,11 @@ def zoom_schedule(
         events.append((p, "punch"))
         taken.add(p)
         ender = [c for c in marks if p < c < p + punch_len + CUT_QUIET]
-        if ender:
+        if ender and ender[0] in punches and ender[0] - CUT_QUIET >= p + ZOOM_MIN_STEP:
+            # the next beat punches at that cut: release a quiet second before it, so the
+            # beat is a punch-in again (never punch-on-punch, which reads as nothing)
+            events.append((round(ender[0] - CUT_QUIET, 3), "release"))
+        elif ender:
             events.append((ender[0], "cut_release"))
             taken.add(ender[0])
         else:
@@ -975,7 +1515,7 @@ def zoom_schedule(
     events += [(c, "toggle") for c in cuts if c not in taken]
     anchors = sorted({0.0, *(t for t, _ in events), *marks, duration})
     for a, b in pairwise(anchors):
-        events += [(f, "toggle") for f in _fill_gap(a, b, max_gap, boundaries)]
+        events += [(f, "toggle") for f in _fill_gap(a, b, max_gap, boundaries, word_gaps)]
 
     base = 1.0
     steps = [(0.0, 1.0)]
@@ -985,6 +1525,8 @@ def zoom_schedule(
         elif kind == "cut_release":
             base = 1.0
         steps.append((round(t, 3), ZOOM_PUNCH if kind == "punch" else base))
+    if len(steps) > 1 and steps[1][0] == 0.0:
+        steps = steps[1:]  # an opening punch replaces the base start
     return [st for st in steps if st[0] < duration]  # e.g. a release past the end
 
 
@@ -1116,16 +1658,7 @@ def scene_filter(
     kind = _kind(layout)
     track: dict = {}
     if kind == "FACE_TRACK":
-        rel = [(t - layout.start, x) for t, x in layout.track_x]
-        track = {
-            "keyframes": rel,
-            "in_w": in_w,
-            "crop_w": _track_w(in_w, in_h),
-            "face_w": layout.face_w,
-            "widths": layout.track_w or None,
-            "lead": layout.lead,
-            "zoom_top": zoom_at_fn(zoom_steps or [(0.0, 1.0)], layout),
-        }
+        track = _track_kw(layout, in_w, in_h, zoom_steps)
     if zoom_steps:
         zoom = zoom_expr(
             zoom_steps,
@@ -1204,6 +1737,29 @@ def _shifted(
     return f"min(max(({x})+({off}),0),{_fmt(max(in_w - cw, 0))})"
 
 
+def _rendered_track(
+    layout: SceneLayout, in_w: int, in_h: int, steps: Sequence[Sequence[float]] | None
+) -> tuple[list[float], list[float], list[int]]:
+    """A FACE_TRACK scene's samples as rendered under `steps`: (scene times, crop centres
+    (share of the source width) with every crop offset in effect -- flat-scene step shift and
+    guard `shift_steps` -- clamped to the frame, indices into `layout.track_x` sorted by
+    time)."""
+    kw = _track_kw(layout, in_w, in_h, steps)
+    plan = _plan_track(**kw).points
+    off = kw["offset"] or (lambda _t: 0.0)
+    cwn = kw["crop_w"] / in_w
+    lo_c, hi_c = (cwn / 2, 1 - cwn / 2) if cwn < 1 else (0.5, 0.5)
+    shifts = sorted((float(a), float(v)) for a, v in layout.shift_steps)
+
+    def pulse(u: float) -> float:
+        on = [v for a, v in shifts if a <= u + layout.start + 1e-9]
+        return (on[-1] if on else 0.0) * cwn
+
+    order = sorted(range(len(layout.track_x)), key=lambda i: layout.track_x[i][0])
+    centres = [min(max(c + off(t) + pulse(t), lo_c), hi_c) for t, c in plan]
+    return [t for t, _ in plan], centres, order
+
+
 def face_offset(
     layout: SceneLayout, in_w: int, in_h: int, steps: Sequence[Sequence[float]]
 ) -> float | None:
@@ -1213,24 +1769,53 @@ def face_offset(
     applied; None for other scenes."""
     if _kind(layout) != "FACE_TRACK" or not layout.track_x:
         return None
-    cw = _track_w(in_w, in_h)
+    cwn = _track_w(in_w, in_h) / in_w
+    _, centres, _ = _rendered_track(layout, in_w, in_h, steps)
     rel = [(t - layout.start, x) for t, x in layout.track_x]
-    plan, _ = _track_plan(
-        rel, in_w, cw, layout.face_w, layout.track_w or None, layout.lead,
-        zoom_at_fn(steps or [(0.0, 1.0)], layout),
-    )  # fmt: skip
     _, xs, _ = _track_faces(rel, layout.face_w, layout.track_w or None)
-    flat = sorted(float(t) for t, _ in steps or []) if layout.step_shift else []
-
-    def shift_at(u: float) -> float:
-        t = u + layout.start
-        on = [float(v) for a, v in sorted(layout.shift_steps) if a <= t + 1e-9]
-        guard = on[-1] if on else 0.0
-        n = sum(1 for a in flat if a <= t + 1e-9)
-        return guard + (layout.step_shift if n and (n - 1) % 2 else 0.0)
-
-    offs = sorted((x - c) * in_w / cw - shift_at(t) for x, (t, c) in zip(xs, plan, strict=True))
+    offs = sorted((x - c) / cwn for x, c in zip(xs, centres, strict=True))
     return round(offs[len(offs) // 2], 4)
+
+
+def face_track_px(
+    layout: SceneLayout, in_w: int, in_h: int, steps: Sequence[Sequence[float]]
+) -> list[list[float]]:
+    """Per face sample of a FACE_TRACK scene with per-sample face rows (`track_face`), the
+    rendered face core in output px: [output t, x0, core top, x1, bottom, eye line y], mapped
+    through the crop path (snaps, step shift, guard shifts), the zoom in effect (eases
+    counted: `zoom_at_fn`, the larger face) about the scene's anchor row; the core is the
+    detector box minus its top FACE_CORE_TOP (hairline). [] for other scenes."""
+    if _kind(layout) != "FACE_TRACK" or not layout.track_x or not layout.track_face:
+        return []
+    if len(layout.track_face) != len(layout.track_x):
+        return []
+    cw = _track_w(in_w, in_h)
+    ts, centres, order = _rendered_track(layout, in_w, in_h, steps)
+    rel = [(t - layout.start, x) for t, x in layout.track_x]
+    _, xs, ws = _track_faces(rel, layout.face_w, layout.track_w or None)
+    rows = [layout.track_face[i] for i in order]
+    ys = _median3([r[0] for r in rows])
+    hs = _median3([r[1] for r in rows])
+    eyes = _median3([r[2] if r[2] is not None else r[0] + 0.4 * r[1] for r in rows])
+    zoom = zoom_at_fn(steps or [(0.0, 1.0)], layout)
+    ay = layout.anchor_px(OUT_H)
+    out = []
+    for t, c, x, w, y, h, eye in zip(ts, centres, xs, ws, ys, hs, eyes, strict=True):
+        z = zoom(t)
+        left = c * in_w - cw / 2
+
+        def px(v: float, z: float = z, left: float = left) -> float:
+            return OUT_W / 2 + z * ((v * in_w - left) / cw * OUT_W - OUT_W / 2)
+
+        def py(v: float, z: float = z) -> float:
+            return ay + z * (v * OUT_H - ay)
+
+        top = y + FACE_CORE_TOP * h
+        out.append(
+            [round(t + layout.start, 3), round(px(x - w / 2)), round(py(top)),
+             round(px(x + w / 2)), round(py(y + h)), round(py(eye))]
+        )  # fmt: skip
+    return out
 
 
 def rendered_zoom_steps(
@@ -1288,10 +1873,11 @@ def _shift_sign(layout: SceneLayout, in_w: int, in_h: int) -> int:
     at any track point (only what the unshifted crop showed counts), or can't move it at all."""
     cw = _track_w(in_w, in_h)
     hi = max(in_w - cw, 0)
-    pts = _track_lefts(
+    plan, _ = _track_plan(
         layout.track_x, in_w, cw, layout.face_w, layout.track_w or None, layout.lead,
         layout.zoom_level(ZOOM_TOP),
     )  # fmt: skip
+    pts = [(t, min(max(c * in_w - cw / 2, 0.0), hi)) for t, c in plan]  # one per sample
     if not pts:
         return 0
     med = _median3([x for _, x in sorted(layout.track_x)])
