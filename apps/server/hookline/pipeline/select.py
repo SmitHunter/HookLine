@@ -32,10 +32,14 @@ from hookline.models import (
 )
 from hookline.pipeline.boundaries import FILLER_OPENERS
 from hookline.pipeline.deadair import MIN_PIECE_S
+
+# the opening / closing piece next to a drop's jump cut needs this much speech (a short line
+# at a clip's edge reads fine; a sliver between two jump cuts does not: MIN_PIECE_S)
+MIN_EDGE_PIECE_S = 0.8
 from hookline.pipeline.signals import CLIP_MARKER, SCARE_MARKER
 from hookline.transcript_text import (
     compact_transcript,
-    ends_sentence,
+    ends_statement,
     format_timestamp,
     selection_lines,
 )
@@ -231,7 +235,7 @@ bishop who lost every game he played with it.", scores about 14 for `hook` at mo
 - A contested factual claim stated as fact raises `comment_risk` (people will argue in the \
 comments), and the packaging attributes it: "She says…", not the claim as fact.
 - A quotable thesis or mission line, a sentence a viewer would quote back or stitch, such as \
-"A library is the last building in town where nobody asks you to buy anything.", beats an \
+"Every garden is a bet that someone will still be here next spring.", beats an \
 abstract policy statement on the same theme: weigh it up as a `bold_claim` when it stands on \
 its own.
 
@@ -915,7 +919,7 @@ def _cold_open(
     ends = [
         k
         for k in range(i, len(words))
-        if ends_sentence(words[k].text) and words[k].end - t0 <= _COLD_OPEN_MAX_S + 1e-6
+        if ends_statement(words[k].text) and words[k].end - t0 <= _COLD_OPEN_MAX_S + 1e-6
     ]
     after = [k for k in ends if k >= j]
     if after:
@@ -1308,14 +1312,17 @@ def _drop_lines(
     src: _Source,
     cold_open: tuple[float, float] | None,
     log: bool,
+    start: float | None = None,
 ) -> list[int]:
     """The declared drop_lines that are actually cut: at most 3 lines strictly inside
     L{first}..L{last}, none holding the cold-open teaser, no question whose next kept line
     answers it, and none leaving a spoken piece shorter than MIN_PIECE_S between two drops (the
-    later drop is ignored), nor an opening or closing piece with less than MIN_PIECE_S of
-    speech (from its first word's start to its last word's end) before or after the jump cut
-    (the first or last drop is ignored). With `log`, every ignored line is logged (warning)."""
+    later drop is ignored), nor an opening or closing piece with less than MIN_EDGE_PIECE_S
+    of speech (from its first word's start to its last word's end; the opening piece from the
+    clip's `start`, default L{first}'s start) before or after the jump cut (the first or last
+    drop is ignored). With `log`, every ignored line is logged (warning)."""
     sents = src.sentences
+    t0 = sents[first].start if start is None else start
 
     def warn(msg: str, *args: object) -> None:
         if log:
@@ -1384,11 +1391,11 @@ def _drop_lines(
         groups = _drop_groups(lines)
         ranges = _drop_ranges(src, lines)
         edges = [
-            ("opening", groups[0], sents[first].start, ranges[0][0]),
+            ("opening", groups[0], t0, ranges[0][0]),
             ("closing", groups[-1], ranges[-1][1], sents[last].end),
         ]
         edge = next(
-            (e for e in edges if _speech(_clip_words(src, e[2], e[3])) < MIN_PIECE_S - 1e-9),
+            (e for e in edges if _speech(_clip_words(src, e[2], e[3])) < MIN_EDGE_PIECE_S - 1e-9),
             None,
         )
         if edge is None:
@@ -1401,7 +1408,7 @@ def _drop_lines(
             ", ".join(f"L{d}" for d in group),
             name,
             _speech(_clip_words(src, a, b)),
-            MIN_PIECE_S,
+            MIN_EDGE_PIECE_S,
         )
         lines = [d for d in lines if d not in group]
     return lines
@@ -1450,13 +1457,13 @@ def _drop_plan(
     t0 = sents[first].start if start is None else start
     cold = _cold_open(raw, first, last, src, log=log)
     if cold:
-        lines = _drop_lines(raw, first, last, src, cold, log=False)
+        lines = _drop_lines(raw, first, last, src, cold, log=False, start=t0)
         main = sents[last].end - t0 - sum(b - a for a, b in _drop_ranges(src, lines))
         max_s = _hard_max(src.settings.max_clip_s)
         if main + (cold[1] - cold[0]) > max_s:
             _drop_cold_open(raw, log, f"would push the clip over the {max_s:.0f}s maximum length")
             cold = None
-    lines = _drop_lines(raw, first, last, src, cold, log=log)
+    lines = _drop_lines(raw, first, last, src, cold, log=log, start=t0)
     if log:
         for d in lines:
             logger.info("clip %r: dropped L%d (%r)", raw.title, d, sents[d].text)
@@ -1619,6 +1626,9 @@ def _to_pick(raw: _RawClip, src: _Source) -> ClipPick | None:
         start_line = _trim_front(raw, first, last, src, min_s)
         if start_line is None:
             return None
+        if start_line == first:  # kept untrimmed: its opener is judged like any other
+            opening = _sentence_words(src, first)[offset:] or None
+            start_line, move = _guard_move(raw, first, last, src, min_s, opening)
     else:
         opening = _sentence_words(src, first)[offset:] or None
         start_line, move = _guard_move(raw, first, last, src, min_s, opening)
@@ -1637,9 +1647,7 @@ def _to_pick(raw: _RawClip, src: _Source) -> ClipPick | None:
         )
         if move is None:
             start_line, move = _guard_move(raw, start_line, last, src, min_s, None)
-        pick = _assemble(raw, start_line, last, src, [], move)
-    else:  # the quiet build stands: log its decisions once
-        _drop_plan(raw, start_line, last, src, pick.start, log=True)
+        pick = _assemble(raw, start_line, last, src, [], move, log=False)
     duration = _main_duration(pick)
     if not min_s <= duration <= max_s:
         logger.warning(
@@ -1648,6 +1656,7 @@ def _to_pick(raw: _RawClip, src: _Source) -> ClipPick | None:
         return None
     if any(min(pick.end, e) - max(pick.start, s) > 0 for s, e in src.exclude):
         return None
+    _drop_plan(raw, start_line, last, src, pick.start, log=True)  # the kept clip's decisions
     return pick
 
 

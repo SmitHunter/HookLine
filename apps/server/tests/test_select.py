@@ -1201,6 +1201,7 @@ def test_86s_candidate_is_trimmed_from_the_front(fake_llm, settings, caplog):
 
 
 def test_front_trim_skips_weak_openers_and_backchannels(fake_llm, settings):
+    settings = settings.model_copy(update={"max_clip_s": 60})  # L17 (57.2 s) fits 60 s
     tr, item = _trim_item({17: "So yes it was.", 18: "Yeah."})
     (p,) = _one(tr, fake_llm, settings, item)
     assert p.start == 76.0  # L17 opens on "So", L18 is a backchannel
@@ -1534,7 +1535,14 @@ def test_backchannel_crossing_stays_within_20s(settings):
 
 def test_system_prompt_has_no_examples_from_the_test_video():
     low = SYSTEM_PROMPT.lower()
-    for needle in ("war worth it", "a little rude", "come to mock", "activists versus big money"):
+    for needle in (
+        "war worth it",
+        "a little rude",
+        "come to mock",
+        "activists versus big money",
+        "library",
+        "public good",
+    ):
         assert needle not in low, needle
 
 
@@ -1992,3 +2000,63 @@ def test_wave_g_select_prompt_uses_no_phrases_from_the_test_stream():
         "just go",
     ):
         assert needle not in low, needle
+
+
+# --- final fixes: opener guard on the untrimmed fallback, ellipses, edge pieces, drop logs ---
+
+
+def test_untrimmed_long_clip_still_runs_the_opener_guard(fake_llm, settings, caplog):
+    """A clip over max_clip_s with no clean later start is kept untrimmed; its weak opener is
+    still judged by the opener guard (here no start within the guard's reach: kept, logged)."""
+    settings = settings.model_copy(update={"max_clip_s": 60})
+    teaser = "Rent doubled in one year for everyone."  # L11: no start may pass it
+    tr = _lines_transcript({10: "So yes it was.", 11: teaser})
+    item = _line_item(
+        10, 27, "So yes it was.", _FILLER.format(n=27), cold_open_words=teaser
+    )  # L10-L27: 69.2 s, over 60 s, within 75 s
+    (p,) = _one(tr, fake_llm, settings, item, caplog)
+    assert p.start == 40.0 and "kept untrimmed" in caplog.text
+    assert "L10 is a weak opener" in caplog.text
+
+
+def test_a_cold_open_runs_past_an_ellipsis_to_the_sentence_end(fake_llm, settings):
+    """A trailing "..." is not a sentence end for the teaser, as for selection lines."""
+    tr = _tease_transcript("will eat every... public good.")
+    item = _line_item(10, 18, _FILLER.format(n=10), _FILLER.format(n=19), cold_open_words=_TEASE)
+    (p,) = _one(tr, fake_llm, settings, item)
+    assert p.cold_open == (61.0, _end_of(tr, 16))
+
+
+def test_an_edge_piece_needs_only_0_8s_of_speech(fake_llm, settings):
+    """Next to a jump cut an opening or closing piece needs MIN_EDGE_PIECE_S (0.8 s) of
+    speech; a piece between two drops still needs MIN_PIECE_S."""
+    tr, item = _guard_item({10: "Look at this now."}, "Look at this now.", drop_lines=[11])
+    (p,) = _one(tr, fake_llm, settings, item)
+    assert len(p.drops) == 1  # 0.95 s of speech before the cut
+    tr, item = _guard_item({18: "Exactly right, it is."}, _FILLER.format(n=10), drop_lines=[17])
+    item["last_words"] = "Exactly right, it is."
+    (p,) = _one(tr, fake_llm, settings, item)
+    assert len(p.drops) == 1
+
+
+def test_the_opening_piece_is_measured_from_the_clip_start(settings):
+    """A mid-line start leaves less speech before the first jump cut than the whole line."""
+    from hookline.pipeline.select import _drop_lines, _RawClip
+
+    src = _fix_src({10: "Yes and look at this now."}, settings)
+    item = _line_item(10, 18, "look at this now.", _FILLER.format(n=18), drop_lines=[11])
+    clip = _RawClip.model_validate(item)
+    assert _drop_lines(clip, 10, 18, src, None, log=False) == [11]  # 1.45 s from 40.0
+    assert _drop_lines(clip, 10, 18, src, None, log=False, start=40.75) == []  # 0.7 s
+
+
+def test_drop_decisions_are_logged_only_for_a_kept_clip(settings, caplog):
+    import dataclasses
+
+    from hookline.pipeline.select import _RawClip, _to_pick
+
+    src = dataclasses.replace(_fix_src({}, settings), exclude=[(50.0, 52.0)])
+    item = _line_item(10, 18, _FILLER.format(n=10), _FILLER.format(n=18), drop_lines=[13])
+    with caplog.at_level(logging.INFO, logger="hookline.pipeline.select"):
+        assert _to_pick(_RawClip.model_validate(item), src) is None  # overlaps an exclude
+    assert "dropped L13" not in caplog.text
