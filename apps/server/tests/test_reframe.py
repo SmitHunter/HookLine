@@ -1267,7 +1267,7 @@ def test_hold_spans_never_zooms_in_inside_a_hold_nor_returns_into_the_next():
             return 1.0
 
     def run(steps, spans, cuts, ok, scene=(0, 20)):
-        held, shifts = _hold_spans(list(steps), spans, cuts, Fit(ok), scene)
+        held, shifts = _hold_spans(list(steps), spans, cuts, lambda _: Fit(ok), scene)
         for a, b in spans:
             assert not [(t, v) for t, v in held if a <= t < b and v != 1.0], (held, spans)
         return held, shifts
@@ -1285,16 +1285,17 @@ def test_hold_spans_never_zooms_in_inside_a_hold_nor_returns_into_the_next():
 
 def test_guard_shifts_are_checked_at_the_rendered_zoom():
     # a shift outside a hold, where the crop renders zoomed in, is validated at that zoom
+    # (a 0.13 face: a 0.17 one now caps the zoom flat so it fits the guard margin)
     from hookline.media.reframe import _SceneFit
 
-    lay = plan_zoom(_lean_at(0, 6, [0.5] * 24, fw=0.17), 1920, 864)
+    lay = plan_zoom(_lean_at(0, 6, [0.5] * 24, fw=0.13), 1920, 864)
     steps = [(0.0, ZOOM_IN)]
     fit = _SceneFit(lay, 1920, 864, steps)
     room_base = 486 * 0.42 / lay.zoom_level(1.0)
     room_zoomed = 486 * 0.42 / lay.zoom_level(ZOOM_IN)
     # a shift that fits the base view but not the zoomed one
-    shift = (room_base - 0.17 * 1920 / 2) / 486 * 0.99
-    assert shift * 486 > room_zoomed - 0.17 * 1920 / 2
+    shift = (room_base - 0.13 * 1920 / 2) / 486 * 0.99
+    assert shift * 486 > room_zoomed - 0.13 * 1920 / 2
     assert not fit.fits(None, 1.0, 2.0, shift=shift)
 
 
@@ -1335,9 +1336,11 @@ def test_guard_pulses_are_spaced_and_keep_one_direction_per_span():
 
     sched = [(0.0, 1.0), (2.0, ZOOM_IN), (2.4, 1.0), (4.0, ZOOM_IN), (4.3, 1.0), (6.0, ZOOM_IN)]
     cuts = [2.0, 4.0, 4.3, 6.0, 6.5]
-    _, shifts = _hold_spans(sched, [(1.0, 9.0)], cuts, Fit(), (0, 12))
+    _, shifts = _hold_spans(sched, [(1.0, 9.0)], cuts, lambda _: Fit(), (0, 12))
     ons = [(t, v) for t, v in shifts if v]
-    assert [t for t, _ in ons] == [2.0, 4.0, 6.0]  # 2.4, 4.3 and 6.5 are under 1 s after one
+    # 2.4 and 6.5 are under 1 s after a pulse; one at 4.0 would be cut to 0.3 s by the cut at
+    # 4.3 (no blinks), so 4.3 takes it
+    assert [t for t, _ in ons] == [2.0, 4.3, 6.0]
     assert {v for _, v in ons} == {0.04}  # the span's one direction
 
 
@@ -1360,7 +1363,9 @@ def test_no_pulse_switches_off_just_before_a_scene_end():
         def direction(self, t0, t1):
             return -1.0
 
-    _, shifts = _hold_spans([(0.0, 1.0), (1.4, ZOOM_IN)], [(0.5, 2.433)], [1.4], Fit(), (0, 2.433))
+    _, shifts = _hold_spans(
+        [(0.0, 1.0), (1.4, ZOOM_IN)], [(0.5, 2.433)], [1.4], lambda _: Fit(), (0, 2.433)
+    )
     assert shifts == [(1.4, -0.04)]  # 1.4-2.4 would end 0.03 s before the camera change
 
 
@@ -1383,11 +1388,82 @@ def test_hold_spans_later_pulse_does_not_block_an_earlier_one_and_no_pumping():
         def direction(self, t0, t1):
             return 1.0
 
-    # a beat at 15.733 lost its change to a hold; a pulse at 25.267 (inside a later hold)
-    # must not stop it getting its own pulse
-    sched = [(0.0, 1.0), (13.256, ZOOM_IN), (15.733, 1.0), (25.267, ZOOM_PUNCH)]
-    held, shifts = _hold_spans(sched, [(13.256, 14.1), (25.267, 26.3)], [], Fit(), (0, 30))
-    assert {t for t, v in shifts if v} == {13.256, 15.733, 25.267}
+    # a beat at 14.9 lost its change to a hold (too close for a return); a pulse at 25.267
+    # (inside a later hold) must not stop it getting its own pulse
+    sched = [(0.0, 1.0), (13.256, ZOOM_IN), (14.9, 1.0), (25.267, ZOOM_PUNCH)]
+    held, shifts = _hold_spans(
+        sched, [(13.256, 14.1), (25.267, 26.3)], [], lambda _: Fit(), (0, 30)
+    )
+    assert {t for t, v in shifts if v} == {13.256, 14.9, 25.267}
     # a hold that starts on a zoom step never returns within CUT_QUIET of its start
-    held, _ = _hold_spans([(0.0, 1.0), (7.992, ZOOM_IN)], [(7.992, 8.44)], [], Fit(), (0, 20))
+    held, _ = _hold_spans(
+        [(0.0, 1.0), (7.992, ZOOM_IN)], [(7.992, 8.44)], [], lambda _: Fit(), (0, 20)
+    )
     assert all(not (7.992 < t < 8.992) for t, _ in held), held
+
+
+# --- wave D review round 4: the reviewer's fuzz as a property test ------------------------
+
+
+def _fuzz_scene(seed: int):
+    import random
+
+    from hookline.media import reframe as R
+
+    rnd = random.Random(seed)
+    dur = rnd.uniform(6, 20)
+    x, xs = 0.5, []
+    for _ in range(int(dur / 0.25)):
+        x += rnd.gauss(0, 0.03) + (0.5 - x) * 0.05
+        if rnd.random() < 0.05:
+            x += rnd.choice([-1, 1]) * rnd.uniform(0.1, 0.25)
+        x = min(max(x, 0.08), 0.92)
+        xs.append(x)
+    lay = SceneLayout(
+        start=0, end=dur, kind="FACE_TRACK", track_x=[(i * 0.25, v) for i, v in enumerate(xs)],
+        face_w=rnd.uniform(0.09, 0.2), face_box=(0.3, 0.3), head_top=0.15,
+        lead=rnd.choice([0, 0, 0.05, -0.05]),
+    )  # fmt: skip
+    n = rnd.randint(0, int(dur / 2.5))
+    cuts = sorted(round(rnd.uniform(0.5, dur - 0.3), 3) for _ in range(n))
+    emph = [rnd.uniform(0.5, dur) for _ in range(rnd.randint(0, 5))]
+    return R.plan_zoom(lay, 1920, 864), R.zoom_schedule(dur, cuts, emph), cuts
+
+
+@pytest.mark.parametrize("block", range(6))
+def test_guard_property_over_random_scenes(block):
+    # 300 seeded scenes (6 x 50): base in effect inside every span the guard finds on the
+    # final schedule; every pulse fits that schedule; the face keeps the margin (less jitter)
+    # on the rendered crop and zoom, wherever the crop is free and the face guardable
+    from hookline.media import reframe as R
+
+    w, h = 1920, 864
+    cw = R._track_w(w, h)
+    for seed in range(block * 50, block * 50 + 50):
+        lay0, sched, cuts = _fuzz_scene(seed)
+        held, (lay,) = R.guard_zoom([lay0], w, h, sched, cuts)
+        rel = [(t - lay.start, x) for t, x in lay.track_x]
+        zoom = R.zoom_at_fn(held, lay)
+        for a, b in R.track_guard_spans(rel, w, cw, lay.face_w, None, lay.lead, zoom_top=zoom):
+            for k in range(int((b - a) / 0.05)):
+                u = a + k * 0.05
+                assert R._level_at(held, u) == 1.0, (seed, (a, b), u, held)
+        fit = R._SceneFit(lay, w, h, held)
+        sh = sorted(lay.shift_steps)
+        for t, v in sh:
+            if v:
+                off = next((u for u, vv in sh if u > t and not vv), lay.end)
+                assert fit.fits(None, t, min(off + R.ZOOM_EASE, lay.end), shift=v), (seed, t)
+        chain = scene_filter(lay, w, h, "a", "b", zoom_steps=held, cut_times=cuts)
+        xe = chain.split("crop=", 1)[1].split(":", 3)[2].replace(r"\,", ",")
+        ze = zoom_expr(held, offset=0, length=lay.end, level=lay.zoom_level, instant=cuts)
+        ts, xs, ws = R._track_faces(rel, lay.face_w, None)
+        for t, x, fw in zip(ts, xs, ws, strict=True):
+            left, z = evaluate(xe, t), evaluate(ze, t)
+            vis = cw / z
+            vl = left + cw / 2 - vis / 2
+            free = 1 < left < w - cw - 1 and 1 < vl and vl + vis < w - 1
+            if not free or not R._guardable(fw, cw / w / z * (0.5 - R.GUARD_MARGIN)):
+                continue
+            m = min(x * w - fw * w / 2 - vl, vl + vis - x * w - fw * w / 2) / vis
+            assert m >= R.GUARD_MARGIN - R.GUARD_JITTER, (seed, t, m)
