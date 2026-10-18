@@ -323,6 +323,13 @@ def zoom_at(steps: list, t: float) -> float:
     return scale
 
 
+def zoom_levels(sidecar: dict) -> list:
+    """The clip's zoom schedule levels, which Q4b maps through each scene's plan: the sidecar's
+    `zoom_levels`, else `zoom_steps` (sidecars before wave D recorded the levels there; newer
+    ones record the rendered zooms)."""
+    return sidecar.get("zoom_levels") or sidecar.get("zoom_steps") or []
+
+
 def _probe(mp4: Path) -> dict:
     res = subprocess.run(
         ["ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", str(mp4)],
@@ -511,11 +518,15 @@ def _check_opening(
 
 
 def _check_pacing(side: dict, duration: float) -> CheckResult:
-    """Q7: longest stretch without a cut, zoom step or scene (layout) change."""
+    """Q7: longest stretch without a cut, zoom step (as rendered, edge-guard holds applied),
+    edge-guard crop shift or scene (layout) change."""
     thr = f"framing change every <= {PACE_MAX_GAP:g}s"
     changes = {float(t) for t in side.get("cut_times") or []}
     changes |= {float(st[0]) for st in side.get("zoom_steps") or []}
     changes |= {float(lay["start"]) for lay in side.get("layout") or []}
+    changes |= {
+        float(st[0]) for lay in side.get("layout") or [] for st in lay.get("shift_steps") or []
+    }
     pts = sorted({0.0, duration} | {t for t in changes if 0 < t < duration})
     gap, at = max((b - a, a) for a, b in pairwise(pts))
     detail = f"longest {gap:.1f}s from {at:.1f}s"
@@ -552,7 +563,7 @@ def audit_clip(
         words = [Word(start=s, end=e, text=t) for s, e, t in sidecar["caption_words"]]
     duration = probe_duration(mp4)
     layouts = sidecar.get("layout") or []
-    steps = sidecar.get("zoom_steps") or []
+    steps = zoom_levels(sidecar)
     caps: list[_Event] = []
     hooks: list[_Event] = []
     cap_black: list[tuple[list[int], Box | None]] = []

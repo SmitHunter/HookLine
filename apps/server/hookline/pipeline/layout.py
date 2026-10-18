@@ -1,5 +1,6 @@
 """Per-scene 9:16 layout choice: STACKED facecam, FACE_TRACK, SPLIT, or FIT_BLUR."""
 
+import logging
 import math
 import statistics
 from pathlib import Path
@@ -12,6 +13,7 @@ from hookline.media.ffmpeg import FFmpegError, probe_duration, probe_size
 from hookline.vision.faces import Crop, Face, sample_frames
 
 LayoutKind = Literal["STACKED", "FACE_TRACK", "SPLIT", "FIT_BLUR"]
+log = logging.getLogger(__name__)
 Box = tuple[float, float, float, float]  # normalized x, y, w, h
 
 MIN_SCORE = 0.6
@@ -34,6 +36,12 @@ TRACK_EASE_S = 1.0  # ... beyond it, eases to the scene's median face x over thi
 HAIR_SHARE = 0.5  # head top ~ face box top - half a face height (hair)
 HEAD_QUANTILE = 0.1  # the head top budgeted for: this low quantile of the samples (highest)
 ZOOM_TOP = 1.2  # the highest zoom step level (a punch); see reframe.ZOOM_PUNCH
+SAMPLE_EVERY = 0.25  # face samples every 0.25 s (4 fps): the tracking edge guard needs them
+# Gaze lead room: a FACE_TRACK crop shifts up to LEAD of its width toward where the subject
+# looks (median landmark yaw over the scene): none under YAW_DEAD, the full lead from YAW_FULL.
+LEAD = 0.08
+YAW_DEAD = 0.1
+YAW_FULL = 0.3
 
 
 class SceneLayout(BaseModel):
@@ -42,6 +50,13 @@ class SceneLayout(BaseModel):
     kind: LayoutKind
     facecam: Box | None = None
     track_x: list[tuple[float, float]] = []
+    track_w: list[float] = []  # face width per track_x keyframe, normalized (edge guard)
+    lead: float = 0.0  # gaze lead room: signed share of crop width the crop shifts (+ right)
+    # Edge-guard framing changes (reframe.guard_zoom): (output s, signed share of crop width)
+    # sideways crop offsets, instant at cuts; and the rendered face centre's median offset from
+    # the crop centre (share of crop width, + right), for caption placement and the audit.
+    shift_steps: list[tuple[float, float]] = []
+    face_dx: float | None = None
     split_x: tuple[float, float] | None = None
     face_box: tuple[float, float] | None = None  # median face (y, h), normalized; captions
     face_w: float | None = None  # median face width (FACE_TRACK), normalized to source width
@@ -180,11 +195,14 @@ def classify_scene(
 
     largest = [(t, max(faces, key=lambda f: f.w * f.h)) for t, faces in kept if faces]
     if n and len(largest) >= TRACK_MIN_SHARE * n:
+        track = _track_keyframes(kept)
         return SceneLayout(
             start=start,
             end=end,
             kind="FACE_TRACK",
-            track_x=_track_keyframes(kept),
+            track_x=[(t, x) for t, x, _ in track],
+            track_w=[w for _, _, w in track],
+            lead=gaze_lead([f.yaw for _, f in largest]),
             face_box=_median_box([(f.y, f.h) for _, f in largest]),
             face_w=statistics.median(f.w for _, f in largest),
             head_top=_head_top([f for _, f in largest]),
@@ -203,23 +221,36 @@ def _head_top(faces: list[Face]) -> float:
     return _quantile([f.y - HAIR_SHARE * f.h for f in faces], HEAD_QUANTILE)
 
 
-def _track_keyframes(kept: list[tuple[float, list[Face]]]) -> list[tuple[float, float]]:
-    """(t, centre x) of the largest face per sample. A sample with no face (none passed
-    MIN_SCORE) HOLDS the last good x rather than following whatever else is in frame; after
-    TRACK_HOLD_S without a face it eases to the scene's median face x over TRACK_EASE_S.
-    Samples before the first face add nothing (the first x holds back to the scene start), so
-    the track only interpolates between valid samples and hold points."""
+def gaze_lead(yaws: list[float | None]) -> float:
+    """Signed lead room (share of crop width; + = the crop shifts right) from the scene's
+    median face yaw: 0 below YAW_DEAD, ramping to LEAD at YAW_FULL. The median ignores a
+    stray estimate; one value per scene keeps the crop steady."""
+    known = [y for y in yaws if y is not None]
+    if not known:
+        return 0.0
+    yaw = statistics.median(known)
+    ramp = min(max((abs(yaw) - YAW_DEAD) / (YAW_FULL - YAW_DEAD), 0.0), 1.0)
+    return math.copysign(LEAD * ramp, yaw) if ramp else 0.0
+
+
+def _track_keyframes(kept: list[tuple[float, list[Face]]]) -> list[tuple[float, float, float]]:
+    """(t, centre x, width) of the largest face per sample. A sample with no face (none passed
+    MIN_SCORE) HOLDS the last good x (and width) rather than following whatever else is in
+    frame; after TRACK_HOLD_S without a face it eases to the scene's median face x over
+    TRACK_EASE_S. Samples before the first face add nothing (the first x holds back to the
+    scene start), so the track only interpolates between valid samples and hold points."""
     xs = [max(faces, key=lambda f: f.w * f.h).cx for _, faces in kept if faces]
     median = statistics.median(xs) if xs else 0.5
-    out: list[tuple[float, float]] = []
-    last: tuple[float, float] | None = None
+    out: list[tuple[float, float, float]] = []
+    last: tuple[float, float, float] | None = None
     for t, faces in sorted(kept, key=lambda s: s[0]):
         if faces:
-            last = (t, max(faces, key=lambda f: f.w * f.h).cx)
+            face = max(faces, key=lambda f: f.w * f.h)
+            last = (t, face.cx, face.w)
             out.append(last)
         elif last is not None:
             ease = min(max((t - last[0] - TRACK_HOLD_S) / TRACK_EASE_S, 0.0), 1.0)
-            out.append((t, last[1] + (median - last[1]) * ease))
+            out.append((t, last[1] + (median - last[1]) * ease, last[2]))
     return out
 
 
@@ -248,7 +279,7 @@ def plan_layouts(
     video: Path,
     detector: _Detector | None,
     facecam_override: Box | None = None,
-    sample_every: float = 0.5,
+    sample_every: float = SAMPLE_EVERY,
     crop: Crop | None = None,
 ) -> list[SceneLayout]:
     """One layout per scene. With no detector (and no override) the whole video is a single
@@ -268,7 +299,12 @@ def plan_layouts(
         try:
             frames = sample_frames(video, times, crop=crop)
             samples = [(t, detector.detect(f)) for t, f in zip(times, frames, strict=True)]
-        except FFmpegError:
-            samples = []  # unreadable scene: fall back to FIT_BLUR rather than abort the plan
+        except FFmpegError as e:
+            # unreadable scene: fall back to FIT_BLUR rather than abort the plan, never silently
+            log.warning(
+                "face sampling failed for %s scene %.2f-%.2f s (%s); the scene uses FIT_BLUR",
+                video.name, start, end, (str(e).splitlines() or ["error"])[0],
+            )  # fmt: skip
+            samples = []
         layouts.append(classify_scene(samples, start, end, src_h=src_h))
     return layouts

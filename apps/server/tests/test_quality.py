@@ -129,7 +129,7 @@ def test_quiet_small_low_bitrate_file_fails_q1_and_q8(bad_mp4, tmp_path):
 
 def test_small_caption_font_fails_q2(good_mp4, tmp_path):
     text = build_ass(_words(), "Wait for the twist", DUR).replace(
-        "Style: Cap,Anton,136", "Style: Cap,Anton,70"
+        "Style: Cap,Anton,152", "Style: Cap,Anton,70"
     )
     by = _by_id(audit_clip(good_mp4, _sidecar(), _ass(tmp_path, text)))
     assert not by["Q2"].ok and by["Q2"].value < 55
@@ -234,7 +234,7 @@ def test_q2_measures_the_cap_band_not_comma_tails_or_accents(tmp_path):
     loose = line_heights(frame)
     dense = line_heights(frame, dense=DOMINANT_ROWS)
     assert len(dense) == 2  # the accents float above the line as their own row run
-    assert 60 <= max(dense) <= 72 < max(loose)  # comma tails inflate the loose measure
+    assert 72 <= max(dense) <= 80 < max(loose)  # comma tails inflate the loose measure
 
 
 @pytest.mark.parametrize(
@@ -462,3 +462,23 @@ def test_seam_into_a_close_up_keeps_tag_and_early_captions_off_the_face(good_mp4
     fixed = audit(caption_y_for(lays, until=until), hook_y_for(lays, until=until))
     assert fixed.ok, fixed
     assert hook_y_for(lays, until=until) > 806  # tag below the face, above the captions
+
+
+def test_face_check_uses_the_schedule_levels_not_the_rendered_zooms():
+    from hookline.quality import zoom_levels
+
+    side = {"zoom_steps": [[0.0, 1.0], [2.0, 1.072]], "zoom_levels": [[0.0, 1.0], [2.0, 1.12]]}
+    assert zoom_levels(side) == [[0.0, 1.0], [2.0, 1.12]]
+    old = {"zoom_steps": [[0.0, 1.0], [2.0, 1.12]]}  # pre-wave-D sidecars recorded levels
+    assert zoom_levels(old) == [[0.0, 1.0], [2.0, 1.12]]
+    assert zoom_levels({}) == []
+
+
+def test_q7_counts_guard_shift_steps_and_reads_the_guarded_zoom_steps():
+    from hookline.quality import _check_pacing
+
+    lay = {"start": 0.0, "end": 20.0, "kind": "FACE_TRACK", "shift_steps": [[9.0, 0.04]]}
+    side = {"cut_times": [], "layout": [lay], "zoom_steps": [[0.0, 1.0], [4.5, 1.072]]}
+    held = _check_pacing({**side, "layout": [{**lay, "shift_steps": []}]}, 13.0)
+    assert not held.ok and held.value == pytest.approx(8.5)  # a guard hold, honestly reported
+    assert _check_pacing(side, 13.0).ok  # the shift at 9.0 is a framing change
