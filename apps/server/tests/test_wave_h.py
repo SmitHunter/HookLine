@@ -686,3 +686,31 @@ def test_seam_luma_reads_the_region_shown(tmp_path):
     assert seam_luma(src, 1.0, 25.0, regions=[(0.0, 0.0, 0.5, 1.0)]) > 200
     assert seam_luma(src, 1.0, 25.0, regions=[(0.5, 0.0, 0.5, 1.0)]) < 40
     assert 90 < seam_luma(src, 1.0, 25.0) < 160
+
+
+def test_a_voiceless_cut_takes_the_death_screen_after_a_jumpscare():
+    """A jumpscare followed 0.3 s later by a death screen: the scare's window stops
+    STATIC_EDGE_S into the screen, so the voiceless cut starts there instead of holding
+    ~1 s of wordless black (stream clip 05)."""
+    from hookline.pipeline.boundaries import STATIC_EDGE_S, voiceless_gaps
+
+    words = [*sentence(0, "Game time"), *sentence(20, "I don't want a hug!")]
+    s = sig(screen=[(11, 14)], scares=[10.0])
+    s.screen[10] = 0b1100  # the screen starts at 10.5 s (frames 2-3 of second 10)
+    gaps = voiceless_gaps(pick(0, 23), words, s)
+    assert any(abs(x - (10.5 + STATIC_EDGE_S)) < 1e-6 for x, _ in gaps)
+    assert all(not (x < 10.0 < y) for x, y in gaps)  # the scare itself stays
+    # a scare inside the screen holds nothing
+    inside = sig(screen=[(10, 14)], scares=[12.0])
+    gaps = voiceless_gaps(pick(0, 23), words, inside)
+    assert any(x <= 12.0 <= y for x, y in gaps)
+
+
+def test_screen_runs_ignore_voice_and_length():
+    from hookline.pipeline.signals import screen_runs, static_runs
+
+    s = sig(screen=[(10, 14), (30, 31)])
+    talked = [W(10.0 + 0.5 * i, 10.0 + 0.5 * i + 0.4) for i in range(8)]
+    assert static_runs(s, talked) == []  # talked over: kept as content
+    assert screen_runs(s) == [(10.0, 14.0), (30.0, 31.0)]
+    assert screen_runs(s, min_s=2.0) == [(10.0, 14.0)]

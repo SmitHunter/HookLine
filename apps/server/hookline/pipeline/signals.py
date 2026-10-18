@@ -188,6 +188,7 @@ def _voiced_s(starts: np.ndarray, ends: np.ndarray, lo: float, hi: float) -> flo
 # an id is never reused while cached.
 _STATIC_CACHE: dict[tuple[int, int, int, int], tuple[object, ...]] = {}
 _STATIC_CACHE_MAX = 16
+_SCREEN_CACHE: dict[tuple[int, int, int, float], tuple[object, ...]] = {}
 
 
 def static_runs(signals: Signals, words: list, fps: int = MOTION_FPS) -> list[tuple[float, float]]:
@@ -208,9 +209,11 @@ def static_runs(signals: Signals, words: list, fps: int = MOTION_FPS) -> list[tu
     return list(runs)
 
 
-def _static_runs(signals: Signals, words: list, fps: int) -> list[tuple[float, float]]:
-    flags = screen_flags(signals, fps)
-    idx = np.flatnonzero(flags)
+def _screen_frame_runs(signals: Signals, fps: int) -> list[tuple[int, int]]:
+    """Runs of screen frames (first, last frame index; gaps of up to STATIC_BRIDGE_FRAMES
+    busy frames bridged) whose mean chroma (with `Signals.screen_chroma`) is under
+    STATIC_CHROMA_MAX: dark gameplay is coloured, a death / loading screen or fade is not."""
+    idx = np.flatnonzero(screen_flags(signals, fps))
     if not len(idx):
         return []
     runs: list[list[int]] = [[int(idx[0]), int(idx[0])]]
@@ -219,22 +222,51 @@ def _static_runs(signals: Signals, words: list, fps: int) -> list[tuple[float, f
             runs[-1][1] = int(k)
         else:
             runs.append([int(k), int(k)])
-    starts = np.array([w.start for w in words], dtype=np.float64)
-    ends = np.array([w.end for w in words], dtype=np.float64)
     chroma = signals.screen_chroma
     out = []
     for a, b in runs:
+        if chroma is not None:
+            seen = [c for c in chroma[a // fps : b // fps + 1] if c is not None]
+            if seen and sum(seen) / len(seen) >= STATIC_CHROMA_MAX:
+                continue
+        out.append((a, b))
+    return out
+
+
+def _static_runs(signals: Signals, words: list, fps: int) -> list[tuple[float, float]]:
+    starts = np.array([w.start for w in words], dtype=np.float64)
+    ends = np.array([w.end for w in words], dtype=np.float64)
+    out = []
+    for a, b in _screen_frame_runs(signals, fps):
         lo, hi = a / fps, (b + 1) / fps
         if hi - lo < STATIC_MIN_S - 1e-6:
             continue
         if _voiced_s(starts, ends, lo, hi) > STATIC_VOICED_MAX * (hi - lo):
             continue
-        if chroma is not None:
-            seen = [c for c in chroma[a // fps : b // fps + 1] if c is not None]
-            if seen and sum(seen) / len(seen) >= STATIC_CHROMA_MAX:
-                continue
         out.append((round(lo, 3), round(hi, 3)))
     return out
+
+
+def screen_runs(
+    signals: Signals, fps: int = MOTION_FPS, min_s: float = 0.5
+) -> list[tuple[float, float]]:
+    """Every screen run (source s, frame-precise) of at least `min_s`, talked over or not:
+    `static_runs` without its length and voice tests. A reaction talked over a death screen
+    is kept as a clip's content, but no scare inside the screen is footage worth holding.
+    Cached per (signals' screen data, fps, min_s)."""
+    key = (id(signals.screen), id(signals.screen_chroma), fps, min_s)
+    hit = _SCREEN_CACHE.get(key)
+    if hit is not None and hit[0] is signals.screen and hit[1] is signals.screen_chroma:
+        return list(hit[2])  # type: ignore[arg-type]
+    runs = [
+        (round(a / fps, 3), round((b + 1) / fps, 3))
+        for a, b in _screen_frame_runs(signals, fps)
+        if (b + 1 - a) / fps >= min_s - 1e-6
+    ]
+    if len(_SCREEN_CACHE) >= _STATIC_CACHE_MAX:
+        _SCREEN_CACHE.pop(next(iter(_SCREEN_CACHE)))
+    _SCREEN_CACHE[key] = (signals.screen, signals.screen_chroma, runs)
+    return list(runs)
 
 
 def low_motion(motion: list[float] | None, start: float, end: float) -> bool:
