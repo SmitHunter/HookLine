@@ -99,7 +99,6 @@ def _render(video, tmp_path, sample_pick, settings, final_argvs):
 def _check_render(video, tmp_path, sample_pick, settings, final_argvs, expected_mode):
     dst, argvs = _render(video, tmp_path, sample_pick, settings, final_argvs)
     m = measure_loudness(dst)
-    print(f"{expected_mode}: I={m.i} TP={m.tp} LRA={m.lra}")
     assert m.i == pytest.approx(-14.0, abs=1.0)
     assert m.tp <= -1.0
     (final,) = argvs
@@ -112,7 +111,6 @@ def _check_render(video, tmp_path, sample_pick, settings, final_argvs, expected_
     af = final[final.index("-af") + 1]
     assert ("linear=true" in af) == (expected_mode == "linear")
     reported = parse_loudnorm_json(argvs.stderrs[0])["normalization_type"]
-    print(f"{expected_mode}: loudnorm reported normalization_type={reported}")
     assert reported == expected_mode
 
 
@@ -139,11 +137,9 @@ def test_high_crest_clip_lands_on_target(
     take several dB off the peaks, its output undershoots the target. The render must check
     what the chain actually produces and correct for it."""
     src = measure_loudness(high_crest_video)
-    print(f"source: I={src.i} TP={src.tp} crest={src.tp - src.i:.1f}")
     assert src.tp - src.i > 16  # the limiter must take > 4 dB off at -14 / -2 dBTP
     dst, _ = _render(high_crest_video, tmp_path, sample_pick, settings, final_argvs)
     m = measure_loudness(dst)
-    print(f"high crest -> I={m.i} TP={m.tp}")
     # wave G-select: the whole clip may sit up to SPEECH_SWAY_DB off -14 so its speech lands
     # on -14 (its "words" are the loud bursts here). Round 1: the firm rungs' 1.2 s release
     # cannot level under full-scale clicks every 0.43 s, so this clip ends on the dynamic path
@@ -162,7 +158,6 @@ def test_near_silent_clip_not_boosted(
     dst, _ = _render(near_silent_video, tmp_path, sample_pick, settings, final_argvs)
     assert trims == []  # near-silent audio is skipped, so no true-peak check either
     m = measure_loudness(dst)
-    print(f"silent -> I={m.i} TP={m.tp}")
     assert m.i <= -40.0
 
 
@@ -214,7 +209,6 @@ def test_ensure_true_peak_trims_hot_file(steady_quiet_video, tmp_path):
     assert before.tp > -1.2
     trim = ensure_true_peak(hot)
     after = measure_loudness(hot)
-    print(f"trim {trim:.2f} dB: TP {before.tp} -> {after.tp}, I {before.i} -> {after.i}")
     assert trim < 0 and after.tp <= -1.0
     assert not hot.with_suffix(".trim.mp4").exists()
     streams = _run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_name",
@@ -349,7 +343,6 @@ def test_game_clip_fixture_has_voice_under_game(game_clip):
 
     whole = measure_loudness(game_clip)
     speech = measure_loudness(game_clip, speech_filter(GAME_SPEECH))
-    print(f"fixture: I={whole.i} LRA={whole.lra} speech I={speech.i}")
     assert whole.lra > 8 and whole.i - speech.i > 4
 
 
@@ -360,7 +353,6 @@ def test_speech_lands_near_the_target_and_the_range_is_compressed(game_clip, tmp
     out = _apply(game_clip, plan.af, tmp_path / "out.m4a")
     m = measure_loudness(out)
     s = measure_loudness(out, speech_filter(GAME_SPEECH))
-    print(f"speech-gated: I={m.i} TP={m.tp} LRA={m.lra} speech I={s.i} ({plan.mode})")
     assert MAX_LRA == 8.0
     assert m.i == pytest.approx(-14.0, abs=1.0) and m.tp <= -1.0
     assert m.lra <= 8.0

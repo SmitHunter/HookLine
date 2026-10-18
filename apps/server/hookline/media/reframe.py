@@ -44,16 +44,13 @@ KEYFRAME_TOL = 0.5  # px: track keyframes this close to the line through their n
 # Reframe snaps (fix wave F): the rendered crop never pans faster than MAX_PAN_PX source px/s
 # at a PAN_REF_W-wide source (scaled with the width). A move that needs more becomes an
 # instant reframe (a framing cut) at the moment the face would leave the margin, moved back
-# to a word gap within SNAP_GAP_S when the new framing already fits there; it frames the face
-# for up to SNAP_LOOKAHEAD s ahead. SNAP_EPS is the expression's one-step ramp.
+# to a word gap within SNAP_GAP_S when the new framing already fits there. SNAP_EPS is the
+# expression's one-step ramp.
 MAX_PAN_PX = 150.0
 PAN_REF_W = 1920
 MAX_PAN = MAX_PAN_PX / PAN_REF_W  # share of the source width per second
 SNAP_GAP_S = 0.3
-SNAP_LOOKAHEAD = 1.0
 SNAP_EPS = 0.001
-SNAP_SETTLED = 0.01  # a face moving less than this over the lookahead has settled (centred)
-RESYNC = 0.25  # an off-plan crop rejoins the plan within this share of a sample's reach
 PAN_TOL = 2 * KEYFRAME_TOL / PAN_REF_W  # held / limited crops keep this inside the margin
 BLUR = "boxblur=20:2"
 MIN_SCENE = 1 / 30
@@ -897,29 +894,6 @@ def scene_snaps(
     if _kind(layout) != "FACE_TRACK" or not layout.track_x:
         return []
     return [round(t + layout.start, 3) for t in track_snaps(**_track_kw(layout, in_w, in_h, steps))]
-
-
-def guarded_steps(
-    steps: Sequence[Sequence[float]], spans: Sequence[tuple[float, float]]
-) -> list[tuple[float, float]]:
-    """Zoom `steps` held at level 1.0 (the base) inside each span: a step to 1.0 at its start
-    and back to the schedule's level at its end; schedule steps inside it, and repeats of the
-    level just before, dropped."""
-    seq = [(float(st[0]), float(st[1])) for st in steps]
-    if not spans:
-        return seq
-
-    def level_at(t: float) -> float:
-        return max((st for st in seq if st[0] <= t + 1e-9), default=(0.0, 1.0))[1]
-
-    out = [st for st in seq if not any(a <= st[0] < b for a, b in spans)]
-    for a, b in spans:
-        out += [(a, 1.0), (b, level_at(b))]
-    merged: list[tuple[float, float]] = []
-    for t, v in sorted(out):
-        if not merged or v != merged[-1][1]:
-            merged.append((t, v))
-    return merged
 
 
 def zoom_at_fn(steps: Sequence[Sequence[float]], layout: SceneLayout) -> Callable[[float], float]:

@@ -1030,20 +1030,6 @@ def test_track_lead_biases_the_crop_toward_the_gaze_within_containment():
     assert track_guard_spans(kfs, in_w, cw, 0.2, lead=-0.08) == []
 
 
-def test_scene_filter_holds_zoom_at_base_while_the_guard_is_active():
-    from hookline.media.reframe import guarded_steps
-
-    steps = [(0.0, 1.0), (1.0, ZOOM_IN), (3.0, ZOOM_PUNCH), (6.0, 1.0)]
-    held = guarded_steps(steps, [(2.0, 4.0)])
-    expr = zoom_expr(held)
-    assert evaluate(expr, 1.5) == pytest.approx(ZOOM_IN)
-    for t in (2.25, 3.0, 3.5, 3.95):
-        assert evaluate(expr, t) == pytest.approx(1.0)  # held at the base level
-    assert evaluate(expr, 4.5) == pytest.approx(ZOOM_PUNCH)  # back to the schedule after
-    assert evaluate(expr, 7.0) == pytest.approx(1.0)
-    assert guarded_steps(steps, []) == steps
-
-
 def test_scene_filter_face_track_guard_holds_the_zoom():
     from hookline.media.reframe import guard_zoom
 

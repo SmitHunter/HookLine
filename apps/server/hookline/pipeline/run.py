@@ -49,7 +49,6 @@ from hookline.transcribe import Transcriber
 from hookline.transcribe.base import words_to_transcript
 from hookline.vision.faces import FaceDetector
 
-STAGES = 6
 PICKS_SCHEMA = 7  # bump when picks change shape or meaning, so old picks.json re-select
 PACKAGE_SCHEMA = 3  # bump when the packaging pass changes, so old package.json re-runs
 PAYOFF_ALLOWANCE_S = 5.0  # a clip may run this far over max_clip_s (select's payoff extension)
