@@ -217,9 +217,9 @@ def test_a_closing_scare_keeps_its_catch():
     from hookline.pipeline.boundaries import extend_payoff
 
     words = [*sentence(10, "We are running away now"), W(28.0, 30.0, "nooo")]  # a shout
-    # a death screen right after the catch, nobody reacting: 0.5 s of it
+    # a death screen right after the scare, nobody reacting: none of it (uncovered)
     out = extend_payoff(pick(10, 30.0), words, sig(scares=[37.8], screen=[(38, 50)]), 60)
-    assert out.end == pytest.approx(38.3)
+    assert out.end == pytest.approx(38.0)
     # the streamer reacts over the death screen: the cam shows it, >= 1.5 s kept
     react = [*words, W(38.0, 38.9, "Nooo!")]
     out = extend_payoff(pick(10, 30.0), react, sig(scares=[37.8], screen=[(38, 50)]), 60)
@@ -490,3 +490,215 @@ def test_run_keeps_one_side_of_each_death_screen_before_packaging():
     noted = pick(10.0, 58.0, ignored_drops=["L48 ignored: it is a question"])
     _one_side_of_deaths([noted], words, sig(), logs.append)
     assert any("L48 ignored" in x for x in logs)
+
+
+# --- a death screen inside a clip: what the fit keeps ----------------------------------------------
+
+
+def _reaction_over_screen():
+    words = [w for w in _two_attempts() if w.start < 30] + sentence(30.4, "Are you kidding me?")
+    words += sentence(41, "Alright.")
+    return words, sig(screen=[(30, 40)], scares=[22.0, 27.0, 29.6])
+
+
+def test_the_reaction_kept_over_a_death_screen_survives_the_fit():
+    """The side before a screen keeps the reaction said over it (10-31.54 s); the fit's
+    static-end check cut it again to 29.75 s while packaging had described it."""
+    from hookline.pipeline.boundaries import fit_to_signals, keep_payoff_side
+
+    words, hot = _reaction_over_screen()
+    side = keep_payoff_side(pick(10.0, 42.0), words, hot)
+    out = fit_to_signals(pick(10.0, 42.0), words, hot, max_s=65)
+    assert out.end == side.end and out.end >= words[-2].end - 1e-6
+    assert out.last_words == side.last_words == "Are you kidding me?"
+    again = fit_to_signals(out, words, hot, max_s=65)  # the render fits the side again
+    assert (again.start, again.end) == (out.start, out.end)
+
+
+def test_an_end_moved_off_a_silent_screen_updates_last_words():
+    from hookline.pipeline.boundaries import avoid_static
+
+    words = [*sentence(10, "Run run run!"), *sentence(25, "Oh no.")]
+    out = avoid_static(pick(10.0, 35.0, last_words="x"), words, sig(screen=[(30, 40)]))
+    assert out.end < 30 and out.last_words == "Oh no."
+
+
+def test_the_side_after_a_screen_gets_its_opener_rechecked():
+    from hookline.pipeline.boundaries import fit_to_signals, keep_payoff_side
+
+    words = sentence(10, "Okay here we go now.") + sentence(14, "Run run run!")
+    words += sentence(20, "Oh no.") + sentence(41, "No, not again.")
+    words += sentence(44, "Alright second try now.") + sentence(50, "I made it out of there.")
+    words += sentence(55, "Never again.")
+    s = sig(screen=[(25, 40)], scares=[52.0])
+    side = keep_payoff_side(pick(10.0, 57.0), words, s)
+    assert side.start == pytest.approx(44.0) and side.first_words == "Alright second try now."
+    out = fit_to_signals(pick(10.0, 57.0), words, s, max_s=55)
+    assert out.start == pytest.approx(44.0)
+
+
+def test_the_side_after_a_screen_starts_on_a_sentence_start():
+    """A sentence begun over the screen ("I swear this game is / so unfair to me."): the side
+    starts on the next sentence, not on "so"."""
+    from hookline.pipeline.boundaries import keep_payoff_side
+
+    words = sentence(10, "Okay here we go now.") + sentence(14, "Run run run!")
+    words += sentence(20, "Oh no.") + sentence(38.5, "I swear this game is")
+    words += sentence(40.3, "so unfair to me.") + sentence(44, "Alright second try now.")
+    words += sentence(50, "I made it out of there.") + sentence(55, "Never again.")
+    out = keep_payoff_side(pick(10.0, 57.0), words, sig(screen=[(25, 40)], scares=[52.0]))
+    assert out.start == pytest.approx(44.0) and out.first_words == "Alright second try now."
+
+
+def test_the_cause_reaction_is_not_undone_by_the_opener_check():
+    """'No, no, no, no!' right after a scare is the reaction include_cause pulled in, not a
+    reply opener."""
+    from hookline.pipeline.boundaries import fit_to_signals
+
+    words = sentence(5, "Let me check the vent.") + sentence(12.2, "No, no, no, no!")
+    words += sentence(14, "I hate this game so much.") + sentence(20, "Where do I go now?")
+    words += sentence(30, "Okay this way.")
+    p = pick(14.0, 34.0, first_words="I hate this game so much.")
+    out = fit_to_signals(p, words, sig(scares=[12.0]), max_s=50)
+    assert out.start == pytest.approx(12.2) and out.first_words.startswith("No, no, no, no!")
+
+
+def test_keeping_a_side_clears_the_opener_move_and_beats_outside_it():
+    from hookline.models import OpenerMove
+    from hookline.pipeline.boundaries import keep_payoff_side
+
+    moved = OpenerMove(from_line=3, to_line=4, reason="reply")
+    beats = ["zoom: 'Run' @ 14.2s", "zoom: 'made' @ 52.3s"]
+    p = pick(10.0, 58.0, opener_moved=moved, edit_beats=beats)
+    out = keep_payoff_side(p, _two_attempts(), sig(screen=[(30, 40)]))
+    assert out.start == pytest.approx(41.0)
+    assert out.opener_moved is None and out.edit_beats == ["zoom: 'made' @ 52.3s"]
+
+
+def test_a_side_shorter_than_the_minimum_clip_is_no_clip():
+    from hookline.pipeline.boundaries import keep_payoff_side
+    from hookline.pipeline.run import _one_side_of_deaths
+
+    words = _two_attempts()
+    p = pick(10.0, 58.0)
+    s = sig(screen=[(30, 40)])
+    assert keep_payoff_side(p, words, s, min_s=21.0) is None  # sides of 20 s and 17 s
+    assert keep_payoff_side(p, words, s, min_s=17.0) is not None
+    logs: list[str] = []
+    out = _one_side_of_deaths([p, pick(70.0, 100.0)], words, s, logs.append, min_s=21.0)
+    assert [x.start for x in out] == [70.0]
+
+
+def test_screen_markers_are_death_screens():
+    from hookline.pipeline.boundaries import DEATH_SCREEN_MIN_S
+    from hookline.pipeline.signals import SCREEN_MARKER_MIN_S
+
+    assert SCREEN_MARKER_MIN_S == DEATH_SCREEN_MIN_S
+
+
+def test_a_reaction_opener_backs_onto_its_cause_sound_on_gameplay_only():
+    from hookline.pipeline.boundaries import fit_to_signals
+
+    words = sentence(10, "And then he told me the price.")
+    words += sentence(14.5, "Oh my god, that is insane.") + sentence(18, "Right?")
+    p = pick(14.5, 40.0, first_words="Oh my god, that is insane.")
+    assert fit_to_signals(p, words, sig(onsets=[13.0])).start == 14.5  # a talk show
+    assert fit_to_signals(p, words, sig(onsets=[13.0]), gameplay=True).start < 14.5
+
+
+# --- cold-open repeats, answers ------------------------------------------------------------------
+
+
+def test_cold_open_repeats_count_only_inside_the_clip():
+    from hookline.pipeline.select import _recurs
+
+    line = "I really do not want a hug!"
+    words = sentence(14, line) + sentence(17, "Okay.") + sentence(20, line) + sentence(30, "Go.")
+    assert _recurs(words, 20.0, 22.0)  # said 6 s before
+    assert not _recurs(words, 20.0, 22.0, lo=17.0, hi=31.0)  # ... outside the clip
+
+
+def test_a_climax_teaser_is_kept_when_its_body_repeat_is_3_s_away():
+    from hookline.pipeline.select import _recurs
+
+    line = "I did it, I made it out!"
+    words = sentence(10, "Okay go go go.") + sentence(30, line) + sentence(36, line)
+    words += sentence(38, "Unbelievable.")
+    # the payoff line at the clip's end said 6 s before: heard three times, but far apart
+    assert not _recurs(words, 36.0, 37.9, lo=10.0, hi=39.0)
+    close = sentence(10, "Okay go go go.") + sentence(34.5, line) + sentence(36.5, line)
+    assert _recurs(close, 36.5, 38.3, lo=10.0, hi=39.0)  # back to back: dropped
+
+
+def test_answers_wh_test_reads_the_question_word():
+    from hookline.pipeline.select import _answers, _tokens
+
+    assert _answers("Whoa, did you see that?", _tokens("Yeah, I did."))
+    assert _answers("Whatever, are you in?", _tokens("Yes, I am."))
+    assert not _answers("So what did you do there?", _tokens("Yeah, it was great."))
+    assert not _answers("What's the time?", _tokens("Yeah, that is not scary."))
+
+
+# --- Q6: the declared first words ----------------------------------------------------------------
+
+
+def _said(text: str) -> list:
+    return [W(i * 0.5, i * 0.5 + 0.4, t) for i, t in enumerate(text.split())]
+
+
+def test_q6_first_word_ignores_selection_fillers():
+    from hookline.quality import first_word_clipped
+
+    assert first_word_clipped("Oh, what was that?", _said("What was that?")) is None
+    assert first_word_clipped("Umm the thing is", _said("the thing is")) is None
+    assert first_word_clipped("Erm, okay, go!", _said("go!")) is None
+    assert first_word_clipped("The fuck was that?", _said("fuck was that?")) == "the"
+
+
+def test_q6_first_word_allows_contractions_and_near_spellings():
+    from hookline.quality import first_word_clipped
+
+    assert first_word_clipped("What is that thing", _said("What's that thing")) is None
+    assert first_word_clipped("Hugie is coming", _said("Huggie is coming")) is None
+
+
+def test_q6_compares_after_the_caption_fixes():
+    """first_words quote the transcript ("Kimble"); the captions show the fix ("Grimbo")."""
+    from hookline.quality import _check_opening
+
+    words = _said("Grimbo is coming for me right now")
+    assert not _check_opening(words, "Kimble is coming for me", None).ok
+    fixes = [{"start": 3.0, "end": 3.2, "original": "Kimble", "text": "Grimbo"}]
+    assert _check_opening(words, "Kimble is coming for me", None, fixes=fixes).ok
+
+
+# --- packaging: names and specifics ----------------------------------------------------------------
+
+
+def test_proper_names_need_two_capitalised_uses_and_no_lowercase_one():
+    """Unpunctuated transcripts: every word is 'mid-sentence'."""
+    from hookline.pipeline.package import _proper_names
+
+    text = "so then Grimbo came out and Then I'm like It's over and Grimbo got me then we ran Left"
+    assert _proper_names(_said(text)) == {"grimbo"}
+
+
+def test_viewer_questions_and_number_words_are_no_unsupported_specifics():
+    from hookline.pipeline.package import unsupported_specifics
+    from hookline.pipeline.select import _tokens
+
+    src = _tokens("this is my fifth attempt and it feels like the nineties again")
+    assert unsupported_specifics("Best scare or worst?", src) == []
+    assert unsupported_specifics("His fifth attempt", src) == []
+    assert unsupported_specifics("A 5th attempt", src) == []
+    assert unsupported_specifics("Back in the 1990s", src) == []
+    assert unsupported_specifics("The worst attempt. Agree?", src) == ["worst"]
+
+
+def test_fallback_packaging_is_checked_for_specifics_too():
+    from hookline.pipeline.package import _supported
+    from hookline.pipeline.select import _tokens
+
+    src = _tokens("we made it out of the vent")
+    out = _supported("title", "The first vent escape", "The fastest vent escape", src, "t")
+    assert out == "The vent escape"

@@ -24,6 +24,7 @@ from hookline.pipeline.boundaries import (
     CAUSE_MAX_S,
     PAYOFF_SAID_MAX_S,
     PAYOFF_SCARE_S,
+    SIDE_MIN_S,
     VOICELESS_GAME_S,
     VOICELESS_MAX_S,
     edit_gaps,
@@ -54,8 +55,8 @@ from hookline.transcribe import Transcriber
 from hookline.transcribe.base import words_to_transcript
 from hookline.vision.faces import FaceDetector
 
-PICKS_SCHEMA = 8  # bump when picks change shape or meaning, so old picks.json re-select
-PACKAGE_SCHEMA = 4  # bump when the packaging pass changes, so old package.json re-runs
+PICKS_SCHEMA = 9  # bump when picks change shape or meaning, so old picks.json re-select
+PACKAGE_SCHEMA = 5  # bump when the packaging pass changes, so old package.json re-runs
 PAYOFF_ALLOWANCE_S = 5.0  # a clip may run this far over max_clip_s (select's payoff extension)
 
 
@@ -345,6 +346,18 @@ _FIT_BEFORE_S = CAUSE_MAX_S + 1.0
 _FIT_AFTER_S = PAYOFF_SCARE_S + PAYOFF_SAID_MAX_S + 1.0
 
 
+def voiceless_limit(gameplay: bool) -> float:
+    """The longest voiceless stretch a clip keeps: VOICELESS_GAME_S on gameplay (a stream with
+    a facecam), VOICELESS_MAX_S on talk; recorded in the sidecar for the audit's Q-voiceless."""
+    return VOICELESS_GAME_S if gameplay else VOICELESS_MAX_S
+
+
+def side_min_s(settings: Settings) -> float:
+    """The shortest side of a death screen that is still a clip: SIDE_MIN_S, at least the
+    configured min_clip_s."""
+    return max(SIDE_MIN_S, settings.min_clip_s)
+
+
 def fit_pick(
     pick: ClipPick,
     words: list[Word],
@@ -357,18 +370,22 @@ def fit_pick(
     on). The fit and the gaps see the words as the render captions them: held ends clamped to
     the voice (`render.voiced_words`), so the voiceless trimmer and the audit's Q-voiceless
     measure the same voice. `gameplay` (a stream with a facecam) cuts voiceless stretches
-    over VOICELESS_GAME_S instead of VOICELESS_MAX_S."""
+    over VOICELESS_GAME_S instead of VOICELESS_MAX_S -- in the fit's length estimates too --
+    and backs reaction openers onto their cause sound (`include_cause_sound`)."""
     voiced = voiced_words(
         wav, words, pick.start - _FIT_BEFORE_S, pick.end + _FIT_AFTER_S, settings.silence_db
     )
+    limit = voiceless_limit(gameplay)
     fitted = fit_to_signals(
         pick,
         voiced,
         signals,
         max_s=settings.max_clip_s + PAYOFF_ALLOWANCE_S,
         quiet_db=settings.silence_db,
+        voiceless_s=limit,
+        gameplay=gameplay,
+        min_side_s=side_min_s(settings),
     )
-    limit = VOICELESS_GAME_S if gameplay else VOICELESS_MAX_S
     gaps = edit_gaps(fitted, voiced, signals, quiet_db=settings.silence_db, voiceless_s=limit)
     return fitted, gaps, voiced
 
@@ -391,16 +408,21 @@ def _layout_profile(
 
 
 def _one_side_of_deaths(
-    picks: list[ClipPick], words: list[Word], signals: Signals, log: Callable[[str], None]
+    picks: list[ClipPick],
+    words: list[Word],
+    signals: Signals,
+    log: Callable[[str], None],
+    min_s: float = SIDE_MIN_S,
 ) -> list[ClipPick]:
-    """Each pick on one side of any death screen it spans (`boundaries.keep_payoff_side`),
-    before packaging describes it; a pick with no viable side is dropped (all kept as they are
-    when that would drop every one). Logs the drop_lines selection ignored, and each change."""
+    """Each pick on one side of any death screen it spans (`boundaries.keep_payoff_side`;
+    sides shorter than `min_s` are no clip), before packaging describes it; a pick with no
+    viable side is dropped (all kept as they are when that would drop every one). Logs the
+    drop_lines selection ignored, and each change."""
     out: list[ClipPick] = []
     for i, pick in enumerate(picks, 1):
         for note in pick.ignored_drops:
             log(f"clip {i:02d}: {note}")
-        side = keep_payoff_side(pick, words, signals)
+        side = keep_payoff_side(pick, words, signals, min_s=min_s)
         if side is None:
             log(f"clip {i:02d}: spans a death screen with no viable side; dropped")
             continue
@@ -482,8 +504,8 @@ def run_job(
     if not settings.chat:
         signals = signals.model_copy(update={"chat": None, "chat_kinds": None})
 
-    # death / loading screens: marked for the selector and the packager, and no pick spans one
-    screens = screen_runs(signals, min_s=SCREEN_MARKER_MIN_S)
+    # death screens: marked for the selector and the packager, and no pick spans one
+    death_screens = screen_runs(signals, min_s=SCREEN_MARKER_MIN_S)
     ppath = job_dir / "picks.json"
     key = _picks_key(settings, tkey)
     picks = _load_picks(ppath, key, log)
@@ -500,7 +522,7 @@ def run_job(
                 raw_sink=raw_payloads,
                 markers=heat_markers(signals),
                 heat_seconds=heat_seconds(signals),
-                screens=screens,
+                screens=death_screens,
             )
         finally:  # kept even when selection fails, for debugging what Claude returned
             atomic_write_text(
@@ -522,8 +544,8 @@ def run_job(
         log(f"[5/6] select: done ({len(picks)} clips)")
 
     words = transcript.words()
-    picks = _one_side_of_deaths(picks, words, signals, log)
-    picks = _package(job_dir, picks, words, llm, settings, log, screens)
+    picks = _one_side_of_deaths(picks, words, signals, log, min_s=side_min_s(settings))
+    picks = _package(job_dir, picks, words, llm, settings, log, death_screens)
 
     log(f"[6/6] render: started ({len(picks)} clips)")
     out_dir = settings.output_dir / job_id
@@ -531,8 +553,8 @@ def run_job(
     # full-cam reaction beats and the audit's Q-beat: every scare (game transients and flash
     # scares) and the gameplay's motion spikes
     scares, spikes = scare_times(signals), beat_spikes(signals)
-    # the talked-over static / death screens: covered by the full cam in the render
-    screens = screen_runs(signals)
+    # every static / death screen run, talked over or not: covered by the full cam in the render
+    cover_screens = screen_runs(signals)
     gameplay = profile is not None and profile.cam is not None  # a stream: 3 s voiceless
     # Segment-interpolated word times are contiguous (no gaps), so protecting them from cuts
     # would remove no dead air at all; only real word timings (DTW / whisper) are protected.
@@ -571,7 +593,7 @@ def run_job(
                 profile=profile,
                 scares=scares,
                 spikes=spikes,
-                screens=screens,
+                screens=cover_screens,
             )
         except Exception as e:  # noqa: BLE001 - one bad clip never aborts the job
             reason = (str(e).splitlines() or [type(e).__name__])[0]
@@ -587,6 +609,7 @@ def run_job(
             **pick.model_dump(mode="json"),
             "post_caption": post_caption,
             "source_video_kbps": source_kbps,
+            "voiceless_limit_s": voiceless_limit(gameplay),  # the audit's Q-voiceless
             **extras,
         }
         atomic_write_text(

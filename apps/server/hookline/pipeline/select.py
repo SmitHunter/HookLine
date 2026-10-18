@@ -392,6 +392,7 @@ _COLD_OPEN_MIN_S = 1.0  # shorter teasers extend back within their sentence, els
 _COLD_OPEN_MIN_MATCH = 0.8
 _COLD_OPEN_REPEAT_S = 10.0  # a teaser said again this close in the body is dropped
 _COLD_OPEN_REPEAT_MATCH = 0.9
+_CLIMAX_REPEAT_S = 3.0  # ... for a climax teaser, a repeat this close
 _BEAT_SNAP_S = 3.0
 _REACTION_PEAK_MIN_S = 12.0
 _CHUNK_OVERLAP_S = 120.0
@@ -1031,7 +1032,8 @@ def _cold_open(
             )
             return None
         t0 = words[back].start
-    if _recurs(words, t0, words[k].end):
+    clip_lo, clip_hi = sents[first].start, sents[last].end
+    if _recurs(words, t0, words[k].end, clip_lo, clip_hi):
         _drop_cold_open(
             raw,
             log,
@@ -1042,15 +1044,22 @@ def _cold_open(
     return t0, words[k].end
 
 
-def _recurs(words: list[Word], t0: float, t1: float) -> bool:
+def _recurs(
+    words: list[Word], t0: float, t1: float, lo: float = -math.inf, hi: float = math.inf
+) -> bool:
     """Whether the teaser spoken over [t0, t1] (`words` of the clip) is said again outside
-    it, within _COLD_OPEN_REPEAT_S before or after: an in-order match of >= 90% of its tokens
-    within as many consecutive tokens."""
+    it, within _COLD_OPEN_REPEAT_S before or after and inside the clip [lo, hi]: an in-order
+    match of >= 90% of its tokens within as many consecutive tokens. A climax teaser (ending
+    within _COLD_OPEN_MAX_S of the clip's end: the payoff line) counts only a repeat starting
+    within _CLIMAX_REPEAT_S of it -- one further off is heard as the build-up, not a stutter."""
     want = [t for w in words if t0 - 1e-6 <= w.start < t1 for t in _tokens(w.text)]
     if not want:
         return False
-    before = [w for w in words if t0 - _COLD_OPEN_REPEAT_S <= w.start < t0 - 1e-6]
-    after = [w for w in words if t1 - 1e-6 <= w.start <= t1 + _COLD_OPEN_REPEAT_S]
+    near = _COLD_OPEN_REPEAT_S
+    if hi - t1 <= _COLD_OPEN_MAX_S + 1e-6:
+        near = _CLIMAX_REPEAT_S
+    before = [w for w in words if max(t0 - near, lo) - 1e-6 <= w.start < t0 - 1e-6]
+    after = [w for w in words if t1 - 1e-6 <= w.start <= min(t1 + near, hi) + 1e-6]
     for side in (before, after):
         toks = _flat_tokens(side)[0]
         for i in range(max(len(toks) - len(want) + 1, 0)):
@@ -1394,12 +1403,28 @@ def _strip_start_filler(words: list[Word]) -> int:
     return i
 
 
+_QUESTION_LEAD_INS = ("so", "and", "but", "okay", "ok", "oh", "well", "then", "like", "um", "uh")
+
+
+def _wh_question(question: str) -> bool:
+    """A wh-question: its first word after lead-ins ("So what did you...?") is a question
+    word or its contraction ("What's") -- not a word that merely starts like one ("Whoa",
+    "Whatever")."""
+    toks = _tokens(question)
+    i = 0
+    while i < len(toks) - 1 and toks[i] in _QUESTION_LEAD_INS:
+        i += 1
+    return bool(toks) and toks[i].split("'")[0] in _WH_WORDS
+
+
 def _answers(question: str, toks: list[str]) -> bool:
     """Whether a line with tokens `toks` answers `question`: it opens on an answer word ("No,",
-    "Yes,", "Not really."; not for a wh-question: "What's the time?" / "Yeah, ...") or repeats >= 2 of the question's content words (one shared word,
-    as in "Did I go?" / "We go there...", is chance)."""
-    wh = _tokens(question)[:1] and _tokens(question)[0].startswith(_WH_WORDS)
-    if not wh and any(toks[: len(a.split())] == a.split() for a in _ANSWER_OPENERS):
+    "Yes,", "Not really."; not for a wh-question, `_wh_question`: "What's the time?" /
+    "Yeah, ...") or repeats >= 2 of the question's content words (one shared word, as in
+    "Did I go?" / "We go there...", is chance)."""
+    if not _wh_question(question) and any(
+        toks[: len(a.split())] == a.split() for a in _ANSWER_OPENERS
+    ):
         return True
     content = {t for t in _tokens(question) if t not in _FUNCTION_WORDS}
     return len(content & set(toks)) >= _ANSWER_MIN_SHARED

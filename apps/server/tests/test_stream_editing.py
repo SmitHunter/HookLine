@@ -725,3 +725,80 @@ def test_screen_runs_ignore_voice_and_length():
     assert static_runs(s, talked) == []  # talked over: kept as content
     assert screen_runs(s) == [(10.0, 14.0), (30.0, 31.0)]
     assert screen_runs(s, min_s=2.0) == [(10.0, 14.0)]
+
+
+# --- 8. the gameplay voiceless limit through the fit ---------------------------------------------
+
+
+def _paced(n: int = 12, every: float = 5.0) -> list[Word]:
+    """A short line every `every` s from 10 s: ~4.4 s voiceless between them."""
+    return [w for k in range(n) for w in sentence(10 + k * every, "go now.")]
+
+
+def test_fit_measures_length_at_the_gameplay_voiceless_limit():
+    """The 3 s gameplay limit cuts more of the voiceless footage: a clip over max_s at the 6 s
+    talk limit fits at 3 s and is not front-trimmed."""
+    from hookline.pipeline.boundaries import VOICELESS_GAME_S, fit_to_signals
+
+    words = _paced()
+    p = pick(10.0, words[-1].end + 0.2)
+    assert fit_to_signals(p, words, sig(), max_s=50.0).start > 10.0  # talk: trimmed
+    out = fit_to_signals(p, words, sig(), max_s=50.0, voiceless_s=VOICELESS_GAME_S)
+    assert out.start == 10.0
+
+
+def test_payoff_extension_counts_length_at_the_gameplay_voiceless_limit():
+    from hookline.pipeline.boundaries import VOICELESS_GAME_S, extend_payoff
+
+    words = _paced(9)
+    end = words[-1].end + 0.2
+    p = pick(10.0, end)
+    scare = end + 1.0
+    assert extend_payoff(p, words, sig(scares=[scare]), max_s=40.0) is p  # 6 s: no room
+    out = extend_payoff(p, words, sig(scares=[scare]), 40.0, voiceless_s=VOICELESS_GAME_S)
+    assert out.end >= scare + 1.5 - 1e-6
+
+
+# --- 9. the closing catch over a death screen ----------------------------------------------------
+
+
+def test_a_reacting_catch_runs_a_full_cover_into_the_screen():
+    """The streamer reacting over the screen after the catch: the clip ends at least
+    COVER_MIN_S into the screen, so the render covers it with the cam -- never shortened to a
+    sliver of uncovered screen to fit."""
+    from hookline.pipeline.boundaries import extend_payoff
+    from hookline.pipeline.layout import COVER_MIN_S
+
+    dense = [W(10 + i * 0.5, 10 + i * 0.5 + 0.4, "w") for i in range(40)]  # to 29.9 s
+    words = [*dense, W(34.8, 35.1, "No!")]
+    s = sig(scares=[34.6], screen=[(36, 50)])
+    base = pick(10, 30.0)
+    assert extend_payoff(base, words, s, max_s=26.2) is base  # only 0.1 s into it would fit
+    out = extend_payoff(base, words, s, max_s=27.5)
+    assert out.end >= 36 + COVER_MIN_S
+
+
+def test_a_silent_catch_ends_before_the_screen():
+    from hookline.pipeline.boundaries import extend_payoff
+
+    words = [*sentence(10, "We are running away now"), W(28.0, 30.0, "nooo")]
+    out = extend_payoff(pick(10, 30.0), words, sig(scares=[36.5], screen=[(38, 50)]), 60)
+    assert out.end == pytest.approx(38.0 - 0.25)
+    # the screen right on the scare: the end stays off it (its first flagged frame at most),
+    # never 0.5 s of uncovered screen after the scare
+    out = extend_payoff(pick(10, 30.0), words, sig(scares=[37.8], screen=[(38, 50)]), 60)
+    assert 37.8 < out.end <= 38.0 + 1e-6
+
+
+def test_no_payoff_from_a_scare_on_a_screen_already_running():
+    """A stinger on the death screen after a side that ends at the screen: no extension over
+    the silent screen (it ran on 3.5 s into it)."""
+    from hookline.pipeline.boundaries import extend_payoff
+
+    words = [*sentence(10, "He is right behind me."), *sentence(26, "Oh no no no!")]
+    s = sig(screen=[(30, 44)], scares=[22.0, 27.0, 28.5, 31.0])
+    p = pick(10.0, 30.0)
+    assert extend_payoff(p, words, s, 55) is p
+    # a screen starting exactly at the end is between the end and the scare too
+    s = sig(screen=[(30, 33)], scares=[34.0])
+    assert extend_payoff(p, words, s, 55) is p

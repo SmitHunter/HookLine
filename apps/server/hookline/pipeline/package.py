@@ -354,18 +354,32 @@ def _repeats_opening(hook: str, opening: list[str]) -> bool:
     return shared / len(content) >= _HOOK_REPEAT_SHARE - 1e-9
 
 
+_PRONOUNS = {"i", "you", "he", "she", "we", "they", "it", "that", "there", "here", "what"}
+_PRONOUNS |= {"who", "let", "where", "how", "this"}
+_NAME_MIN_USES = 2  # a name is capitalised at least this often
+
+
 def _proper_names(words: list[Word]) -> set[str]:
     """Lowercased tokens the source capitalises mid-sentence ("I think Grimbo is ..."): names
-    of people, places, shows and games."""
-    out: set[str] = set()
+    of people, places, shows and games -- capitalised at least _NAME_MIN_USES times and never
+    written lowercase (an unpunctuated transcript capitalises "Then" and "Left" anywhere), no
+    pronoun contraction ("I'm", "It's")."""
+    lower: set[str] = set()
+    caps: Counter[str] = Counter()
+    mid: set[str] = set()
     for prev, w in zip([None, *words], words, strict=False):
         text = w.text.strip().lstrip(_OPENING_QUOTES)
-        if not text[:1].isupper() or prev is None or ends_sentence(prev.text):
+        toks = [t.removesuffix("'s") for t in _tokens(text)]
+        if not text[:1].isupper():
+            lower.update(toks)
             continue
-        for t in _tokens(text):
-            if t not in _FUNCTION_WORDS and t != "i" and len(t) > 1:
-                out.add(t.removesuffix("'s"))
-    return out
+        for t in toks:
+            if t in _FUNCTION_WORDS or len(t) <= 1 or t.split("'")[0] in _PRONOUNS:
+                continue
+            caps[t] += 1
+            if prev is not None and not ends_sentence(prev.text):
+                mid.add(t)
+    return {t for t in mid if caps[t] >= _NAME_MIN_USES and t not in lower}
 
 
 def _entities(hook: str, names: set[str]) -> set[str]:
@@ -439,8 +453,14 @@ def _choose_hook(
             found.append((name, hook))
     plain = [f for f in found if not _entity_label(f[1], names)]
     if not found:
-        logger.warning("clip %r: no hook passes the checks; kept the selection hook_text", label)
-        return pick.hook_text
+        kept = pick.hook_text
+        bad = unsupported_specifics(kept, source) if source is not None else []
+        if bad:
+            kept = _without(kept, bad)
+        logger.warning(
+            "clip %r: no hook passes the checks; kept the selection hook_text %r", label, kept
+        )
+        return kept
     name, hook = (plain or found)[0]
     if plain and plain[0] != found[0]:
         logger.info(
@@ -466,30 +486,62 @@ _NOT_SUPERLATIVE |= {"earnest", "unrest", "attest", "detest", "midwest", "inques
 _ORDINAL_NEAR = 2  # an ordinal is supported when the source says it this close before its noun
 
 
+_ORDINAL_DIGITS = {f"{n}{suf}": w for n, suf, w in (
+    (1, "st", "first"), (2, "nd", "second"), (3, "rd", "third"), (4, "th", "fourth"),
+    (5, "th", "fifth"), (6, "th", "sixth"), (7, "th", "seventh"), (8, "th", "eighth"),
+    (9, "th", "ninth"), (10, "th", "tenth"),
+)}  # fmt: skip
+_DECADES = {"twenties": "1920s", "thirties": "1930s", "forties": "1940s", "fifties": "1950s"}
+_DECADES |= {"sixties": "1960s", "seventies": "1970s", "eighties": "1980s"}
+_DECADES |= {"nineties": "1990s"}
+_DECADES |= {v[2:]: v for v in list(_DECADES.values())}  # "90s"
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+")
+
+
+def _canon(token: str) -> str:
+    """One spelling per specific: "5th" as "fifth", "nineties" / "90s" as "1990s"."""
+    return _ORDINAL_DIGITS.get(token) or _DECADES.get(token) or token
+
+
 def unsupported_specifics(text: str, source: list[str]) -> list[str]:
     """Tokens of `text` that claim a specific the `source` tokens (in order) do not say: a
-    year or month not in the source, a superlative ("biggest", "worst") not in it, or an
+    year or month not in the source, a superlative ("biggest", "worst") not in it -- unless
+    asked in a question ("Best scare or worst?": the viewer's opinion, no claim) --, or an
     ordinal ("first", "last", "3rd") the source never says within _ORDINAL_NEAR words before
-    the same next content word ("first deployment" does not support "First Gulf War")."""
-    have = set(source)
-    toks = _tokens(text)
+    the same next content word ("first deployment" does not support "First Gulf War"). A
+    number written either way ("5th" / "fifth", "1990s" / "nineties") is the same claim."""
+    src = [_canon(t) for t in source]
+    have = set(src)
     out: list[str] = []
-    for i, t in enumerate(toks):
-        if _YEAR_RE.match(t) or t in _MONTHS:
-            ok = t in have
-        elif t in _ORDINALS or _ORDINAL_RE.match(t):
-            noun = next((x for x in toks[i + 1 :] if x not in _FUNCTION_WORDS), None)
-            ok = any(
-                s == t and (noun is None or noun in source[j + 1 : j + 1 + _ORDINAL_NEAR])
-                for j, s in enumerate(source)
-            )
-        elif t in _SUPERLATIVES or (_SUPERLATIVE_RE.match(t) and t not in _NOT_SUPERLATIVE):
-            ok = t in have
-        else:
-            continue
-        if not ok:
-            out.append(t)
+    for part in _SENTENCE_SPLIT_RE.split(text.strip()):
+        asked = part.rstrip().rstrip("\"'”’)").endswith("?")
+        raw = _tokens(part)
+        toks = [_canon(t) for t in raw]
+        for i, t in enumerate(toks):
+            if _YEAR_RE.match(t) or t in _MONTHS:
+                ok = t in have
+            elif t in _ORDINALS or _ORDINAL_RE.match(t):
+                noun = next((x for x in toks[i + 1 :] if x not in _FUNCTION_WORDS), None)
+                ok = any(
+                    s == t and (noun is None or noun in src[j + 1 : j + 1 + _ORDINAL_NEAR])
+                    for j, s in enumerate(src)
+                )
+            elif t in _SUPERLATIVES or (_SUPERLATIVE_RE.match(t) and t not in _NOT_SUPERLATIVE):
+                ok = t in have or asked
+            else:
+                continue
+            if not ok:
+                out.append(raw[i])
     return out
+
+
+def _without(text: str, bad: list[str]) -> str:
+    """`text` without the words whose token is in `bad` (spacing and dangling punctuation
+    tidied)."""
+    drop = set(bad)
+    kept = [w for w in text.split() if not (set(_tokens(w)) & drop)]
+    out = " ".join(kept).strip(" ,;:-–—")
+    return out[:1].upper() + out[1:] if out and text[:1].isupper() else out
 
 
 def _grounded(tag: str, source: set[str]) -> bool:
@@ -525,19 +577,22 @@ def _merge_hashtags(
 
 def _supported(name: str, text: str, fallback: str, source: list[str], label: str) -> str:
     """`text`, or `fallback` (logged) when it claims a date, ordinal or superlative the source
-    does not say (`unsupported_specifics`)."""
+    does not say (`unsupported_specifics`) -- the fallback checked too: when it also claims
+    one, it is kept without the offending words."""
     bad = unsupported_specifics(text, source)
     if not bad:
         return text
+    worse = unsupported_specifics(fallback, source)
+    kept = _without(fallback, worse) if worse else fallback
     logger.warning(
         "clip %r: packaged %s %r has unsupported specifics %s; kept %r",
         label,
         name,
         text,
         bad,
-        fallback,
+        kept,
     )
-    return fallback
+    return kept
 
 
 def _apply(

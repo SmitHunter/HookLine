@@ -200,7 +200,7 @@ def test_picks_cache_key_mismatch_reselects(fixture_video, fake_llm, settings_tm
     job = s.workspace_dir / job_id_for(str(fixture_video))
     saved = json.loads((job / "picks.json").read_text(encoding="utf-8"))
     assert saved["key"] == {
-        "schema": 8,
+        "schema": 9,
         "clips": 1,
         "select_model": s.select_model,
         "min_clip_s": s.min_clip_s,
@@ -545,14 +545,14 @@ def test_run_job_passes_loud_seconds_to_render(fixture_video, fake_llm, settings
     assert seen == [set(range(20, 25))]
 
 
-def test_picks_schema_is_8_and_schema_7_picks_are_reselected(settings, tmp_path):
+def test_picks_schema_is_9_and_schema_8_picks_are_reselected(settings, tmp_path):
     from hookline.pipeline.run import PACKAGE_SCHEMA, PICKS_SCHEMA, _load_picks, _picks_key
 
-    # death-screen markers, encounter spreading and ignored drop_lines change the picks
-    assert PICKS_SCHEMA == 8 and _picks_key(settings, {})["schema"] == 8
-    assert PACKAGE_SCHEMA == 4  # death screens in the words, hook and specifics rules
+    # death-screen markers only for deaths (5 s, not 3 s loading screens) change the picks
+    assert PICKS_SCHEMA == 9 and _picks_key(settings, {})["schema"] == 9
+    assert PACKAGE_SCHEMA == 5  # names need two capitalised uses; specifics in questions
     key = _picks_key(settings, {})
-    old = {**key, "schema": 7}
+    old = {**key, "schema": 8}
     ppath = tmp_path / "picks.json"
     ppath.write_text(json.dumps({"key": old, "picks": []}), encoding="utf-8")
     logs: list[str] = []
@@ -669,9 +669,16 @@ def test_run_job_trims_idle_ends_before_render_and_records_the_source_bitrate(
     s = settings_tmp.model_copy(update={"clips": 1, "vertical": False, "captions": False})
     (clip,) = run_job(str(fixture_video), s, fake_llm, FakeTranscriber(duration=150))
     assert len(trims) == 1 and seen[0].end == pytest.approx(trims[0].end - 3)
-    # the hard length clamp (payoff allowance) and the quiet level reach the fit;
-    # interior idle gaps of the fitted pick reach the render
-    assert kws[0] == {"max_s": s.max_clip_s + 5.0, "quiet_db": s.silence_db}
+    # the hard length clamp (payoff allowance), the quiet level, the source's voiceless limit
+    # (talk: no facecam) and the shortest death-screen side reach the fit; interior idle
+    # gaps of the fitted pick reach the render
+    assert kws[0] == {
+        "max_s": s.max_clip_s + 5.0,
+        "quiet_db": s.silence_db,
+        "voiceless_s": 6.0,
+        "gameplay": False,
+        "min_side_s": max(10.0, s.min_clip_s),
+    }
     assert gaps == [seen[0]] and seen_kw[0]["idle_gaps"] == [(25.0, 27.0)]
     # beats / Q-beat see every scare (flashes too) and the gameplay spikes
     signals = run_mod.Signals.model_validate_json(
@@ -684,6 +691,7 @@ def test_run_job_trims_idle_ends_before_render_and_records_the_source_bitrate(
     side = json.loads(clip.with_suffix(".json").read_text(encoding="utf-8"))
     assert "beat_spikes" in side and "scare_times" in side
     assert side["source_video_kbps"] > 0
+    assert side["voiceless_limit_s"] == 6.0  # the audit's Q-voiceless: a talk source
 
 
 # --- signals cache --------------------------------------------------------------------------------

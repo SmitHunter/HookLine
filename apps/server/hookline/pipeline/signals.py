@@ -22,8 +22,10 @@ SCARE_MARKER = "\u26a1scare"
 # A death / loading / menu screen or fade (`screen_runs`, talked over or not) of at least
 # SCREEN_MARKER_MIN_S, marked `\u2b1bscreen Ns` on the transcript line at or after it: the selector
 # sees where a game reset (a death, a respawn) and never splices two attempts across it.
+# The same length as a death inside a clip (`boundaries.DEATH_SCREEN_MIN_S`, which is this):
+# a shorter run is a loading screen or a fade, not a death, and goes unmarked.
 SCREEN_MARKER = "\u2b1bscreen"
-SCREEN_MARKER_MIN_S = 3.0
+SCREEN_MARKER_MIN_S = 5.0
 # signals.json format; a cached file below this version has its onsets recomputed (2: motion,
 # onsets and game-audio transients; 3: exact onset times, 0.3 s speech pad; 4: per-frame
 # screen flags; 5: screen chroma, cam masked). The VOD

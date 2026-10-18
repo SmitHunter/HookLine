@@ -3,12 +3,15 @@ idle (no speech, still picture) stretches off a clip's ends."""
 
 import logging
 import math
+import re
 from itertools import pairwise
 
 from hookline.config import Settings
 from hookline.models import ClipPick, Word
+from hookline.pipeline.layout import COVER_MIN_S
 from hookline.pipeline.signals import (
     LOW_MOTION,
+    SCREEN_MARKER_MIN_S,
     STATIC_MIN_S,
     Signals,
     loud_seconds,
@@ -386,10 +389,18 @@ def include_cause(pick: ClipPick, words: list[Word], signals: Signals) -> ClipPi
     return pick.model_copy(update=update)
 
 
-def _length(pick: ClipPick, words: list[Word], signals: Signals, quiet_db: float) -> float:
+def _length(
+    pick: ClipPick,
+    words: list[Word],
+    signals: Signals,
+    quiet_db: float,
+    voiceless_s: float | None = None,
+) -> float:
     """The pick's on-screen length before dead-air cuts and the end tail: its segments minus
-    its interior edit gaps (`edit_gaps`: idle, static screens, voiceless stretches)."""
-    gaps = edit_gaps(pick, words, signals, quiet_db, quiet=True)
+    its interior edit gaps (`edit_gaps`: idle, static screens, voiceless stretches over
+    `voiceless_s`, default VOICELESS_MAX_S)."""
+    limit = VOICELESS_MAX_S if voiceless_s is None else voiceless_s
+    gaps = edit_gaps(pick, words, signals, quiet_db, quiet=True, voiceless_s=limit)
     return pick.duration - sum(b - a for a, b in gaps)
 
 
@@ -414,6 +425,7 @@ def clamp_length(
     signals: Signals,
     max_s: float,
     quiet_db: float = QUIET_DB,
+    voiceless_s: float | None = None,
 ) -> ClipPick:
     """The final hard length clamp before render: `pick` (fitted from `original`) lasting at
     most `max_s` (max_clip_s plus the payoff allowance), counted without its interior idle
@@ -421,8 +433,9 @@ def clamp_length(
     original start, idle-trimmed); still over, the start moves to the earliest later sentence
     start (not a filler opener, not past the cold-open teaser) that fits, else the earliest
     later word that fits. `first_words` becomes the new opening sentence and
-    `declared_first_words` is cleared (Claude's opening is no longer in the clip). Logs."""
-    full = _length(pick, words, signals, quiet_db)
+    `declared_first_words` is cleared (Claude's opening is no longer in the clip). Lengths
+    count voiceless stretches over `voiceless_s` cut (`edit_gaps`). Logs."""
+    full = _length(pick, words, signals, quiet_db, voiceless_s)
     if full <= max_s + 1e-6:
         return pick
     if pick.start < original.start - 1e-6:
@@ -432,7 +445,7 @@ def clamp_length(
             pick.title, full, max_s, pick.start, uncaused.start,
         )  # fmt: skip
         pick = uncaused
-        full = _length(pick, words, signals, quiet_db)
+        full = _length(pick, words, signals, quiet_db, voiceless_s)
         if full <= max_s + 1e-6:
             return pick
     spoken = _spoken(pick, words)
@@ -448,7 +461,7 @@ def clamp_length(
     for kind, cands in (("sentence", clean), ("word", later)):
         for i in cands:
             out = _front_trimmed(pick, spoken, i)
-            length = _length(out, words, signals, quiet_db)
+            length = _length(out, words, signals, quiet_db, voiceless_s)
             if length <= max_s + 1e-6:
                 log.info(
                     "clip %r: length %.1fs over %.0fs; trimmed from the front to a %s start "
@@ -468,26 +481,35 @@ def fit_to_signals(
     signals: Signals,
     max_s: float | None = None,
     quiet_db: float = QUIET_DB,
+    voiceless_s: float | None = None,
+    gameplay: bool = False,
+    min_side_s: float | None = None,
 ) -> ClipPick:
-    """`keep_payoff_side` (a clip never spans a death screen; a clip it would reject is kept
-    as given: `run` rejects those before packaging), `include_cause` (else
+    """`keep_payoff_side` (a clip never spans a death screen; sides shorter than `min_side_s`
+    (default SIDE_MIN_S) are no clip; a clip it would reject is kept as given: `run` rejects those before
+    packaging), `include_cause` (else, on `gameplay` -- a stream with a facecam --
     `include_cause_sound`), then `trim_idle`, then `avoid_static`: the clip shows what its
     reaction reacts to and neither idles on a still screen at either end nor starts or ends
-    on a static screen. A moved start has its opener re-checked (`recheck_opener`). With
-    `max_s`, then `extend_payoff` and `clamp_length` (its start re-checked, forward only): the
-    payoff scare just after the end is shown, and the clip lasts at most `max_s` (its interior
-    edit gaps not counted)."""
-    side = keep_payoff_side(pick, words, signals) or pick
+    on a static screen. A start moved off `pick`'s has its opener re-checked
+    (`recheck_opener`) -- not one the cause moved onto its reaction. With `max_s`, then
+    `extend_payoff` and `clamp_length` (its start re-checked, forward only): the payoff scare
+    just after the end is shown, and the clip lasts at most `max_s` (its interior edit gaps,
+    voiceless stretches over `voiceless_s` -- default VOICELESS_GAME_S on `gameplay`, else
+    VOICELESS_MAX_S -- not counted)."""
+    if voiceless_s is None:
+        voiceless_s = VOICELESS_GAME_S if gameplay else VOICELESS_MAX_S
+    side = keep_payoff_side(pick, words, signals, min_s=min_side_s or SIDE_MIN_S) or pick
     caused = include_cause(side, words, signals)
-    if caused is side:
+    if caused is side and gameplay:
         caused = include_cause_sound(side, words, signals)
     out = trim_idle(caused, words, signals, quiet_db)
     out = avoid_static(out, words, signals)
-    if abs(out.start - side.start) > 1e-6:
+    on_cause = caused is not side and abs(out.start - caused.start) < 1e-6
+    if abs(out.start - pick.start) > 1e-6 and not on_cause:
         out = recheck_opener(out, words, signals)
     if max_s is not None:
-        out = extend_payoff(out, words, signals, max_s, quiet_db)
-        clamped = clamp_length(out, side, words, signals, max_s, quiet_db)
+        out = extend_payoff(out, words, signals, max_s, quiet_db, voiceless_s)
+        clamped = clamp_length(out, side, words, signals, max_s, quiet_db, voiceless_s)
         if abs(clamped.start - out.start) > 1e-6:
             clamped = recheck_opener(clamped, words, signals, back=False)
         out = clamped
@@ -527,10 +549,12 @@ PAYOFF_PUNCHLINE_S = 1.5
 PAYOFF_SHOUT_WORDS = 4
 # The catch: an extension keeps at least PAYOFF_CATCH_S after the scare (the reaction), or is
 # not made. When a death screen follows the scare, a voiced reaction (a word within
-# PAYOFF_CATCH_S of it) still gets PAYOFF_CATCH_S (the cam shows it over the screen); without
-# one the clip ends PAYOFF_SCREEN_CATCH_S after the scare.
+# PAYOFF_CATCH_S of it) still gets PAYOFF_CATCH_S, and runs a whole cover (layout.COVER_MIN_S)
+# into the screen: the cam shows the reaction over it. Without one the clip ends before the
+# screen, never less than PAYOFF_MIN_CATCH_S after the scare (else no extension): a death
+# screen too short to cover is never shown.
 PAYOFF_CATCH_S = 1.5
-PAYOFF_SCREEN_CATCH_S = 0.5
+PAYOFF_MIN_CATCH_S = 0.2
 # A screen run starts somewhere in its first flagged 4 fps frame: an end stays this far clear.
 STATIC_EDGE_S = 0.25
 
@@ -590,7 +614,9 @@ def avoid_static(pick: ClipPick, words: list[Word], signals: Signals) -> ClipPic
     on one moves to the first sentence start after it (its opening becomes `first_words`); an
     end on one moves STATIC_EDGE_S before the screen's start -- or, with a word running into
     the screen, to min(the word's end, the screen's start): pass voice-clamped words
-    (`render.voiced_words`), a DTW-held end is not voice. Logs."""
+    (`render.voiced_words`), a DTW-held end is not voice; `last_words` follows. An end after
+    words said over the screen is the reaction the side before a death screen keeps
+    (`keep_payoff_side`, `_closing_catch`): left alone, the cam covers the screen. Logs."""
     out = pick
     for lo, hi in static_runs(signals, words):
         if lo - 1e-6 <= out.start < hi:
@@ -607,7 +633,9 @@ def avoid_static(pick: ClipPick, words: list[Word], signals: Signals) -> ClipPic
                     pick.title, lo, hi, out.start, new.start,
                 )  # fmt: skip
                 out = new
-        if lo < out.end <= hi + 1e-6 and lo > out.start:
+        over = [w.end for w in words if lo - 1e-6 <= w.start < out.end]
+        reacting = bool(over) and out.end - max(over) <= PAYOFF_CATCH_S + 1e-6
+        if lo < out.end <= hi + 1e-6 and lo > out.start and not reacting:
             end = lo - STATIC_EDGE_S
             for w in words:
                 if w.start < lo - STATIC_EDGE_S < w.end:
@@ -616,8 +644,18 @@ def avoid_static(pick: ClipPick, words: list[Word], signals: Signals) -> ClipPic
                 "clip %r: ends on a static screen %.2f-%.2fs; end %.2f -> %.2f",
                 pick.title, lo, hi, out.end, end,
             )  # fmt: skip
-            out = out.model_copy(update={"end": round(end, 3)})
+            out = _ended(out, words, round(end, 3))
     return out
+
+
+def _ended(pick: ClipPick, words: list[Word], end: float) -> ClipPick:
+    """`pick` ending at `end`, its last sentence there as `last_words` (unchanged when no word
+    is left), its drops past the end gone."""
+    update: dict = {"end": end, "drops": [d for d in pick.drops if d[1] <= end]}
+    kept = [w for w in _spoken(pick, words) if w.start < end - 1e-6]
+    if kept:
+        update["last_words"] = _sentence_text(_last_sentence(kept))
+    return pick.model_copy(update=update)
 
 
 def _voiceless_keep(
@@ -745,20 +783,26 @@ def extend_payoff(
     signals: Signals,
     max_s: float,
     quiet_db: float = QUIET_DB,
+    voiceless_s: float | None = None,
 ) -> ClipPick:
-    """A clip ending just before its payoff: the first scare (`scare_times`) within
-    PAYOFF_SCARE_S after its end, with no static screen between, moves the end to
-    PAYOFF_REACT_S after the scare -- or to the end of the sentence said in that time (at
-    most PAYOFF_SAID_MAX_S after the scare) -- never mid-word. A death screen after the scare
-    (`screen_runs` of at least STATIC_MIN_S) ends it STATIC_EDGE_S before the screen, but
-    never less than PAYOFF_SCREEN_CATCH_S after the scare, or, with the streamer reacting
-    (a word within PAYOFF_CATCH_S of the scare), PAYOFF_CATCH_S after it, over the screen.
-    A clip already ending on a punchline (`_ends_on_punchline`) is extended only to a scare
-    at most PAYOFF_PUNCHLINE_S after its last spoken word, and never when the extension adds
-    a new spoken sentence. Shortened in 0.5 s steps (each moved off a word, earlier) to fit
-    `max_s` (counted without `edit_gaps`); not made when even the catch (PAYOFF_CATCH_S after
-    the scare, or PAYOFF_SCREEN_CATCH_S before a silent death screen) does not fit. Logs."""
-    scares = scare_times(signals)
+    """A clip ending just before its payoff: the first scare (`scare_times`; none on a screen
+    already running, `screen_runs`: a stinger over the death screen is no payoff) within
+    PAYOFF_SCARE_S after its end, with no static screen starting between (from the end on),
+    moves the end to PAYOFF_REACT_S after the scare -- or to the end of the sentence said in
+    that time (at most PAYOFF_SAID_MAX_S after the scare) -- never mid-word. A death screen
+    after the scare (`screen_runs` of at least STATIC_MIN_S): with the streamer reacting (a
+    word within PAYOFF_CATCH_S of the scare) the end runs on over it at least PAYOFF_CATCH_S
+    after the scare and COVER_MIN_S + STATIC_EDGE_S into the screen (the render covers the
+    screen with the cam); without one the clip ends STATIC_EDGE_S before the screen (at the
+    latest on its first flagged frame) -- not extended when that leaves less than
+    PAYOFF_MIN_CATCH_S after the scare. A clip already ending on a punchline
+    (`_ends_on_punchline`) is extended only to a scare at most PAYOFF_PUNCHLINE_S after its
+    last spoken word, and never when the extension adds a new spoken sentence. Shortened in
+    0.5 s steps (each moved off a word, earlier) to fit `max_s` (counted without
+    `edit_gaps`, voiceless stretches over `voiceless_s`); not made when even the catch does
+    not fit. Logs."""
+    screens = screen_runs(signals)
+    scares = [t for t in scare_times(signals) if not any(lo <= t < hi for lo, hi in screens)]
     scare = next((t for t in scares if pick.end < t <= pick.end + PAYOFF_SCARE_S), None)
     if scare is None:
         return pick
@@ -772,7 +816,7 @@ def extend_payoff(
         )  # fmt: skip
         return pick
     runs = static_runs(signals, words)
-    if any(pick.end < lo < scare for lo, _ in runs):
+    if any(pick.end - 1e-6 <= lo < scare for lo, _ in runs):
         return pick
     target = scare + PAYOFF_REACT_S
     said = sorted((w for w in words if scare <= w.start < target), key=lambda w: w.start)
@@ -785,11 +829,21 @@ def extend_payoff(
     floor = scare + PAYOFF_CATCH_S
     if screen is not None and screen < target:
         if any(scare - CAUSE_REACT_S <= w.start <= scare + PAYOFF_CATCH_S for w in words):
-            target = max(target, floor)  # the streamer's reaction, on the cam over the screen
+            # the streamer's reaction, on the cam over the screen: a whole cover of it
+            floor = max(floor, screen + COVER_MIN_S + STATIC_EDGE_S)
+            target = max(target, floor)
             screen = None
         else:
-            target = max(min(target, screen - STATIC_EDGE_S), scare + PAYOFF_SCREEN_CATCH_S)
-            floor = min(floor, scare + PAYOFF_SCREEN_CATCH_S)
+            target = min(target, screen - STATIC_EDGE_S)
+            if target < scare + PAYOFF_MIN_CATCH_S:
+                target = min(screen, scare + PAYOFF_REACT_S)  # its first flagged frame
+            if target < scare + PAYOFF_MIN_CATCH_S - 1e-6:
+                log.info(
+                    "clip %r: payoff scare at %.2fs runs straight into a death screen; not "
+                    "extended", pick.title, scare,
+                )  # fmt: skip
+                return pick
+            floor = target
     target = round(_off_words(target, words, screen, earlier=False), 3)
     if punchline and any(pick.end < w.start < target for w in words):
         log.info(
@@ -799,7 +853,7 @@ def extend_payoff(
         return pick
     while target >= floor - 1e-6:
         out = pick.model_copy(update={"end": target})
-        if _length(out, words, signals, quiet_db) <= max_s + 1e-6:
+        if _length(out, words, signals, quiet_db, voiceless_s) <= max_s + 1e-6:
             log.info(
                 "clip %r: payoff scare at %.2fs just after the end; end %.2f -> %.2f",
                 pick.title, scare, pick.end, target,
@@ -818,7 +872,7 @@ def extend_payoff(
 # A screen run (`signals.screen_runs`, talked over or not) at least this long wholly inside a
 # clip is a death / respawn: the clip keeps one side of it. A side shorter than SIDE_MIN_S
 # (from its first word, or the clip's start, to its end) is no clip.
-DEATH_SCREEN_MIN_S = 5.0
+DEATH_SCREEN_MIN_S = SCREEN_MARKER_MIN_S  # the selector's screen markers: the same deaths
 SIDE_MIN_S = 10.0
 # A reaction said over the death screen (its first word within this of the screen's start,
 # each next word within this of the one before) stays with the side before it.
@@ -864,17 +918,35 @@ def _sides(
     return sides
 
 
-def keep_payoff_side(pick: ClipPick, words: list[Word], signals: Signals) -> ClipPick | None:
+_BEAT_TIME_RE = re.compile(r"@\s*(-?\d+(?:\.\d+)?)\s*s")
+
+
+def _beats_within(beats: list[str], start: float, end: float) -> list[str]:
+    """The `edit_beats` ("zoom: 'word' @ 52.3s") timed inside [start, end] (untimed kept)."""
+    out = []
+    for b in beats:
+        m = _BEAT_TIME_RE.search(b)
+        if m is None or start - 1e-6 <= float(m.group(1)) <= end + 1e-6:
+            out.append(b)
+    return out
+
+
+def keep_payoff_side(
+    pick: ClipPick, words: list[Word], signals: Signals, min_s: float = SIDE_MIN_S
+) -> ClipPick | None:
     """A clip spanning a death / respawn screen (`screen_runs` of at least DEATH_SCREEN_MIN_S
     wholly inside it) splices two attempts: keep only the side (between screens) holding the
     payoff -- scored by its scares (1 each, none on a screen), loud seconds (SIDE_LOUD_SCORE
     each) and, for the side holding the clip's end and its last words, SIDE_PAYOFF_SCORE; a
-    tie goes to the later side -- among the sides lasting at least SIDE_MIN_S with words. A
-    side after a screen starts on its first sentence (`first_words` follows,
-    `declared_first_words` is cleared), a side before one ends with the reaction said over
-    it (`last_words` follows), and a cold open outside the kept side is dropped. None
-    (logged) when no side is viable: the clip is rejected. `pick` itself when it spans no
-    death screen. Logs."""
+    tie goes to the later side -- among the sides lasting at least `min_s` (`run` passes
+    max(SIDE_MIN_S, min_clip_s)) with words. A side after a screen starts on its first
+    sentence start (a sentence begun over the screen is skipped; `first_words` follows,
+    `declared_first_words` is cleared) and has its opener re-checked (`recheck_opener`,
+    forward: no reply opener); a side before one ends with the reaction said over it
+    (`last_words` follows), at least COVER_MIN_S + STATIC_EDGE_S into the screen (a whole
+    cam cover of it); a cold open outside the kept side is dropped, the opener guard's move
+    (`opener_moved`) cleared and the `edit_beats` outside it dropped. None (logged) when no
+    side is viable: the clip is rejected. `pick` itself when it spans no death screen. Logs."""
     runs = screen_runs(signals)
     deaths = [
         (lo, hi)
@@ -890,11 +962,16 @@ def keep_payoff_side(pick: ClipPick, words: list[Word], signals: Signals) -> Cli
     best: tuple[float, float, int] | None = None
     for k, (a, b) in enumerate(sides):
         ws = [w for w in spoken if a - 1e-6 <= w.start < b]
-        if k:  # after a screen: from its first sentence start
-            i = next((i for i, w in enumerate(ws) if i == 0 or _sentence_start(ws[i - 1], w)), 0)
-            ws = ws[i:]
+        if k and ws:  # after a screen: from its first sentence start
+            j = spoken.index(ws[0])
+            prev = spoken[j - 1] if j else None
+            i = next(
+                (i for i, w in enumerate(ws) if _sentence_start(ws[i - 1] if i else prev, w)),
+                None,
+            )
+            ws = ws[i:] if i is not None else []
         begin = ws[0].start if k and ws else a
-        if not ws or b - begin < SIDE_MIN_S - 1e-6:
+        if not ws or b - begin < min_s - 1e-6:
             continue
         score = sum(1.0 for t in scares if begin <= t < b)
         score += SIDE_LOUD_SCORE * sum(1 for sec in loud if begin <= sec < b)
@@ -905,18 +982,21 @@ def keep_payoff_side(pick: ClipPick, words: list[Word], signals: Signals) -> Cli
     if best is None:
         log.warning(
             "clip %r: spans a death screen (%s) and no side lasts %.0fs with speech; rejected",
-            pick.title, where, SIDE_MIN_S,
+            pick.title, where, min_s,
         )  # fmt: skip
         return None
     _, begin, k = best
     end = sides[k][1]
-    out = pick
+    if k < len(deaths) and end > deaths[k][0] + 1e-6:  # a reaction over the screen
+        end = max(end, min(deaths[k][0] + COVER_MIN_S + STATIC_EDGE_S, deaths[k][1]))
+    out = pick.model_copy(update={"opener_moved": None})
     if k:
         out = _front_trimmed(out, spoken, next(i for i, w in enumerate(spoken) if w.start == begin))
     if end < pick.end - 1e-6:
         kept = [w for w in spoken if out.start - 1e-6 <= w.start < end]
         update = {"end": round(end, 3), "drops": [d for d in out.drops if d[1] <= end]}
         out = out.model_copy(update={**update, "last_words": _sentence_text(_last_sentence(kept))})
+    out = out.model_copy(update={"edit_beats": _beats_within(out.edit_beats, out.start, out.end)})
     teaser = out.cold_open
     if teaser and not (out.start - 1e-6 <= teaser[0] and teaser[1] <= out.end + 1e-6):
         out = out.model_copy(update={"cold_open": None})
@@ -924,6 +1004,8 @@ def keep_payoff_side(pick: ClipPick, words: list[Word], signals: Signals) -> Cli
         "clip %r: spans a death screen (%s); kept the side %.2f-%.2fs holding the payoff",
         pick.title, where, out.start, out.end,
     )  # fmt: skip
+    if k:
+        out = recheck_opener(out, words, signals, back=False)
     return out
 
 
@@ -1008,12 +1090,17 @@ def recheck_opener(
     context opener (`select._bad_opener`) moved: back onto the sentence before it (the turn it
     answers) when that starts within OPENER_BACK_S and off a static screen (with `back`),
     else forward to the next sentence start within OPENER_FORWARD_S that opens cleanly and
-    leaves OPENER_MIN_S of clip. Kept (logged) when neither exists. Logs each move."""
+    leaves OPENER_MIN_S of clip. Kept (logged) when neither exists. An opening said from
+    CAUSE_REACT_S before a scare to PAYOFF_CATCH_S after it ("No, no, no, no!") is the
+    reaction to it, never a reply: kept. Logs each move."""
     spoken = _spoken(pick, words)
     if not spoken:
         return pick
     opening = _first_sentence(spoken)
     if not _weak_opening(opening):
+        return pick
+    first = spoken[0].start
+    if any(t - CAUSE_REACT_S <= first <= t + PAYOFF_CATCH_S for t in scare_times(signals)):
         return pick
     text = _sentence_text(opening)
     before = sorted((w for w in words if w.start < spoken[0].start - 1e-6), key=lambda w: w.start)
