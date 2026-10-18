@@ -6,7 +6,13 @@ import os
 import re
 from pathlib import Path
 
-from hookline.captions.ass import build_ass, caption_y_for, early_until, hook_y_for
+from hookline.captions.ass import (
+    build_ass,
+    caption_words,
+    caption_y_for,
+    early_until,
+    hook_y_for,
+)
 from hookline.config import Settings
 from hookline.fsutil import atomic_write_text
 from hookline.media.audio import Envelope, detect_silences, energy_envelope
@@ -277,7 +283,9 @@ def render_clip(
     size = probe_size(inter)
     crop, bands = letterbox, None
 
-    out_words = remap_words(spoken, keep, fps)
+    seam = seam_time(keep, refined.cold_open)
+    # punctuation-only tokens never captioned; first word (and first after the seam) capitalised
+    out_words = caption_words(remap_words(spoken, keep, fps), seam)
     cuts = cut_times_for(keep)
     layouts: list[SceneLayout] = []
     steps: list[tuple[float, float]] = []
@@ -304,7 +312,6 @@ def render_clip(
     else:
         graph = _horizontal_graph(crop)
 
-    seam = seam_time(keep, refined.cold_open)
     out_label = "[vout]"
     if seam is not None:
         graph += f";[vout]{seam_flash(seam, fps)}[vseam]"

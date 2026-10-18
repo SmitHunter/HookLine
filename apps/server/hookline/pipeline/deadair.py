@@ -2,8 +2,9 @@ from hookline.models import Word
 
 MIN_RANGE = 0.05
 MIN_PIECE_S = 1.5  # a cut may not leave a kept piece shorter than this (choppy jump cuts)
-MIN_WORD_S = 0.05  # captions drop shorter words; edge-clipped words are stretched to this
+MIN_WORD_S = 0.05  # captions drop shorter words; edge-clipped survivors are stretched to this
 DEFAULT_FPS = 30.0  # for the one-frame sliver threshold when the clip's fps is unknown
+MIN_SURVIVING = 0.5  # an edge-clipped word keeping less than this share of itself is dropped
 
 
 def _word_free(
@@ -113,7 +114,8 @@ def remap_words(
     words: list[Word], keep: list[tuple[float, float]], fps: float | None = None
 ) -> list[Word]:
     """Move word timings onto the output timeline of the kept ranges. A word a range edge
-    clips to less than one frame (1 / fps; 30 fps when unknown) is left out of that range."""
+    clips to less than half of its duration, or to less than one frame (1 / fps; 30 fps when
+    unknown), is left out of that range: it belongs to the speech the cut removed."""
     frame = 1 / (fps or DEFAULT_FPS)
     out: list[Word] = []
     offset = 0.0
@@ -124,8 +126,11 @@ def remap_words(
             if end <= start:
                 continue
             clipped = word.start < k_start or word.end > k_end
-            if clipped and end - start < frame - 1e-9:
-                continue  # a sliver of a word cut away at the seam: no caption flash
+            if clipped and (
+                end - start < frame - 1e-9
+                or end - start < MIN_SURVIVING * (word.end - word.start) - 1e-9
+            ):
+                continue  # mostly cut away at the seam (a dropped line's last word): no flash
             if end - start < MIN_WORD_S and clipped:
                 # A cut clipped this word to a sliver: keep it visible, inside the range.
                 if word.end > k_end:

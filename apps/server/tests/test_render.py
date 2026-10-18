@@ -417,7 +417,7 @@ def test_render_clip_sidecar_caption_words_and_no_seam(
     )  # fmt: skip
     assert extras["seam"] is None and "drawbox=" not in _graph(final_argvs[0])
     words = extras["caption_words"]
-    assert words and words[0][0] <= 0.5 and words[0][2] == "line10"
+    assert words and words[0][0] <= 0.5 and words[0][2] == "Line10"  # capitalised
     assert all(len(w) == 3 and w[0] < w[1] for w in words)
     ass = tmp_path / "r" / "03.ass"
     assert "EARLIER" not in ass.read_text(encoding="utf-8")

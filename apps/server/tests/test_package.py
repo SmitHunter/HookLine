@@ -55,7 +55,7 @@ def _pick(**kw) -> ClipPick:
 def _answer(n=1, **kw):
     item = {
         "clip": n,
-        "hook_text": "Handed the keys on day three",
+        "hook_text": "Dishwasher trusted with the keys",
         "title": "The day-three keys",
         "post_caption": "His boss gave him the keys on day three. Trust or desperation?",
         "hashtags": ["#kitchenlife", "fyp", "restaurantstories", "linecook"],
@@ -86,7 +86,8 @@ def test_prompt_numbers_final_words_and_flags_low_probability_ones(fake_llm, set
     assert call["schema"] is PACKAGING_SCHEMA and call["system"] == PACKAGING_SYSTEM_PROMPT
     prompt = call["prompt"]
     assert "0:My 1:boss 2:handed" in prompt and "5:keys(?)" in prompt
-    assert "Maybe" not in prompt and "dishwasher." not in prompt
+    assert "Maybe" not in prompt  # the dropped line is not heard
+    assert "0:Before" not in prompt  # the line before the clip is context, never numbered
     assert "Dishwasher to head chef" in prompt  # selection-time packaging shown for reference
 
 
@@ -100,7 +101,7 @@ def test_cold_open_teaser_words_come_first_in_the_prompt(fake_llm, settings):
 def test_packaging_replaces_copy_and_cleans_it(fake_llm, settings):
     fake_llm.queue({"clips": [_answer(verdict="maybe")]})
     (p,) = package_clips([_pick()], WORDS, fake_llm, settings)
-    assert p.hook_text == "Handed the keys on day three"
+    assert p.hook_text == "Dishwasher trusted with the keys"
     assert p.title == "The day-three keys"
     assert p.post_caption.endswith("Trust or desperation?")
     assert p.hashtags == ["kitchenlife", "restaurantstories", "linecook"]
@@ -210,7 +211,7 @@ def test_apply_caption_fixes_replaces_matching_words_only():
 def test_packaging_rules_are_shared_with_selection():
     for needle in ('"Agree or disagree?"', "#fyp", "two plausible answers", "keyword-first"):
         assert needle in PACKAGING_SYSTEM_PROMPT and needle in SYSTEM_PROMPT, needle
-    for needle in ("give away the payoff", "true of the final words", "1:1"):
+    for needle in ("give away the payoff", "true of the source", "1:1"):
         assert needle in PACKAGING_SYSTEM_PROMPT, needle
 
 
@@ -271,3 +272,117 @@ def test_caption_fix_original_matches_ignoring_case_and_punctuation(fake_llm, se
     fake_llm.queue({"clips": [_answer(caption_fixes=fixes)]})
     (p,) = package_clips([_pick()], WORDS, fake_llm, settings)
     assert p.caption_fixes == [CaptionFix(start=14.0, end=14.4, original="three.", text="tree.")]
+
+
+# --- fix wave E: context, duplicate hooks, hashtags, search titles ---------------------------
+
+
+def test_prompt_shows_up_to_60s_of_context_before_the_clip(fake_llm, settings):
+    words = _seq("An hour ago we talked about rent.", 30.0) + _seq(
+        "The bakery opened in 1990.", 50.0
+    )
+    words += _seq("I ran it alone for a decade.", 100.0) + _seq("Then the landlord called.", 104.0)
+    p = _pick(start=100.0, end=106.0, first_words="I ran it alone for a decade.")
+    fake_llm.queue({"clips": [_answer()]})
+    package_clips([p], words, fake_llm, settings)
+    prompt = fake_llm.calls[0]["prompt"]
+    assert "CONTEXT ONLY" in prompt and "The bakery opened in 1990." in prompt
+    assert "rent." not in prompt  # 70 s before the clip: outside the window
+    assert prompt.index("The bakery") < prompt.index("0:I 1:ran")
+
+
+def test_context_starts_at_a_sentence_and_includes_the_lines_words_before_a_mid_line_start(
+    fake_llm, settings
+):
+    words = _seq("Before any of this I was a dishwasher.", 0.0) + _seq(
+        "Look, my boss called.", 10.0
+    )
+    p = _pick(start=10.5, end=12.0, first_words="my boss called.")  # mid-line, after "Look,"
+    fake_llm.queue({"clips": [_answer()]})
+    package_clips([p], words, fake_llm, settings)
+    prompt = fake_llm.calls[0]["prompt"]
+    assert "Before any of this I was a dishwasher. Look," in prompt and "0:my" in prompt
+
+
+def test_cold_open_source_sentence_is_shown_as_context(fake_llm, settings):
+    fake_llm.queue({"clips": [_answer()]})
+    package_clips([_pick(cold_open=(20.5, 23.9))], WORDS, fake_llm, settings)
+    prompt = fake_llm.calls[0]["prompt"]
+    assert "Teaser source" in prompt
+    line = next(x for x in prompt.splitlines() if x.startswith("Teaser source"))
+    assert line.endswith("Nobody had ever trusted me with a kitchen.")
+
+
+def test_packaging_prompt_rules_wave_e():
+    for needle in (
+        "true of the source",
+        "not contradicted by the cut",
+        "who, where or what",
+        "CONTEXT ONLY",
+        '"She says…"',
+        "first two spoken sentences",
+        "at most 60 characters",
+    ):
+        assert needle in PACKAGING_SYSTEM_PROMPT, needle
+    assert "said in the final words" not in PACKAGING_SYSTEM_PROMPT
+    item = PACKAGING_SCHEMA["properties"]["clips"]["items"]
+    assert "alt_hook_text" in item["required"]
+
+
+@pytest.mark.parametrize(
+    "hook",
+    [
+        '"Handed me the keys": day three',  # quotes the first line
+        "Boss handed keys on day three",  # token overlap
+        "Wait, was it day three?",  # the second sentence
+    ],
+)
+def test_hook_text_repeating_the_opening_falls_back_to_the_alternative(
+    fake_llm, settings, caplog, hook
+):
+    fake_llm.queue({"clips": [_answer(hook_text=hook, alt_hook_text="Nobody trusted the new guy")]})
+    with caplog.at_level(logging.INFO, logger="hookline.pipeline.package"):
+        (p,) = package_clips([_pick()], WORDS, fake_llm, settings)
+    assert p.hook_text == "Nobody trusted the new guy" and "repeats" in caplog.text
+    dup_alt = "Handed the keys on day three"
+    fake_llm.queue({"clips": [_answer(hook_text=hook, alt_hook_text=dup_alt)]})
+    (p,) = package_clips([_pick()], WORDS, fake_llm, settings)
+    assert p.hook_text == "Dishwasher to head chef"  # the selection-time hook
+
+
+def test_hook_text_against_the_teaser_and_first_clip_sentence(fake_llm, settings):
+    # with a cold open the viewer hears the teaser, then the clip's first line
+    p = _pick(cold_open=(20.0, 23.9), drops=[DROP])
+    fake_llm.queue({"clips": [_answer(hook_text="Trusted with a kitchen")]})
+    (out,) = package_clips([p], WORDS, fake_llm, settings)
+    assert out.hook_text == "Dishwasher to head chef"
+    fake_llm.queue({"clips": [_answer(hook_text="Maybe four days in")]})  # dropped: not heard
+    (out,) = package_clips([p], WORDS, fake_llm, settings)
+    assert out.hook_text == "Maybe four days in"
+
+
+def test_hashtags_keep_selection_tags_grounded_in_the_source_specific_first(fake_llm, settings):
+    p = _pick(hashtags=["dishwasher", "bosskeys", "history", "chefstories"])
+    tags = ["restaurantstories", "motivation", "kitchenlife"]
+    fake_llm.queue({"clips": [_answer(hashtags=tags)]})
+    (out,) = package_clips([p], WORDS, fake_llm, settings)
+    # grounded (a source word in the tag) first; "dishwasher" is said only in the context;
+    # selection's generic #history and ungrounded #chefstories are not carried over
+    assert out.hashtags == [
+        "kitchenlife",
+        "dishwasher",
+        "bosskeys",
+        "restaurantstories",
+        "motivation",
+    ]
+
+
+def test_packaged_search_title_clause_cut_then_selection_fallback(fake_llm, settings):
+    long = "Dishwasher Handed the Restaurant Keys on Day Three: Trust, Panic and a Kitchen"
+    fake_llm.queue({"clips": [_answer(search_title=long)]})
+    (p,) = package_clips([_pick()], WORDS, fake_llm, settings)
+    assert p.search_title == "Dishwasher Handed the Restaurant Keys on Day Three"
+    long = "Dishwasher Handed the Restaurant Keys on Day Three by a Desperate Owner Who Panicked"
+    fake_llm.queue({"clips": [_answer(search_title=long)]})
+    (p,) = package_clips([_pick()], WORDS, fake_llm, settings)
+    assert p.search_title == "Dishwasher Gets Restaurant Keys on Day Three"  # selection's

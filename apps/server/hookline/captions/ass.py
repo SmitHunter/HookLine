@@ -118,6 +118,35 @@ def _normalise(words: list[Word]) -> list[Word]:
     return out
 
 
+# Punctuation a transcriber emits as a word of its own ("--", "—", "…"): never a caption word.
+_PUNCT_ONLY = set(".,;:!?-–—…'\"“”‘’()[]")
+_SEAM_SLACK_S = 0.01
+
+
+def _capitalised(text: str) -> str:
+    """`text` with its first letter upper-cased, unless the word is mixed case ("iPhone")."""
+    i = next((k for k, c in enumerate(text) if c.isalpha()), None)
+    if i is None or any(c.isupper() for c in text[i + 1 :]):
+        return text
+    return text[:i] + text[i].upper() + text[i + 1 :]
+
+
+def caption_words(words: list[Word], seam: float | None = None) -> list[Word]:
+    """The words as captioned: punctuation-only tokens dropped (the other words keep their
+    times), and the clip's first word and the first word at or after the cold-open `seam`
+    capitalised (a clip may start mid-sentence)."""
+    out = [w for w in words if not set(w.text.strip()) <= _PUNCT_ONLY]
+    firsts = {0} if out else set()
+    if seam is not None:
+        after = next((k for k, w in enumerate(out) if w.start >= seam - _SEAM_SLACK_S), None)
+        if after is not None:
+            firsts.add(after)
+    return [
+        w.model_copy(update={"text": _capitalised(w.text)}) if k in firsts else w
+        for k, w in enumerate(out)
+    ]
+
+
 BREAK_SLACK_S = 0.01  # a word starting this little before a break still starts after it
 BREAK_CARRY_S = 0.15  # a word running further past a break moves to the page after it
 

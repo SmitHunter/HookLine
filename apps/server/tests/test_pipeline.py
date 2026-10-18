@@ -200,7 +200,7 @@ def test_picks_cache_key_mismatch_reselects(fixture_video, fake_llm, settings_tm
     job = s.workspace_dir / job_id_for(str(fixture_video))
     saved = json.loads((job / "picks.json").read_text(encoding="utf-8"))
     assert saved["key"] == {
-        "schema": 5,
+        "schema": 6,
         "clips": 1,
         "select_model": s.select_model,
         "min_clip_s": s.min_clip_s,
@@ -503,12 +503,13 @@ def test_run_job_passes_loud_seconds_to_render(fixture_video, fake_llm, settings
     assert seen == [set(range(20, 25))]
 
 
-def test_picks_schema_is_5_and_schema_4_picks_are_reselected(settings, tmp_path):
-    from hookline.pipeline.run import PICKS_SCHEMA, _load_picks, _picks_key
+def test_picks_schema_is_6_and_schema_5_picks_are_reselected(settings, tmp_path):
+    from hookline.pipeline.run import PACKAGE_SCHEMA, PICKS_SCHEMA, _load_picks, _picks_key
 
-    assert PICKS_SCHEMA == 5 and _picks_key(settings, {})["schema"] == 5
+    assert PICKS_SCHEMA == 6 and _picks_key(settings, {})["schema"] == 6
+    assert PACKAGE_SCHEMA == 3  # wave E: context, hook/hashtag/search-title checks
     key = _picks_key(settings, {})
-    old = {**key, "schema": 4}
+    old = {**key, "schema": 5}
     ppath = tmp_path / "picks.json"
     ppath.write_text(json.dumps({"key": old, "picks": []}), encoding="utf-8")
     logs: list[str] = []
@@ -545,7 +546,7 @@ def test_packaging_pass_runs_once_and_fixes_captions(
     (fix,) = side["caption_fixes"]
     assert (fix["original"], fix["text"], fix["start"]) == ("says", "sails", 30.75)
     texts = [w[2] for w in side["caption_words"]]
-    assert texts[:2] == ["line10", "sails"] and texts.count("says") == 6
+    assert texts[:2] == ["Line10", "sails"] and texts.count("says") == 6
     job = s.workspace_dir / job_id_for(str(fixture_video))
     assert (job / "package.json").exists() and (job / "package_raw.json").exists()
     run_job(str(fixture_video), s, fake_llm, t)  # cached: neither selection nor packaging

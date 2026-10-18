@@ -102,15 +102,35 @@ def test_silence_split_by_word_only_cuts_long_pieces():
 
 
 def test_remap_keeps_word_clipped_to_a_sliver():
-    # 40 ms kept (over one 30 fps frame): stretched to 50 ms, inside the range
-    out = remap_words([w(1.0, 1.5, "didn't")], [(0.0, 1.04)])
+    # 40 ms of a 60 ms word kept (over half, over one 30 fps frame): stretched to 50 ms
+    out = remap_words([w(1.0, 1.06, "didn't")], [(0.0, 1.04)])
     assert len(out) == 1 and out[0].end - out[0].start == pytest.approx(0.05)
     assert out[0].end <= 1.04 + 1e-9
 
 
 def test_remap_sliver_at_range_start_extends_forward_within_range():
-    out = remap_words([w(0.5, 1.04, "x")], [(1.0, 2.0)])
+    out = remap_words([w(0.98, 1.04, "x")], [(1.0, 2.0)])
     assert (out[0].start, out[0].end) == pytest.approx((0.0, 0.05))
+
+
+@pytest.mark.parametrize(
+    ("word", "keep"),
+    [
+        ((28.0, 28.5, "alone."), [(20.0, 28.1), (30.0, 35.0)]),  # end of a range: 20% kept
+        ((29.6, 30.2, "up."), [(20.0, 28.0), (30.0, 35.0)]),  # start of a range: 33% kept
+    ],
+)
+def test_remap_drops_an_edge_word_when_under_half_of_it_survives(word, keep):
+    # real case: "alone." / "up." from dropped lines flashed as captions at the jump cut
+    out = remap_words([w(*word), w(25.0, 25.4, "kept"), w(31.0, 31.3, "too")], keep)
+    assert [x.text for x in out] == ["kept", "too"]
+
+
+def test_remap_keeps_an_edge_word_when_half_or_more_survives():
+    (out,) = remap_words([w(1.0, 1.4, "most")], [(0.0, 1.2)])  # exactly half
+    assert (out.start, out.end) == pytest.approx((1.0, 1.2))
+    (out,) = remap_words([w(0.9, 1.3, "most")], [(1.0, 2.0)])  # 75%
+    assert (out.start, out.end) == pytest.approx((0.0, 0.3))
 
 
 @pytest.mark.parametrize(
@@ -125,9 +145,10 @@ def test_remap_drops_a_word_clipped_to_under_one_frame(word, fps):
 
 def test_remap_one_frame_threshold_follows_the_fps():
     # 25 ms kept: under a 30 fps frame (33 ms) but over a 60 fps frame (17 ms)
+    # (of a 40 ms word: over half survives, so only the frame rule decides)
     keep = [(0.0, 1.025)]
-    assert remap_words([w(1.0, 1.5, "x")], keep, 30.0) == []
-    (out,) = remap_words([w(1.0, 1.5, "x")], keep, 60.0)
+    assert remap_words([w(1.0, 1.04, "x")], keep, 30.0) == []
+    (out,) = remap_words([w(1.0, 1.04, "x")], keep, 60.0)
     assert out.end - out.start == pytest.approx(0.05)
 
 

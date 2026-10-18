@@ -150,9 +150,14 @@ def test_burns_captions_in_emoji_space_dir(fixture_video, tmp_path):
 def test_word_clipped_to_40ms_by_a_cut_still_captioned():
     from hookline.pipeline.deadair import remap_words
 
-    words = [w(0.0, 0.4, "But"), w(0.5, 0.9, "I"), w(1.0, 1.5, "didn't")]
+    # 40 ms of a 70 ms word survives the cut (over half): stretched and captioned
+    words = [w(0.0, 0.4, "But"), w(0.5, 0.9, "I"), w(1.0, 1.07, "didn't")]
     cap = remap_words(words, [(0.0, 1.04), (1.6, 2.0)])
     assert "DIDN'T" in build_ass(cap, "", 1.5)
+    # 40 ms of a 500 ms word is the remnant of cut speech: not captioned
+    words[2] = w(1.0, 1.5, "didn't")
+    cap = remap_words(words, [(0.0, 1.04), (1.6, 2.0)])
+    assert "DIDN'T" not in build_ass(cap, "", 1.5)
 
 
 def _lay(kind, face_box=None):
@@ -670,3 +675,37 @@ def test_face_rects_use_the_measured_face_offset_and_zoom():
     zoomed = lay.model_copy(update={"zoom_cap": 1.12})
     ((z0, _, z1, _),) = face_rects(zoomed, 1.2)
     assert (z0 + z1) / 2 == pytest.approx(540 + 0.1 * 1080 * 1.12)
+
+
+# --- fix wave E: caption words ------------------------------------------------------------
+
+
+def test_caption_words_drop_punctuation_only_tokens_keeping_neighbour_timing():
+    from hookline.captions.ass import caption_words
+
+    words = [w(0, 0.3, "We"), w(0.3, 0.5, "--"), w(0.5, 0.8, "look,"), w(0.8, 0.9, "—")]
+    words += [w(1.0, 1.1, "…"), w(1.1, 1.4, "fine."), w(1.4, 1.5, "...")]
+    out = caption_words(words)
+    assert [(x.start, x.end, x.text) for x in out] == [
+        (0, 0.3, "We"),
+        (0.5, 0.8, "look,"),
+        (1.1, 1.4, "fine."),
+    ]
+
+
+def test_caption_words_keep_symbols_that_are_spoken():
+    from hookline.captions.ass import caption_words
+
+    texts = [x.text for x in caption_words([w(0, 1, "Rock"), w(1, 2, "&"), w(2, 3, "50%")])]
+    assert texts == ["Rock", "&", "50%"]
+
+
+def test_caption_words_capitalise_the_first_word_and_the_first_after_the_seam():
+    from hookline.captions.ass import caption_words
+
+    words = [w(0, 0.2, "--"), w(0.2, 0.5, '"the'), w(0.5, 0.9, "original"), w(0.9, 1.2, "deal.")]
+    words += [w(1.5, 1.8, "so"), w(1.8, 2.0, "we"), w(2.0, 2.3, "iPhone")]
+    out = caption_words(words, seam=1.5)
+    assert [x.text for x in out] == ['"The', "original", "deal.", "So", "we", "iPhone"]
+    assert caption_words([w(0, 1, "iPhone")])[0].text == "iPhone"  # mixed case is a name
+    assert caption_words([]) == []

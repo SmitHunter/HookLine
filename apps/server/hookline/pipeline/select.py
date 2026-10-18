@@ -52,7 +52,7 @@ ALL_SKIP_MESSAGE = "Claude rated every candidate as skip — the source may not 
 # Shared by selection and the packaging pass (pipeline/package.py). Every example in the
 # prompts is invented: examples lifted from a test video get copied back verbatim.
 PACKAGING_RULES = """\
-Everything in packaging must be literally true to the clip.
+Everything in packaging must be literally true to the clip and its source: never put words \nin the speaker's mouth.
 
 - `title`: short and specific, under 60 characters.
 - `hook_text`: on-screen text over the first seconds. 3–7 words that name the stake or the \
@@ -72,8 +72,11 @@ questions are banned: "Agree or disagree?", "Thoughts?", "What do you think?" an
 - `hashtags`: 3–5 specific tags, without the `#`, about the clip's actual topic, people or \
 game: never a neighbouring topic the clip does not discuss, and never a broad tag such as \
 #history or #life. Generic reach tags such as #fyp, #foryou or #viral are banned.
-- `search_title`: a keyword-first title for search, at most 70 characters, that leads with the \
+- `search_title`: a keyword-first title for search, at most 60 characters, that leads with the \
 searchable topic rather than a tease, and never ends on a dangling "for", "to" or "the".
+- Contested claims: when the speaker states a disputed fact (history, politics, health, a \
+number others contest) as settled, `title`, `hook_text` and `post_caption` attribute it to \
+them ("She says…", "He claims…") instead of stating it as fact.
 """
 
 SYSTEM_PROMPT = """\
@@ -133,6 +136,11 @@ skip only because of its opening.
 after a false start ("We were going to -- look, the bank called the loan that morning."), \
 copy `first_words` from the word where the hook begins ("the bank called the loan that \
 morning.") and the clip starts on that word.
+- Set up the hook's referents. When the hook line leans on a who, where or what that the \
+speaker introduced 5–15 seconds earlier, start on the setup sentence that introduces them, or \
+use a cold open: the hook line plays first as the teaser, then the clip runs from the setup. \
+For example (invented): "So I asked her, would you still open the shop on Sundays?" lands \
+only if the viewer has heard "My grandmother ran the corner bakery for forty years." first.
 - Cold opens. When a clip genuinely needs its setup but its strongest line comes later, set \
 `cold_open_words` to that later line, copied verbatim from the transcript: a complete thought \
 that finishes its sentence, without lead-ins such as "I think" or "the thing is". It plays \
@@ -145,10 +153,13 @@ on the start of the next topic. Before you fix `end_line`, read the next 20 seco
 it: if a more concrete or emotional line follows (the example, the number, the punchline), \
 extend the clip to include it, even past an interviewer's "Yeah." or "Right." that sits \
 between them. `last_words` is the verbatim last sentence heard, copied from the `end_line` \
-line. Prefer endings that echo the opening, so a replay loops naturally.
+line. Prefer endings that echo the opening, so a replay loops naturally. Never stop one \
+line short of the payoff to stay under the maximum length: when the payoff line ends within 8 \
+seconds of the line before it, the clip may run up to 5 seconds over the maximum to include it.
 - Length: prefer 20–40 seconds for talking heads; go longer, up to the maximum stated with \
-the request, only if the tension holds the whole way. Never exceed that maximum: if the \
-story needs more, start later, closer to the turn, or drop lines. A `reaction_peak` clip \
+the request, only if the tension holds the whole way. Never exceed that maximum (except the \
+payoff allowance above): if the story needs more, start later, closer to the turn, or drop \
+lines. A `reaction_peak` clip \
 may be as short as 12 seconds.
 - `drop_lines`: up to 3 line numbers strictly inside the clip (never `start_line` or \
 `end_line`) that are cut out with a jump cut: an aside, a self-correction ("Was that the \
@@ -200,6 +211,14 @@ car." puts the stake first and scores 22. An abstract policy or jargon claim, su
 "Zoning code section 12 exempts accessory units from the parking minimum.", scores about 14 \
 for `hook` and is a `maybe` at best, however much it matters: a stranger cannot feel the \
 stake until someone pays it.
+- A surprising fact that only lands with outside knowledge (the viewer must already know who \
+a company or person is and why it matters), such as "The first owners of the city's water \
+utility included a tyre maker.", scores about 14 for `hook` at most and loses `context` points.
+- A contested factual claim stated as fact raises `comment_risk` (people will argue in the \
+comments), and the packaging attributes it: "She says…", not the claim as fact.
+- A quotable thesis or mission line, a sentence a viewer would quote back or stitch, such as \
+"We don't fix bikes to sell bikes; we fix them so kids can get to school.", beats an abstract \
+policy statement on the same theme: weigh it up as a `bold_claim` when it stands on its own.
 
 ## Verdict
 
@@ -214,7 +233,8 @@ Use `skip` honestly; a source with no strong moments should get mostly skips.
 <<PACKAGING_RULES>>
 - `category`: one or two words for the content area, such as "gaming" or "relationships".
 - `comment_risk`: `high` when the clip invites creepy or harassing comments about the \
-speaker's appearance, `medium` when that is plausible, otherwise `low`.
+speaker's appearance, `medium` when that is plausible or when the clip states a contested \
+factual claim as fact (expect arguments), otherwise `low`.
 - `reason`: one or two sentences on why this moment works and what the payoff is.
 - `edit_beats`: a few editing cues at moments that matter, written exactly as \
 `zoom: '<word>' @ <t>s` or `emoji <emoji> @ <t>s`, where `<t>` is absolute seconds from the \
@@ -291,7 +311,7 @@ def _object(properties: dict) -> dict:
 
 _STRING = {"type": "string"}
 # Structured outputs reject maxLength, so the limit is stated (and enforced by _clip_title).
-SEARCH_TITLE = {"type": "string", "description": "Keyword-first, at most 70 characters."}
+SEARCH_TITLE = {"type": "string", "description": "Keyword-first, at most 60 characters."}
 
 SELECTION_SCHEMA: dict = _object(
     {
@@ -333,7 +353,11 @@ _WORDS_MIN_OVERLAP = 0.6
 _REANCHOR_RADIUS = 3
 _EXTEND_MAX_LINES = 2
 _EXTEND_MAX_S = 8.0
-_SEARCH_TITLE_MAX = 70
+_SEARCH_TITLE_MAX = 70  # the prompt asks for 60; over 70 the code cuts
+_SEARCH_TITLE_MIN = 25  # a clause cut leaving less than this is a stub, not a title
+_CLAUSE_BOUNDARIES = (":", " — ", " – ", " - ", ",", "|")
+_PAYOFF_OVER_S = 5.0  # a clip may run this far over max_clip_s to land its payoff line ...
+_PAYOFF_WITHIN_S = 8.0  # ... when that line ends within this long after the line before it
 _BANNED_HASHTAGS = {
     "fyp",
     "foryou",
@@ -478,7 +502,9 @@ def build_prompt(
     if min_s is not None and max_s is not None:
         parts.append(
             f"Each clip lasts {min_s:.0f}–{max_s:.0f} seconds. Never exceed {max_s:.0f} s; if "
-            "the story needs more, start later, closer to the turn."
+            "the story needs more, start later, closer to the turn. The only exception: a clip "
+            f"may run up to {_PAYOFF_OVER_S:.0f} s over to end on a payoff line that ends within "
+            f"{_PAYOFF_WITHIN_S:.0f} s of the line before it."
         )
     if exclude:
         ranges = "\n".join(f"- {format_timestamp(s)} to {format_timestamp(e)}" for s, e in exclude)
@@ -675,15 +701,36 @@ def _is_marked(sentence: Sentence, heat: frozenset[int] | set[int] | None) -> bo
     return any(sec in heat for sec in range(lo, hi))
 
 
+def _payoff_fits(src: _Source, first: int, last: int, target: int, raw: _RawClip) -> bool:
+    """Whether L{first}..L{target} fits max_clip_s (counted without drop_lines), or runs at
+    most 5 s over it with L{target} ending within 8 s of L{last}'s end (a payoff extension,
+    logged)."""
+    span, cap = _span(src, first, target, raw), src.settings.max_clip_s
+    if span <= cap:
+        return True
+    near = src.sentences[target].end - src.sentences[last].end <= _PAYOFF_WITHIN_S + 1e-9
+    if span <= cap + _PAYOFF_OVER_S + 1e-9 and near:
+        logger.info(
+            "clip %r: the payoff L%d runs the clip to %.1fs, over the %.0fs maximum",
+            raw.title,
+            target,
+            span,
+            cap,
+        )
+        return True
+    return False
+
+
 def _fix_ending(raw: _RawClip, first: int, last: int, src: _Source) -> int:
     """Never end on a backchannel (step back one line) unless the clip is a reaction peak or
     the line carries a loud / chat-spike marker (the nod is the payoff), and finish an
     unfinished last sentence by extending up to 2 lines / 8 s (within max_clip_s, counted
-    without drop_lines) to the first line with terminal punctuation. One backchannel line in
-    the way may be crossed when the line right after it finishes the sentence within 20 s
-    (the interviewer's "Yeah." before the payoff). Logs each adjustment."""
+    without drop_lines, or up to 5 s over it for a line ending within 8 s) to the first line
+    with terminal punctuation. One backchannel line in the way may be crossed when the line
+    right after it finishes the sentence within 20 s (the interviewer's "Yeah." before the
+    payoff). Logs each adjustment."""
     sents, toks = src.sentences, src.tokens
-    cap = src.settings.max_clip_s
+    cap = src.settings.max_clip_s + _PAYOFF_OVER_S
     if (
         last > first
         and _is_backchannel(toks[last])
@@ -704,7 +751,7 @@ def _fix_ending(raw: _RawClip, first: int, last: int, src: _Source) -> int:
                 and not _is_backchannel(toks[k])
                 and _is_finished(sents[k].text)
                 and sents[k].end - sents[last].end <= _EXTEND_ACROSS_S
-                and _span(src, first, k, raw) <= cap
+                and _payoff_fits(src, first, last, k, raw)
             ):
                 logger.info(
                     "clip %r: L%d is unfinished; extended to L%d across the backchannel L%d",
@@ -718,6 +765,8 @@ def _fix_ending(raw: _RawClip, first: int, last: int, src: _Source) -> int:
         if sents[j].end - sents[last].end > _EXTEND_MAX_S:
             break
         if _is_finished(sents[j].text):
+            if not _payoff_fits(src, first, last, j, raw):
+                break
             logger.info("clip %r: L%d is unfinished; extended to L%d", raw.title, last, j)
             return j
     logger.warning("clip %r: L%d is unfinished and could not be completed", raw.title, last)
@@ -1116,6 +1165,43 @@ def _clean_hashtags(tags: list[str], label: str) -> list[str]:
     return out[:5]
 
 
+def _clause_cut(text: str, limit: int = _SEARCH_TITLE_MAX) -> str:
+    """`text` cut at a clause boundary within `limit` characters, the strongest kind first
+    (":", then a dash, then ",", then "|"; the last of that kind), when that leaves at least
+    _SEARCH_TITLE_MIN characters; "" when there is none."""
+    for sep in _CLAUSE_BOUNDARIES:
+        i = text.rfind(sep, 0, limit + 1)
+        head = text[:i].rstrip(" ,;:-–—|") if i > 0 else ""
+        if len(head) >= _SEARCH_TITLE_MIN:
+            return head
+    return ""
+
+
+def _search_title(text: str, fallback: str = "", label: str = "") -> str:
+    """`text` when it fits _SEARCH_TITLE_MAX; over it, cut at its last clause boundary; else
+    `fallback` (the selection-time title) when it fits; else cut at a word boundary without a
+    dangling function word (logged: the title may read cut off)."""
+    text = " ".join(text.split())
+    if len(text) <= _SEARCH_TITLE_MAX:
+        return text
+    if cut := _clause_cut(text):
+        logger.info("clip %r: search_title %r cut at a clause to %r", label, text, cut)
+        return cut
+    fallback = " ".join(fallback.split())
+    if fallback and len(fallback) <= _SEARCH_TITLE_MAX:
+        logger.info("clip %r: search_title %r is too long; kept %r", label, text, fallback)
+        return fallback
+    cut = _clip_title(text)
+    logger.warning(
+        "clip %r: search_title %r has no clause boundary within %d characters; cut to %r",
+        label,
+        text,
+        _SEARCH_TITLE_MAX,
+        cut,
+    )
+    return cut
+
+
 def _clip_title(text: str, limit: int = _SEARCH_TITLE_MAX) -> str:
     """`text` cut at a word boundary to `limit` characters, never ending on a dangling
     function word ("... for", "... to the")."""
@@ -1397,7 +1483,7 @@ def _assemble(
         verdict=raw.verdict,
         post_caption=_check_caption(raw.post_caption, raw.title),
         hashtags=_clean_hashtags(raw.hashtags, raw.title),
-        search_title=_clip_title(raw.search_title),
+        search_title=_search_title(raw.search_title, label=raw.title),
         category=raw.category.strip(),
         comment_risk=raw.comment_risk,
         drops=drops,
@@ -1419,6 +1505,21 @@ def _guard_move(
         return line, None
     reason = f"L{first} is a weak opener ({src.sentences[first].text!r})"
     return line, OpenerMove(from_line=first, to_line=line, reason=reason)
+
+
+def _length_cap(raw: _RawClip, first: int, last: int, src: _Source) -> float:
+    """max_clip_s, or 5 s more when only the payoff line takes the clip over it: the clip
+    without L{last} (and any backchannel just before it) fits max_clip_s, and L{last} ends
+    within 8 s of that line (logged)."""
+    cap = src.settings.max_clip_s
+    prev = last - 1
+    while prev > first and _is_backchannel(src.tokens[prev]):
+        prev -= 1
+    if prev < first or _span(src, first, last, raw) <= cap or _span(src, first, prev, raw) > cap:
+        return cap
+    if _payoff_fits(src, first, prev, last, raw):
+        return cap + _PAYOFF_OVER_S
+    return cap
 
 
 def _to_pick(raw: _RawClip, src: _Source) -> ClipPick | None:
@@ -1470,7 +1571,7 @@ def _to_pick(raw: _RawClip, src: _Source) -> ClipPick | None:
         last = given_last
     offset = _mid_line_offset(raw, first, src)
     move = None
-    if _span(src, first, last, raw) > src.settings.max_clip_s:
+    if _span(src, first, last, raw) > _length_cap(raw, first, last, src):
         start_line = _trim_front(raw, first, last, src, min_s)
         if start_line is None:
             return None

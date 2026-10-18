@@ -923,7 +923,8 @@ def test_unfinished_ending_without_completion_is_kept_and_logged(settings, caplo
 
 
 def test_unfinished_ending_never_extends_past_max_clip_s(settings):
-    s = settings.model_copy(update={"max_clip_s": 30})  # L10-L17 ~ 29.2 s already
+    # L10-L18 is 32.45 s: more than the 5 s a payoff may run over max_clip_s
+    s = settings.model_copy(update={"max_clip_s": 25})
     assert _fix({17: "so the thing is...", 18: "it worked."}, s) == 17
 
 
@@ -1490,10 +1491,11 @@ def test_drop_lines_never_remove_the_cold_open(fake_llm, settings, caplog):
 
 def test_drops_count_toward_the_length_bounds(fake_llm, settings):
     tr = _lines_transcript({})
-    # L10-L23 spans 53.2 s (over the 50 s max); dropping L12 and L14 (4 s each) leaves 45.2 s
-    item = _line_item(10, 23, _FILLER.format(n=10), _FILLER.format(n=23), drop_lines=[12, 14])
+    # L10-L24 spans 57.2 s (over the 50 s max, even with the 5 s payoff allowance); dropping
+    # L12 and L14 (4 s each) leaves 49.2 s
+    item = _line_item(10, 24, _FILLER.format(n=10), _FILLER.format(n=24), drop_lines=[12, 14])
     (p,) = _one(tr, fake_llm, settings, item)
-    assert p.start == 40.0 and p.duration == pytest.approx(45.2)
+    assert p.start == 40.0 and p.duration == pytest.approx(49.2)
     item["drop_lines"] = []
     (p,) = _one(tr, fake_llm, settings, item)
     assert p.start > 40.0  # without drops it is trimmed from the front
@@ -1513,7 +1515,7 @@ def test_backchannel_crossing_needs_the_next_line_to_finish(settings):
 
 
 def test_backchannel_crossing_stays_within_max_length(settings):
-    s = settings.model_copy(update={"max_clip_s": 36})  # L10-L19 is 37.2 s
+    s = settings.model_copy(update={"max_clip_s": 31})  # L10-L19 is 37.2 s (over 31 + 5)
     texts = {17: "and what we found was...", 18: "Yeah.", 19: "the money was never there."}
     assert _fix(texts, s) == 17
 
@@ -1567,7 +1569,7 @@ def test_search_title_never_ends_on_a_function_word(text):
 
 def test_search_title_schema_states_the_limit():
     props = SELECTION_SCHEMA["properties"]["clips"]["items"]["properties"]
-    assert "70" in props["search_title"].get("description", "")
+    assert "60" in props["search_title"].get("description", "")  # code still caps at 70
 
 
 # --- fix wave C review round 1 ----------------------------------------------------------------
@@ -1627,15 +1629,15 @@ def test_start_falls_back_to_the_whole_line_when_the_cut_start_breaks_min_length
 
 
 def test_length_estimate_keeps_drops_restored_for_the_teaser(fake_llm, settings, caplog):
-    # L10-L23 is 53.2 s; dropping L15 would make it 49.2 s, but L15 holds the teaser, so the
-    # drop is restored: the clip is over 50 s and must be trimmed from the front
+    # L10-L24 is 57.2 s; dropping L15 would make it 53.2 s, but L15 holds the teaser, so the
+    # drop is restored: the clip is over 50 + 5 s and must be trimmed from the front
     teaser = "Rent doubled in one year for everyone."
     tr = _lines_transcript({15: teaser})
     item = _line_item(
-        10, 23, _FILLER.format(n=10), _FILLER.format(n=23), drop_lines=[15], cold_open_words=teaser
+        10, 24, _FILLER.format(n=10), _FILLER.format(n=24), drop_lines=[15], cold_open_words=teaser
     )
     (p,) = _one(tr, fake_llm, settings, item, caplog)
-    assert p.start == 44.0 and p.drops == [] and p.cold_open == (60.0, _end_of(tr, 15))
+    assert p.start == 48.0 and p.drops == [] and p.cold_open == (60.0, _end_of(tr, 15))
     assert p.end - p.start <= settings.max_clip_s
 
 
@@ -1745,3 +1747,116 @@ def test_whole_line_fallback_logs_each_drop_once(fake_llm, settings, caplog):
     assert p.start == 40.0 and "whole line" in caplog.text
     assert caplog.text.count("dropped L13") == 1
     assert caplog.text.count("L25 ignored") == 1
+
+
+# --- fix wave E: search titles, payoff allowance, prompt calibration --------------------------
+
+
+@pytest.mark.parametrize(
+    ("text", "want"),
+    [
+        (
+            "Rent Control, Zoning and Parking Minimums: What Small Landlords Keep Missing",
+            "Rent Control, Zoning and Parking Minimums",
+        ),
+        (
+            "How a Night-Shift Baker Built a Bakery Empire — From One Oven to Twelve Stores",
+            "How a Night-Shift Baker Built a Bakery Empire",
+        ),
+        (
+            "Night Shift Bakers Who Quit Before Sunrise | Flour Prices and Twelve Stores",
+            "Night Shift Bakers Who Quit Before Sunrise",
+        ),
+    ],
+)
+def test_search_title_over_the_cap_cuts_at_the_last_clause_boundary(text, want):
+    from hookline.pipeline.select import _search_title
+
+    assert len(text) > 70
+    assert _search_title(text, "Selection Title That Fits") == want
+
+
+def test_search_title_without_a_clause_boundary_falls_back_then_word_cuts(caplog):
+    from hookline.pipeline.select import _search_title
+
+    # the only boundary leaves an 18-character stub: not a title
+    text = "Night Shift Bakers, Flour Prices and the Twelve-Store Bakery Chain Nobody Expected"
+    assert _search_title(text, "Why Night Shift Bakers Quit") == "Why Night Shift Bakers Quit"
+    with caplog.at_level(logging.WARNING, logger="hookline.pipeline.select"):
+        out = _search_title(text, "", label="bakers")
+    assert len(out) <= 70 and text.startswith(out) and out.split()[-1] != "the"
+    assert "search_title" in caplog.text and "bakers" in caplog.text
+    assert _search_title("  Short  Title ", "x") == "Short Title"  # under the cap: as given
+
+
+def test_selection_search_title_uses_the_clause_cut(long_transcript, fake_llm, settings):
+    long = "Rent Control, Zoning and Parking Minimums: What Small Landlords Keep Missing"
+    (p,) = _one(long_transcript, fake_llm, settings, raw(30, 60, search_title=long))
+    assert p.search_title == "Rent Control, Zoning and Parking Minimums"
+
+
+def test_search_title_limit_is_60_in_the_prompt_and_schema():
+    props = SELECTION_SCHEMA["properties"]["clips"]["items"]["properties"]
+    assert "60" in props["search_title"]["description"]
+    assert "at most 60 characters" in SYSTEM_PROMPT
+
+
+def test_unfinished_ending_may_run_5s_over_max_for_a_payoff_within_8s(settings, caplog):
+    caplog.set_level(logging.INFO, logger="hookline.pipeline.select")
+    s = settings.model_copy(update={"max_clip_s": 30})  # L10-L18 is 32.45 s
+    assert _fix({17: "so the thing is...", 18: "it worked."}, s) == 18
+    assert "over the 30s maximum" in caplog.text
+    s = settings.model_copy(update={"max_clip_s": 27})  # 32.45 s is more than 5 s over
+    assert _fix({17: "so the thing is...", 18: "it worked."}, s) == 17
+
+
+def test_clip_over_max_keeps_its_start_when_only_the_payoff_line_runs_over(
+    fake_llm, settings, caplog
+):
+    tr = _lines_transcript({})  # L10-L21 is 45.2 s; L22 ends 4 s later (49.2 s)
+    item = _line_item(10, 22, _FILLER.format(n=10), _FILLER.format(n=22))
+    s = settings.model_copy(update={"max_clip_s": 46})
+    (p,) = _one(tr, fake_llm, s, item, caplog)
+    assert (p.start, p.end) == (40.0, _end_of(tr, 22)) and "payoff" in caplog.text
+    s = settings.model_copy(update={"max_clip_s": 43})  # L10-L21 alone is over: trimmed
+    (p,) = _one(tr, fake_llm, s, item)
+    assert p.start > 40.0 and p.end == _end_of(tr, 22)
+
+
+def test_build_prompt_states_the_payoff_allowance():
+    p = build_prompt("x", n=5, duration=900.0, exclude=[], min_s=20, max_s=50)
+    assert "up to 5 s over" in p and "within 8 s" in p
+
+
+def test_system_prompt_covers_wave_e():
+    for needle in (
+        "5–15 seconds earlier",
+        "outside knowledge",
+        "about 14",
+        '"She says…"',
+        "`comment_risk`",
+        "quotable",
+        "up to 5 seconds over",
+    ):
+        assert needle in SYSTEM_PROMPT, needle
+
+
+def test_wave_e_prompts_use_no_phrases_from_the_test_video():
+    from hookline.pipeline.package import PACKAGING_SYSTEM_PROMPT
+
+    for prompt in (SYSTEM_PROMPT, PACKAGING_SYSTEM_PROMPT):
+        low = prompt.lower()
+        for needle in (
+            "worth it to go to war",
+            "your husband",
+            "united fruit",
+            "cable company",
+            "public access",
+            "uvm",
+            "send-off",
+            "devour",
+            "making media",
+            "forces of capital",
+            "president's office",
+        ):
+            assert needle not in low, needle
