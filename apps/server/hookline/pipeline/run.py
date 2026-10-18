@@ -258,8 +258,10 @@ def _layout_profile(
     cached; None (per-clip detection) when it cannot be computed."""
     try:
         prof = layout_profile(job_dir, src, detector)
-    except (FFmpegError, ValueError, OSError) as e:
-        log(f"warning: layout profile failed ({e}); layouts are planned per clip")
+    except Exception as e:  # noqa: BLE001 - an optional analysis (e.g. MemoryError on 4K)
+        log(
+            f"warning: layout profile failed ({type(e).__name__}: {e}); layouts are planned per clip"
+        )
         return None
     if prof.cam is not None:
         log(f"[6/6] render: stream facecam at {prof.cam} px (fixed STACKED template)")

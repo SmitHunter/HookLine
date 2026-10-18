@@ -241,3 +241,63 @@ def test_classify_profile_scene_reuses_a_near_identical_previous_fit():
     far = (60 / 320, 0.0, 200 / 320, 1.0)
     lay = classify_profile_scene(0.0, 5.0, frames, (0, 0), wide, prof, None, prev_fit=far)
     assert lay.fit_src == pytest.approx((40 / 320, 0.0, 240 / 320, 1.0))
+
+
+# --- round 1: synthetic matrix (layout side) ------------------------------------------------
+
+
+def _textured_profile(seed: int = 0):
+    """A profile whose border ring (dark outer line, white border) and cam picture (a dim
+    room: values 0-60, i.e. mostly <= 40 gray) have structure, and its median frame."""
+    rng = np.random.default_rng(seed)
+    med = np.full((720, 1280), 30, np.uint8)
+    ox0, oy0, ox1, oy1 = PROFILE.outer
+    x0, y0, x1, y1 = PROFILE.cam
+    med[oy0:oy1, ox0:ox1] = 20
+    med[oy0 + 1 : oy1 - 1, ox0 + 1 : ox1 - 1] = 230
+    med[y0:y1, x0:x1] = rng.integers(0, 60, size=(y1 - y0, x1 - x0))
+    ring = ring_reference(med, PROFILE.outer)
+    ring_in = ring_reference(med, (x0 + 3, y0 + 3, x1 - 3, y1 - 3))
+    return PROFILE.model_copy(update={"ring": ring, "ring_in": ring_in}), med
+
+
+def test_classify_profile_scene_dark_frames_do_not_show_the_cam():
+    """A black / near-black screen (the cam hidden, a dark loading screen) matches the dim
+    points of the reference by value alone; with no structure it is not the cam."""
+    prof, med = _textured_profile()
+    wide = np.full((4, 180, 320), 12, np.uint8)
+    for level in (0, 12, 25):
+        dark = np.full((4, 720, 1280), level, np.uint8)
+        lay = classify_profile_scene(0.0, 5.0, dark, (0, 0), wide, prof, None)
+        assert lay.kind == "FIT_BLUR", level
+    # the cam itself, with sensor noise, still shows
+    rng = np.random.default_rng(1)
+    noisy = np.clip(med[None].astype(int) + rng.integers(-6, 7, size=(4, 720, 1280)), 0, 255)
+    lay = classify_profile_scene(0.0, 5.0, noisy.astype(np.uint8), (0, 0), wide, prof, None)
+    assert lay.kind == "STACKED"
+
+
+def test_hidden_scene_layout_tracks_a_just_chatting_face():
+    """A Just Chatting stretch of a profiled VOD (the overlay off, the streamer full frame):
+    a large face in most samples is followed (FACE_TRACK), not blurred-fitted; an in-game
+    character's small face or no face stays FIT_BLUR."""
+    from hookline.pipeline.layout import hidden_scene_layout
+    from hookline.vision.faces import Face
+
+    big = [(t * 0.25, [Face(0.42, 0.2, 0.16, 0.3, 0.95, 0.0, 0.3)]) for t in range(20)]
+    assert hidden_scene_layout(big, 0.0, 5.0, src_h=720).kind == "FACE_TRACK"
+    small = [(t * 0.25, [Face(0.6, 0.4, 0.04, 0.08, 0.9, 0.0, None)]) for t in range(20)]
+    assert hidden_scene_layout(small, 0.0, 5.0, src_h=720).kind == "FIT_BLUR"
+    assert hidden_scene_layout([(0.0, [])], 0.0, 5.0, src_h=720).kind == "FIT_BLUR"
+
+
+def test_pillarbox_rejects_a_dark_symmetric_vignette():
+    """A dark scene whose edges fade to black evenly (a vignette) has no hard picture edge:
+    not a pillarboxed cutscene."""
+    xx = np.arange(320)
+    ramp = np.clip(np.minimum(xx, 319 - xx) * 0.6 - 10, 0, 60).astype(np.uint8)
+    frames = np.repeat(np.repeat(ramp[None, None, :], 180, axis=1), 4, axis=0)
+    assert pillarbox(frames, []) is None
+    hard = np.zeros((4, 180, 320), np.uint8)
+    hard[:, :, 40:280] = 50
+    assert pillarbox(hard, []) == pytest.approx((40 / 320, 0, 240 / 320, 1))

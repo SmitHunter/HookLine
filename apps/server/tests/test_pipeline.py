@@ -724,3 +724,17 @@ def test_run_job_builds_the_layout_profile_once_and_passes_it_with_scares(
     assert len(built) == 1 and built[0][1].startswith("source")
     assert len(seen) == 2 and all(p is prof for p, _ in seen)
     assert all(isinstance(sc, list) for _, sc in seen)  # the VOD's game transients
+
+
+def test_layout_profile_failure_of_any_kind_falls_back_to_per_clip(tmp_path, monkeypatch):
+    """The profile is optional analysis: a MemoryError (a 4K VOD) or any bug in it logs a
+    warning and the clips are planned per clip, never a failed job."""
+    from hookline.pipeline import run as run_mod
+
+    def boom(job_dir, src, detector):
+        raise MemoryError("Unable to allocate 2.4 GiB")
+
+    monkeypatch.setattr(run_mod, "layout_profile", boom)
+    logs: list[str] = []
+    assert run_mod._layout_profile(tmp_path, tmp_path / "src.mp4", None, logs.append) is None
+    assert any("layout profile failed" in m and "MemoryError" in m for m in logs)

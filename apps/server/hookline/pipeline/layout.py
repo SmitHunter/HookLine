@@ -59,6 +59,14 @@ CAM_SHOWN = 0.5
 PILLAR_MIN = 0.05
 PILLAR_SYMMETRY = 0.03
 PILLAR_W = 320
+# ... with a hard picture edge: on each side, in some sample, the PILLAR_EDGE columns inside it
+# average >= PILLAR_STEP gray over the PILLAR_EDGE columns of bar outside it (a vignette fades)
+PILLAR_EDGE = 3
+PILLAR_STEP = 20.0
+# The cam hidden (BRB, a full-screen cutscene, a Just Chatting stretch with the overlay off):
+# a face at least JC_FACE_MIN of the frame tall in most samples is the streamer full frame
+# (`classify_scene`: FACE_TRACK / SPLIT); otherwise FIT_BLUR.
+JC_FACE_MIN = 0.2
 FIT_TRIM = 0.15  # an overlay at a fitted picture's side edge is cut off when it costs <= this
 # Full-cam reaction beats: the cam alone (whole, blurred background) for BEAT_S at the
 # strongest reaction peaks, starting BEAT_LEAD before the peak; at most MAX_BEATS per clip,
@@ -491,6 +499,13 @@ def pillarbox(frames: np.ndarray, keep_out: list[Box]) -> Box | None:
     left, right = int(cols[0]), w - 1 - int(cols[-1])
     if min(left, right) < PILLAR_MIN * w or abs(left - right) > PILLAR_SYMMETRY * w:
         return None
+    col_mean = frames.astype(np.float32).mean(axis=1)  # (n, W)
+    k = PILLAR_EDGE
+    lo, hi = left, w - right  # the picture's columns [lo, hi)
+    step_l = col_mean[:, lo : lo + k].mean(axis=1) - col_mean[:, max(lo - k, 0) : lo].mean(axis=1)
+    step_r = col_mean[:, hi - k : hi].mean(axis=1) - col_mean[:, hi : hi + k].mean(axis=1)
+    if step_l.max() < PILLAR_STEP or step_r.max() < PILLAR_STEP:
+        return None  # no hard edge: a dark scene fading to black at its sides
     return (left / w, 0.0, (w - left - right) / w, 1.0)
 
 
@@ -527,6 +542,19 @@ def classify_profile_scene(
     return SceneLayout(start=start, end=end, kind="STACKED", fit_src=fit, **tpl)
 
 
+def hidden_scene_layout(
+    samples: list[tuple[float, list[Face]]], start: float, end: float, src_h: int | None = None
+) -> SceneLayout:
+    """A profiled stream's scene with the cam hidden: the streamer full frame (Just Chatting,
+    the overlay off) when `classify_scene` tracks a face (FACE_TRACK / SPLIT) at least
+    JC_FACE_MIN of the frame tall (median); else FIT_BLUR (BRB, a cutscene, in-game faces)."""
+    lay = classify_scene(samples, start, end, src_h=src_h)
+    big = lay.face_box is not None and lay.face_box[1] >= JC_FACE_MIN
+    if lay.kind in ("FACE_TRACK", "SPLIT") and big:
+        return lay
+    return SceneLayout(start=start, end=end, kind="FIT_BLUR")
+
+
 def _gray(frames: list[np.ndarray]) -> np.ndarray:
     return np.stack(
         [
@@ -549,11 +577,14 @@ def plan_profile_layouts(
     profile: LayoutProfile,
     crop: Crop | None = None,
     sample_every: float = PROFILE_SAMPLE_S,
+    detector: _Detector | None = None,
 ) -> list[SceneLayout]:
     """One layout per scene of a profiled stream (`classify_profile_scene`), identical
     neighbours merged: the cam is never re-detected, only checked for showing (its border)
-    and the gameplay for pillarboxing. `video` has the profile's source size; `crop` is the
-    letterbox / overlay crop the reframe applies."""
+    and the gameplay for pillarboxing. A scene with the cam hidden is checked for the
+    streamer full frame with the `detector` (`hidden_scene_layout`: Just Chatting).
+    `video` has the profile's source size; `crop` is the letterbox / overlay crop the
+    reframe applies."""
     rw, rh, rx, ry = _ring_box(profile)
     layouts = []
     for start, end in _scenes(video):
@@ -570,10 +601,31 @@ def plan_profile_layouts(
             layouts.append(SceneLayout(start=start, end=end, kind="STACKED", **tpl))
             continue
         prev = layouts[-1].fit_src if layouts else None
-        layouts.append(
-            classify_profile_scene(start, end, ring, (rx, ry), wide, profile, crop, prev)
-        )
+        lay = classify_profile_scene(start, end, ring, (rx, ry), wide, profile, crop, prev)
+        if lay.kind == "FIT_BLUR" and detector is not None:
+            lay = _hidden_scene(video, detector, start, end, crop, profile)
+        layouts.append(lay)
     return merge_same(layouts)
+
+
+def _hidden_scene(
+    video: Path,
+    detector: _Detector,
+    start: float,
+    end: float,
+    crop: Crop | None,
+    profile: LayoutProfile,
+) -> SceneLayout:
+    """`hidden_scene_layout` from face samples every SAMPLE_EVERY s (FIT_BLUR when they can't
+    be read)."""
+    times = _sample_times(start, end, SAMPLE_EVERY)
+    try:
+        frames = sample_frames(video, times, crop=crop)
+    except FFmpegError:
+        return SceneLayout(start=start, end=end, kind="FIT_BLUR")
+    samples = [(t, detector.detect(f)) for t, f in zip(times, frames, strict=True)]
+    src_h = crop[1] if crop else profile.size[1]
+    return hidden_scene_layout(samples, start, end, src_h=src_h)
 
 
 _GEOMETRY = ("kind", "facecam", "cam_rect", "head_box", "game_box", "game_fit", "patches")
@@ -585,7 +637,12 @@ def merge_same(layouts: list[SceneLayout]) -> list[SceneLayout]:
     out: list[SceneLayout] = []
     for lay in layouts:
         prev = out[-1] if out else None
-        if prev is not None and all(getattr(prev, k) == getattr(lay, k) for k in _GEOMETRY):
+        tracked = lay.kind in ("FACE_TRACK", "SPLIT")  # per-scene tracks: never joined
+        if (
+            prev is not None
+            and not tracked
+            and all(getattr(prev, k) == getattr(lay, k) for k in _GEOMETRY)
+        ):
             out[-1] = prev.model_copy(update={"end": lay.end})
         else:
             out.append(lay)

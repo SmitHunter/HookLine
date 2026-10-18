@@ -333,7 +333,7 @@ def _plan_vertical(
         if bands and box_hits_bands(box, size, letterbox, bands):
             log.info("profile facecam %s overlaps overlay bands %s; bands kept", box, bands)
             crop, bands = letterbox, None
-        return plan_profile_layouts(inter, profile, crop=crop), crop, bands
+        return plan_profile_layouts(inter, profile, crop=crop, detector=detector), crop, bands
     cam = settings.facecam
     if cam is not None and bands and box_hits_bands(cam, size, letterbox, bands):
         log.info("facecam %s overlaps overlay bands %s; bands kept", cam, bands)
