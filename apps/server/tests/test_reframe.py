@@ -1244,7 +1244,8 @@ def test_guard_zoom_is_a_fixed_point_and_holds_hold(name):
     lays, steps, cuts = _GUARD_CASES[name]
     lays = [plan_zoom(lay, 1920, 864) for lay in lays]
     held, out = guard_zoom(lays, 1920, 864, steps, cuts)
-    again, out2 = guard_zoom(out, 1920, 864, held, cuts)
+    # the same pre-guard schedule gives the same result, whatever shifts the layouts carry
+    again, out2 = guard_zoom(out, 1920, 864, steps, cuts)
     assert again == held and [o.shift_steps for o in out2] == [o.shift_steps for o in out]
     for lay in out:  # the guard does not fire again at the zoom it renders
         for a, b in _final_spans(held, lay):
@@ -1262,11 +1263,11 @@ def test_hold_spans_never_zooms_in_inside_a_hold_nor_returns_into_the_next():
         def fits(self, level, t0, t1, shift=0.0, path=False):
             return self.ok(level, shift)
 
-        def toward(self, t):
+        def direction(self, t0, t1):
             return 1.0
 
     def run(steps, spans, cuts, ok, scene=(0, 20)):
-        held, shifts = _hold_spans(list(steps), spans, cuts, (), Fit(ok), scene)
+        held, shifts = _hold_spans(list(steps), spans, cuts, Fit(ok), scene)
         for a, b in spans:
             assert not [(t, v) for t, v in held if a <= t < b and v != 1.0], (held, spans)
         return held, shifts
@@ -1284,11 +1285,11 @@ def test_hold_spans_never_zooms_in_inside_a_hold_nor_returns_into_the_next():
 
 def test_guard_shifts_are_checked_at_the_rendered_zoom():
     # a shift outside a hold, where the crop renders zoomed in, is validated at that zoom
-    from hookline.media.reframe import _SceneFit, zoom_at_fn
+    from hookline.media.reframe import _SceneFit
 
     lay = plan_zoom(_lean_at(0, 6, [0.5] * 24, fw=0.17), 1920, 864)
     steps = [(0.0, ZOOM_IN)]
-    fit = _SceneFit(lay, 1920, 864, zoom_at_fn(steps, lay), steps)
+    fit = _SceneFit(lay, 1920, 864, steps)
     room_base = 486 * 0.42 / lay.zoom_level(1.0)
     room_zoomed = 486 * 0.42 / lay.zoom_level(ZOOM_IN)
     # a shift that fits the base view but not the zoomed one
@@ -1304,3 +1305,89 @@ def test_face_offset_includes_the_guard_shifts():
     plain = face_offset(lay, 1920, 864, [(0.0, 1.0)])
     shifted = lay.model_copy(update={"shift_steps": [(0.0, 0.04)]})
     assert face_offset(shifted, 1920, 864, [(0.0, 1.0)]) == pytest.approx(plain - 0.04, abs=1e-3)
+
+
+# --- wave D review round 3: one placement pass, spaced pulses, eases, lead slack ---------
+
+
+def test_guard_zoom_unsettled_scene_holds_base_to_its_end(monkeypatch, caplog):
+    from hookline.media import reframe
+
+    monkeypatch.setattr(reframe, "GUARD_PASSES", 1)  # no pass can confirm the spans settled
+    lays, steps, cuts = _GUARD_CASES["back-to-back holds"]
+    lay = plan_zoom(lays[0], 1920, 864)
+    with caplog.at_level("WARNING"):
+        held, _ = reframe.guard_zoom([lay], 1920, 864, steps, cuts)
+    assert any("did not settle" in r.getMessage() for r in caplog.records)
+    # the face first moves at 1.0 s: from the first hold on, base to the end (no return)
+    assert all(v == 1.0 for t, v in held if t >= 1.0)
+
+
+def test_guard_pulses_are_spaced_and_keep_one_direction_per_span():
+    from hookline.media.reframe import _hold_spans
+
+    class Fit:
+        def fits(self, level, t0, t1, shift=0.0, path=False):
+            return True
+
+        def direction(self, t0, t1):  # the nearest sample would flip half-way through
+            return 1.0 if t0 < 3 else -1.0
+
+    sched = [(0.0, 1.0), (2.0, ZOOM_IN), (2.4, 1.0), (4.0, ZOOM_IN), (4.3, 1.0), (6.0, ZOOM_IN)]
+    cuts = [2.0, 4.0, 4.3, 6.0, 6.5]
+    _, shifts = _hold_spans(sched, [(1.0, 9.0)], cuts, Fit(), (0, 12))
+    ons = [(t, v) for t, v in shifts if v]
+    assert [t for t, _ in ons] == [2.0, 4.0, 6.0]  # 2.4, 4.3 and 6.5 are under 1 s after one
+    assert {v for _, v in ons} == {0.04}  # the span's one direction
+
+
+def test_zoom_at_fn_counts_a_zoom_out_while_it_eases():
+    from hookline.media.reframe import zoom_at_fn
+
+    lay = SceneLayout(start=0, end=6, kind="FACE_TRACK")
+    at = zoom_at_fn([(0.0, ZOOM_IN), (2.0, 1.0)], lay)
+    assert at(2.1) == pytest.approx(ZOOM_IN)  # still easing out of the zoom-in
+    assert at(2.5) == pytest.approx(1.0)
+
+
+def test_no_pulse_switches_off_just_before_a_scene_end():
+    from hookline.media.reframe import _hold_spans
+
+    class Fit:
+        def fits(self, level, t0, t1, shift=0.0, path=False):
+            return True
+
+        def direction(self, t0, t1):
+            return -1.0
+
+    _, shifts = _hold_spans([(0.0, 1.0), (1.4, ZOOM_IN)], [(0.5, 2.433)], [1.4], Fit(), (0, 2.433))
+    assert shifts == [(1.4, -0.04)]  # 1.4-2.4 would end 0.03 s before the camera change
+
+
+def test_gaze_lead_leaves_jitter_slack_before_the_guard_margin():
+    kfs = [(i * 0.25, 0.5) for i in range(8)]
+    in_w, cw = 1920, 486
+    expr = track_x_expr(kfs, in_w=in_w, crop_w=cw, face_w=0.17, lead=-0.08)
+    left = evaluate(expr, 1.0)
+    room_edge = left + cw - 0.08 * cw  # the guard margin on the side the face is pushed to
+    assert (0.5 + 0.17 / 2) * in_w <= room_edge - 0.02 * in_w + 1e-6
+
+
+def test_hold_spans_later_pulse_does_not_block_an_earlier_one_and_no_pumping():
+    from hookline.media.reframe import _hold_spans
+
+    class Fit:
+        def fits(self, level, t0, t1, shift=0.0, path=False):
+            return True
+
+        def direction(self, t0, t1):
+            return 1.0
+
+    # a beat at 15.733 lost its change to a hold; a pulse at 25.267 (inside a later hold)
+    # must not stop it getting its own pulse
+    sched = [(0.0, 1.0), (13.256, ZOOM_IN), (15.733, 1.0), (25.267, ZOOM_PUNCH)]
+    held, shifts = _hold_spans(sched, [(13.256, 14.1), (25.267, 26.3)], [], Fit(), (0, 30))
+    assert {t for t, v in shifts if v} == {13.256, 15.733, 25.267}
+    # a hold that starts on a zoom step never returns within CUT_QUIET of its start
+    held, _ = _hold_spans([(0.0, 1.0), (7.992, ZOOM_IN)], [(7.992, 8.44)], [], Fit(), (0, 20))
+    assert all(not (7.992 < t < 8.992) for t, _ in held), held
