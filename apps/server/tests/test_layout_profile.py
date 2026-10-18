@@ -301,3 +301,22 @@ def test_pillarbox_rejects_a_dark_symmetric_vignette():
     hard = np.zeros((4, 180, 320), np.uint8)
     hard[:, :, 40:280] = 50
     assert pillarbox(hard, []) == pytest.approx((40 / 320, 0, 240 / 320, 1))
+
+
+def test_plan_cam_beats_never_cover_a_scare_and_land_on_the_reaction_after():
+    """A beat never shows during [scare - 0.5 s, scare + 1 s] (the payoff is the gameplay)
+    nor over a gameplay spike: a reaction peak right at the scare gets its beat just after
+    it (the reaction continuing), up to BEAT_SHIFT_MAX later; else none."""
+    from hookline.pipeline.layout import BEAT_SHIFT_MAX
+
+    lays = [_stacked(0.0, 40.0)]
+    (out,) = plan_cam_beats([(10.2, 12.0)], lays, cuts=[], duration=40.0, avoid=[(9.5, 11.0)])
+    ((a, b),) = out.cam_beats
+    assert a >= 11.0 - 1e-6 and a - 10.2 <= BEAT_SHIFT_MAX + 1e-6 and b - a == pytest.approx(2.5)
+    # a long spike: shifting past it would leave the reaction behind -- no beat
+    (out,) = plan_cam_beats([(10.2, 12.0)], lays, cuts=[], duration=40.0, avoid=[(9.5, 14.0)])
+    assert out.cam_beats == []
+    # a spike inside the would-be beat pushes it past the spike too
+    (out,) = plan_cam_beats([(20.0, 9.0)], lays, cuts=[], duration=40.0, avoid=[(21.0, 21.4)])
+    ((a, _),) = out.cam_beats
+    assert a >= 21.4 - 1e-6

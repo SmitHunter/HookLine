@@ -82,11 +82,16 @@ FACE_ZOOM_BUDGET = 1.2  # ZOOM_PUNCH: a punch-in grows the face about its centre
 # moves a page down off the head); 757 with the 760 px cam panel.
 SEAM_OVERLAP = 0.05
 STACKED_CAPTION_Y = STACK_CAM_H + round(SEAM_OVERLAP * STACK_GAME_H) - CAPTION_BELOW
-# a two-line hook box TEXT_SEPARATION below the seam captions (visible to 818): 1022
-STACKED_HOOK_Y = STACKED_CAPTION_Y + CAPTION_BELOW + TEXT_SEPARATION + HOOK_HALF
-# ... both move down together to clear a streamer's chin in the cam panel; at most this far,
-# so a two-line hook box still ends inside Q4 (829)
+# ... moved down to clear a streamer's chin in the cam panel, at most this far (829)
 STACKED_CAPTION_MAX_Y = SAFE_BOTTOM - 2 * HOOK_HALF - TEXT_SEPARATION - CAPTION_BELOW
+# The STACKED hook title (and EARLIER tag) sits over the cam panel's lower band and the seam,
+# centred on it (a two-line box 604-916), lowered to clear the chin (CAPTION_FACE_GAP) -- never
+# over the gameplay's centre; the captions shown with it go TEXT_SEPARATION under its box
+# (1003), the later ones back on the seam. At most STACKED_HOOK_MAX_Y, so those captions
+# still fit Q4 (937).
+STACKED_HOOK_Y = STACK_CAM_H
+STACKED_HOOK_MAX_Y = CAPTION_MAX_Y - CAPTION_ABOVE - TEXT_SEPARATION - HOOK_HALF
+STACKED_CAPTION_EARLY_Y = STACKED_HOOK_Y + HOOK_HALF + TEXT_SEPARATION + CAPTION_ABOVE
 HOOK_Y = 360  # requested centre; clamped so the box stays in Q4 (1 line: 378, 2 lines: 446)
 # A rendered face sample (`SceneLayout.face_px`): output s, core x0, top, x1, bottom, eye y px
 FaceSample = tuple[float, float, float, float, float, float | None]
@@ -628,11 +633,10 @@ def _caption_cost(y: int, faces: Faces) -> float:
     return _overlap(y - CAPTION_ABOVE - gap, y + CAPTION_BELOW + gap, faces)
 
 
-def _stacked_caption_y(layouts: list[SceneLayout], until: float | None) -> int:
-    """The STACKED seam caption line: STACKED_CAPTION_Y, lowered to clear (CAPTION_FACE_GAP)
-    the lowest chin of the cam panel's head (`face_px` rows inside the panel, of STACKED
-    scenes starting before `until`; full-cam beat rows sit below the panel and don't count),
-    at most STACKED_CAPTION_MAX_Y."""
+def _stacked_chin(layouts: list[SceneLayout], until: float | None) -> float | None:
+    """The lowest chin (px) of the cam panel's head (`face_px` rows inside the panel, of
+    STACKED scenes starting before `until`; full-cam beat rows sit below the panel and don't
+    count); None without one."""
     chins = [
         float(r[4])  # type: ignore[arg-type]
         for lay in layouts
@@ -640,17 +644,35 @@ def _stacked_caption_y(layouts: list[SceneLayout], until: float | None) -> int:
         for r in lay.face_px
         if (until is None or r[0] < until) and r[4] is not None and r[4] <= STACK_CAM_H + 1  # type: ignore[operator]
     ]
-    if not chins:
+    return max(chins) if chins else None
+
+
+def _stacked_caption_y(layouts: list[SceneLayout], until: float | None) -> int:
+    """The STACKED seam caption line: STACKED_CAPTION_Y, lowered to clear (CAPTION_FACE_GAP)
+    the cam panel's lowest chin (`_stacked_chin`), at most STACKED_CAPTION_MAX_Y."""
+    chin = _stacked_chin(layouts, until)
+    if chin is None:
         return STACKED_CAPTION_Y
-    need = math.ceil(max(chins) + CAPTION_FACE_GAP + CAPTION_ABOVE)
+    need = math.ceil(chin + CAPTION_FACE_GAP + CAPTION_ABOVE)
     return min(max(STACKED_CAPTION_Y, need), STACKED_CAPTION_MAX_Y)
+
+
+def _stacked_hook_y(layouts: list[SceneLayout], until: float | None) -> int:
+    """The STACKED hook centre: on the seam (STACKED_HOOK_Y), lowered so its two-line box
+    clears the cam panel's chin by CAPTION_FACE_GAP, at most STACKED_HOOK_MAX_Y."""
+    chin = _stacked_chin(layouts, until)
+    if chin is None:
+        return STACKED_HOOK_Y
+    need = math.ceil(chin + CAPTION_FACE_GAP + HOOK_HALF)
+    return min(max(STACKED_HOOK_Y, need), STACKED_HOOK_MAX_Y)
 
 
 def caption_y_for(
     layouts: list[SceneLayout], late: bool = False, until: float | None = None
 ) -> int:
-    """The caption line. STACKED first scene: on the seam, lowered to clear the cam panel's
-    chin (`_stacked_caption_y`). Otherwise the lowest line
+    """The caption line. STACKED first scene: while the hook / tag is up (`late=False`) under
+    the hook box on the seam (`hook_y_for`), later on the seam, lowered to clear the cam
+    panel's chin (`_stacked_caption_y`). Otherwise the lowest line
     clear of every FACE_TRACK/SPLIT face, budgeting for a 1.2x punch-in (default 1180, i.e.
     below the chin when the face ends higher; else just above the head); when none is clear,
     the line with the least face overlap weighted by scene duration.
@@ -662,7 +684,10 @@ def caption_y_for(
     if not layouts:
         return CAPTION_Y
     if layouts[0].kind == "STACKED":
-        return _stacked_caption_y(layouts, None if late else (until or HOOK_S))
+        if late:
+            return _stacked_caption_y(layouts, None)
+        hook = _stacked_hook_y(layouts, until or HOOK_S)
+        return hook + HOOK_HALF + TEXT_SEPARATION + CAPTION_ABOVE
     faces = _faces(layouts, None if late else (until or HOOK_S))
     if not faces:
         return CAPTION_Y
@@ -672,8 +697,8 @@ def caption_y_for(
 
 
 def hook_y_for(layouts: list[SceneLayout], until: float | None = None) -> int:
-    """Hook title (and EARLIER tag) centre when STACKED: TEXT_SEPARATION below the seam
-    captions (1022 for the default line).
+    """Hook title (and EARLIER tag) centre when STACKED: over the cam panel's lower band and
+    the seam, clear of the chin (`_stacked_hook_y`; the captions shown with it go under it).
     Otherwise 360 (the top of Q4) unless a face core in a scene starting before `until`
     (`early_until`; the hook's 3 s by default; punch-in budgeted) reaches the hook band; then
     the centre in [HOOK_TOP_Y, caption visible top - TEXT_SEPARATION - two-line half height]
@@ -681,8 +706,7 @@ def hook_y_for(layouts: list[SceneLayout], until: float | None = None) -> int:
     if not layouts:
         return HOOK_Y
     if layouts[0].kind == "STACKED":
-        cap = _stacked_caption_y(layouts, until or HOOK_S)
-        return cap + CAPTION_BELOW + TEXT_SEPARATION + HOOK_HALF
+        return _stacked_hook_y(layouts, until or HOOK_S)
     faces = _faces(layouts, until or HOOK_S)
     gap = CAPTION_FACE_GAP
 

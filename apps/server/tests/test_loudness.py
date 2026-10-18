@@ -247,12 +247,33 @@ def test_ensure_true_peak_runs_on_hot_measurement(steady_quiet_video, tmp_path, 
     (cmd,) = cmds
     assert cmd[cmd.index("-c:v") + 1] == "copy"
     assert "alimiter=limit=" in cmd[cmd.index("-af") + 1]
-    # the limiter not enough: a volume trim from the original instead
-    tps = iter([-0.4, -1.0, -1.9])
+    # the limiter not enough (nor a deeper one): a volume trim from the original instead
+    tps = iter([-0.4, -1.0, -1.0, -1.9])
     cmds.clear()
     trim = ensure_true_peak(copy)
     assert trim == pytest.approx(-1.1)
-    assert len(cmds) == 2 and "volume=-1.10dB" in cmds[1]
+    assert len(cmds) == 3 and "volume=-1.10dB" in cmds[2]
+    lims = [c[c.index("-af") + 1] for c in cmds[:2]]
+    assert lims[0] != lims[1]  # the second limiter sits lower
+
+
+def test_ensure_true_peak_acts_when_the_trim_still_overshoots(
+    steady_quiet_video, tmp_path, monkeypatch
+):
+    """Round 1: the volume-trim fallback is re-measured; a peak still over -1.2 dBTP after it
+    (AAC ringing again) gets a second trim instead of being left hot."""
+    from hookline.media import loudness as loud_mod
+
+    copy = tmp_path / "c.mp4"
+    copy.write_bytes(steady_quiet_video.read_bytes())
+    tps = iter([-0.4, -1.0, -1.0, -1.0, -1.6])
+    monkeypatch.setattr(loud_mod, "measure_loudness", lambda p: _m(-14.0, tp=next(tps)))
+    cmds = []
+    real = loud_mod._run
+    monkeypatch.setattr(loud_mod, "_run", lambda cmd: (cmds.append(cmd), real(cmd))[1])
+    trim = ensure_true_peak(copy)
+    assert len(cmds) == 4 and "volume=-1.10dB" in cmds[2] and "volume=-0.50dB" in cmds[3]
+    assert trim == pytest.approx(-1.6)
 
 
 def test_render_runs_true_peak_check(

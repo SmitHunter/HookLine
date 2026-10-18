@@ -704,7 +704,7 @@ def test_run_job_builds_the_layout_profile_once_and_passes_it_with_scares(
     from hookline.pipeline import run as run_mod
     from hookline.pipeline.profile import LayoutProfile
 
-    built, seen = [], []
+    built, seen, spikes = [], [], []
     prof = LayoutProfile(size=(320, 180))
 
     def fake_profile(job_dir, src, detector):
@@ -713,6 +713,7 @@ def test_run_job_builds_the_layout_profile_once_and_passes_it_with_scares(
 
     def spy(*a, **k):
         seen.append((k.get("profile"), k.get("scares")))
+        spikes.append(k.get("spikes"))
         a[5].parent.mkdir(parents=True, exist_ok=True)  # dst
         return {"layout": [], "removed_s": 0.0}
 
@@ -723,7 +724,18 @@ def test_run_job_builds_the_layout_profile_once_and_passes_it_with_scares(
     run_job(str(fixture_video), s, fake_llm, FakeTranscriber(duration=150))
     assert len(built) == 1 and built[0][1].startswith("source")
     assert len(seen) == 2 and all(p is prof for p, _ in seen)
-    assert all(isinstance(sc, list) for _, sc in seen)  # the VOD's game transients
+    assert all(isinstance(sc, list) for _, sc in seen)  # the VOD's scares
+    assert all(isinstance(sp, list) for sp in spikes)  # gameplay motion spikes (source spans)
+
+
+def test_beat_spikes_are_the_motion_flashes():
+    from hookline.pipeline.signals import Signals
+
+    motion = [5.0] * 60
+    motion[30] = 80.0  # a flash / hard visual jump
+    sig = Signals(duration=60.0, loudness=[-30.0] * 60, motion=motion)
+    assert run_mod.beat_spikes(sig) == [(29.5, 32.0)]
+    assert run_mod.beat_spikes(Signals(duration=60.0, loudness=[-30.0] * 60)) == []
 
 
 def test_layout_profile_failure_of_any_kind_falls_back_to_per_clip(tmp_path, monkeypatch):

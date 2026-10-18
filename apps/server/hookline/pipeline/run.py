@@ -18,15 +18,17 @@ from hookline.pipeline.chat import chat_keywords, chat_rate, try_fetch_chat
 from hookline.pipeline.ingest import find_source, ingest, job_id_for
 from hookline.pipeline.package import apply_caption_fixes, package_clips
 from hookline.pipeline.profile import LayoutProfile, layout_profile
-from hookline.pipeline.render import render_clip
+from hookline.pipeline.render import SCARE_POST_S, SCARE_PRE_S, render_clip
 from hookline.pipeline.select import NoClipsSelectedError, select_clips
 from hookline.pipeline.signals import (
     SIGNALS_VERSION,
     Signals,
+    flash_seconds,
     heat_markers,
     heat_seconds,
     loud_seconds,
     onset_times,
+    scare_times,
     seconds_of,
 )
 from hookline.transcribe import Transcriber
@@ -251,6 +253,15 @@ def _face_detector(settings: Settings, log: Callable[[str], None]) -> FaceDetect
         return None
 
 
+def beat_spikes(signals: Signals) -> list[tuple[float, float]]:
+    """Gameplay motion spikes (`signals.flash_seconds`: a flash, a hard visual jump) as source
+    spans a full-cam beat stays out of: the spike's second from SCARE_PRE_S before to
+    SCARE_POST_S after it ends."""
+    return [
+        (s - SCARE_PRE_S, s + 1 + SCARE_POST_S) for s in sorted(flash_seconds(signals.motion or []))
+    ]
+
+
 def _layout_profile(
     job_dir: Path, src: Path, detector: FaceDetector | None, log: Callable[[str], None]
 ) -> LayoutProfile | None:
@@ -369,7 +380,8 @@ def run_job(
     work_dir = job_dir / "render"
     detector = _face_detector(settings, log)
     profile = _layout_profile(job_dir, src, detector, log)
-    scares = list(signals.transient_times or [])  # game transients: full-cam reaction beats
+    # full-cam reaction beats stay clear of the scares and the gameplay's motion spikes
+    scares, spikes = scare_times(signals), beat_spikes(signals)
     # Segment-interpolated word times are contiguous (no gaps), so protecting them from cuts
     # would remove no dead air at all; only real word timings (DTW / whisper) are protected.
     protect = transcript.timing != "segment"
@@ -412,6 +424,7 @@ def run_job(
                 idle_gaps=gaps,
                 profile=profile,
                 scares=scares,
+                spikes=spikes,
             )
         except (FFmpegError, ValueError, OSError) as e:
             reason = (str(e).splitlines() or [type(e).__name__])[0]

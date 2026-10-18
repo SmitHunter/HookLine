@@ -848,6 +848,29 @@ def test_reaction_peaks_loud_words_and_scare_reactions():
     assert reaction_peaks(words, env, [(4.0, 20.0)], scares=[])[0][0] == pytest.approx(1.0)
 
 
+def test_reaction_peaks_use_voice_frames_and_loud_shouts():
+    """Peaks are measured on voice-like frames only (a game bang under a word is no
+    reaction); in a clip of shouting (the median word already a shout) the loud shouts still
+    count (`REACT_LOUD_DB`)."""
+    from hookline.media.audio import Envelope
+    from hookline.pipeline.render import reaction_peaks
+
+    db = np.full(2000, -30.0)
+    db[500:540] = -12.0  # a game bang at 5.0 s ...
+    voice = np.ones(2000, bool)
+    voice[500:540] = False  # ... not voice-like
+    db[800:840] = -16.0  # a real shout at 8.0 s
+    env = Envelope(t0=0.0, hop=0.01, db=db, voice=voice)
+    words = [Word(start=t, end=t + 0.4, text="w") for t in (1.0, 3.0, 5.0, 8.0, 12.0)]
+    assert [round(t, 2) for t, _ in reaction_peaks(words, env, [(0.0, 20.0)])] == [8.0]
+    # every word a shout (-12 dB): none lifts over the median, the loudest still count
+    loud = np.full(2000, -12.0)
+    loud[1200:1240] = -10.0
+    env = Envelope(t0=0.0, hop=0.01, db=loud, voice=np.ones(2000, bool))
+    peaks = reaction_peaks(words, env, [(0.0, 20.0)])
+    assert peaks and max(peaks, key=lambda p: p[1])[0] == pytest.approx(12.0)
+
+
 def _template_profile():
     from hookline.pipeline.profile import LayoutProfile
 
@@ -873,7 +896,7 @@ def test_render_clip_with_a_profile_uses_the_template_and_the_vod_bars(
 
     planned = []
 
-    def fake_plan(video, profile, crop=None):
+    def fake_plan(video, profile, crop=None, detector=None):
         planned.append(crop)
         end = probe_duration(video)
         tpl = stack_template(profile, crop, profile.size)
@@ -919,3 +942,49 @@ def test_render_clip_facecam_override_beats_the_profile(
     # the override (mapped into the profile's black-bar crop), not the profile's template
     assert extras["layout"][0]["facecam"] == pytest.approx([0.0, 0.5, 94 / 316, 0.3], abs=0.004)
     assert extras["layout"][0]["game_box"] is None and extras["layout_profile"] is None
+
+
+def test_beat_avoid_spans_cover_scares_spikes_startles_and_the_tag():
+    """Output spans a full-cam beat must stay out of: the EARLIER tag, [scare - 0.5 s,
+    scare + 1 s], gameplay spikes (source spans) and startled reaction words (a sharp onset
+    right at the word: the cause is on screen then), all through the keep ranges."""
+    from hookline.pipeline.render import beat_avoid
+
+    keep = [(100.0, 110.0), (120.0, 130.0)]
+    spans = beat_avoid(
+        seam=None, scares=[105.0, 125.0, 115.0], spikes=[(121.0, 123.0)], startles=[4.0],
+        keep=keep,
+    )  # fmt: skip
+    assert [4.5, 6.0] in spans and [14.5, 16.0] in spans  # scares (one in a cut: dropped)
+    assert [11.0, 13.0] in spans  # the spike
+    assert [3.5, 5.0] in spans  # the startle (already output s)
+    assert all(not (a < 10.0 < b and b - a > 5) for a, b in spans)
+    assert [1.2, 2.4] in beat_avoid(seam=1.2, scares=[], spikes=[], startles=[], keep=keep)
+
+
+def test_startle_times_sharp_onsets_at_peak_words():
+    from hookline.media.audio import Envelope
+    from hookline.pipeline.render import startle_times
+
+    db = np.full(2000, -40.0)
+    db[500:540] = -15.0  # a sudden "Oh!" at 5.0 s out of quiet
+    db[790:840] = -16.0
+    db[700:790] = -20.0  # a shout at 8.0 s that builds up (no jump)
+    env = Envelope(t0=0.0, hop=0.01, db=db)
+    words = [Word(start=5.0, end=5.4, text="Oh!"), Word(start=8.0, end=8.4, text="no")]
+    assert startle_times(words, env, [(0.0, 20.0)], peaks=[5.0, 8.0]) == [5.0]
+    assert startle_times(words, env, [(2.0, 20.0)], peaks=[3.0]) == [3.0]  # output s
+
+
+def test_mix_format_pins_every_channel_count_to_a_layout(monkeypatch):
+    """The room-tone mix inputs get one layout: mono stays mono, stereo and anything wider
+    (5.1 / 7.1 sources) a stereo mix, never left to amix's negotiation."""
+    import subprocess as sp
+
+    from hookline.pipeline import render as render_mod
+
+    for channels, layout in (("1", "mono"), ("2", "stereo"), ("6", "stereo"), ("8", "stereo")):
+        monkeypatch.setattr(
+            render_mod, "_run", lambda cmd, c=channels: sp.CompletedProcess(cmd, 0, c + "\n", "")
+        )
+        assert render_mod.mix_format(Path("x.mkv")).endswith(f"channel_layouts={layout}")

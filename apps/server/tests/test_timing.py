@@ -455,3 +455,37 @@ def test_uncaptioned_speech_needs_a_voice_like_spectrum(tmp_path):
     assert env.voice is not None and len(env.voice) == len(env.db)
     (span,) = uncaptioned_speech([], env, THR, [(0.0, 6.0)])
     assert span == (pytest.approx(2.6, abs=0.1), pytest.approx(3.4, abs=0.1))
+
+
+def test_uncaptioned_speech_finds_quiet_speech_under_a_game_bed(tmp_path):
+    """Q3b (round 1): quiet speech over a steady game bed swings only ~3 dB round its trend
+    (the bed fills the syllable gaps): still flagged; the bed alone (no speech) is not."""
+    import wave
+
+    from hookline.pipeline.timing import uncaptioned_speech
+
+    rate = 16000
+    t = np.arange(6 * rate) / rate
+    rng = np.random.default_rng(0)
+    bed = np.convolve(0.015 * rng.standard_normal(len(t)), np.ones(8) / 8 * 3, mode="same")
+    speech = np.zeros_like(t)
+    voiced = (t >= 2.6) & (t < 3.6)
+    for k in range(1, 30):
+        f = 140 * k
+        gain = np.exp(-(((f - 600) / 250) ** 2)) + 0.6 * np.exp(-(((f - 1500) / 300) ** 2))
+        syllables = np.abs(np.sin(2 * np.pi * 2.0 * t)) ** 2
+        speech[voiced] += (0.04 * gain * np.sin(2 * np.pi * f * t) * syllables)[voiced]
+
+    def env_of(sig, name):
+        wav = tmp_path / name
+        with wave.open(str(wav), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(rate)
+            w.writeframes((np.clip(sig, -1, 1) * 32767).astype(np.int16).tobytes())
+        return energy_envelope(wav, 0.0, 6.0)
+
+    thr = -33.0  # the render's threshold sits over the bed (its noise floor + 9 dB)
+    found = uncaptioned_speech([], env_of(bed + speech, "mix.wav"), thr, [(0.0, 6.0)])
+    assert found and found[0][0] >= 2.5 and found[-1][1] <= 3.7
+    assert uncaptioned_speech([], env_of(bed, "bed.wav"), thr, [(0.0, 6.0)]) == []

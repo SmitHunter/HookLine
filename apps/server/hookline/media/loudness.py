@@ -313,6 +313,10 @@ TP_TRIM_TARGET = -1.5
 # decoded audio takes off only the overshooting peaks -- AAC rings on a lone transient (a game
 # hit: stream clip 01 went 1.9 dB over its plan) -- so the clip keeps its loudness.
 TP_LIMIT_DB = -2.5
+# ... and a second, deeper one when the first still leaves an overshoot; the limiter only
+# counts when it costs at most TP_LIMIT_LOSS of loudness (else Q1 would drift)
+TP_LIMIT_DEEP_DB = -4.0
+TP_LIMIT_LOSS = 0.5
 
 
 def _reencode_audio(src: Path, dst: Path, af: str) -> None:
@@ -329,26 +333,37 @@ def _reencode_audio(src: Path, dst: Path, af: str) -> None:
 
 def ensure_true_peak(dst: Path) -> float | None:
     """Post-encode safety net: AAC can overshoot the limiter ceiling. When `dst`'s true peak
-    is above -1.2 dBTP, re-encode only its audio: first through a peak limiter at TP_LIMIT_DB
-    (the loudness stays); if that still leaves the peak over -1.2 dBTP, with a volume trim
-    instead (from the original) to land at about -1.5. Returns the loudness change in dB
-    (None when nothing was done)."""
+    is above -1.2 dBTP, re-encode only its audio: first through a peak limiter at TP_LIMIT_DB,
+    then TP_LIMIT_DEEP_DB (the loudness stays); if neither brings the peak under -1.2 dBTP for
+    at most TP_LIMIT_LOSS of loudness, with a volume trim instead (from the original) to land
+    at about -1.5, re-measured and trimmed again while still over. Returns the loudness
+    change in dB (None when nothing was done)."""
     m = measure_loudness(dst)
     if m is None or m.tp <= TP_TRIM_ABOVE:
         return None
     tmp = dst.with_suffix(".trim" + dst.suffix)
-    lim = LIMITER.format(lim=10 ** (TP_LIMIT_DB / 20))
-    _reencode_audio(dst, tmp, f"aresample={LIMIT_RATE},{lim}")
-    after = measure_loudness(tmp)
-    if after is not None and after.tp <= TP_TRIM_ABOVE:
+    for ceiling in (TP_LIMIT_DB, TP_LIMIT_DEEP_DB):
+        lim = LIMITER.format(lim=10 ** (ceiling / 20))
+        _reencode_audio(dst, tmp, f"aresample={LIMIT_RATE},{lim}")
+        after = measure_loudness(tmp)
+        if after is not None and after.tp <= TP_TRIM_ABOVE and m.i - after.i <= TP_LIMIT_LOSS:
+            os.replace(tmp, dst)
+            log.info(
+                "audio: true-peak limit %.1f: %.2f -> TP %.2f, I %.2f -> %.2f",
+                ceiling, m.tp, after.tp, m.i, after.i,
+            )  # fmt: skip
+            return round(after.i - m.i, 2)
+    total, tp = 0.0, m.tp
+    for _ in range(2):  # the trim, then once more if AAC still rings over
+        trim = round(TP_TRIM_TARGET - tp, 2)
+        _reencode_audio(dst, tmp, f"volume={trim:.2f}dB")
         os.replace(tmp, dst)
+        total += trim
+        after = measure_loudness(dst)
         log.info(
-            "audio: true-peak limit %.2f -> TP %.2f, I %.2f -> %.2f", m.tp, after.tp, m.i, after.i
+            "audio: true-peak trim %.2f dB -> TP %s", trim, f"{after.tp:.2f}" if after else "?"
         )
-        return round(after.i - m.i, 2)
-    trim = TP_TRIM_TARGET - m.tp
-    _reencode_audio(dst, tmp, f"volume={trim:.2f}dB")
-    os.replace(tmp, dst)
-    after = measure_loudness(dst)
-    log.info("audio: true-peak trim %.2f dB -> TP %s", trim, f"{after.tp:.2f}" if after else "?")
-    return trim
+        if after is None or after.tp <= TP_TRIM_ABOVE:
+            break
+        tp = after.tp
+    return round(total, 2)

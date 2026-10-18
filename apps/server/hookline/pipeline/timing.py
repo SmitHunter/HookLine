@@ -61,11 +61,12 @@ SPLICE_LEAD_S = 0.12  # ... the range then starts this long before the next onse
 UNCAPTIONED_BRIDGE_S = 0.25  # syllable gaps up to this long inside one uncaptioned stretch
 # ... and at least this share of its frames voice-like (`audio.voice_frames`), when known:
 # game sound, screams over music and rumbles are not speech the transcript missed
-UNCAPTIONED_VOICE = 0.5
+UNCAPTIONED_VOICE = 0.3
 # ... and rising and falling like syllables: inside the stretch, the envelope (smoothed over
 # SYLLABLE_SMOOTH_S) swings around its SYLLABLE_TREND_S trend by >= UNCAPTIONED_SWING_DB
-# (std): a sustained scream or a tonal music bed holds steady
-UNCAPTIONED_SWING_DB = 5.0
+# (std): a sustained scream or a tonal music bed holds steady (~0.5 dB); quiet speech over a
+# game bed, the bed filling its syllable gaps, swings ~3-5 dB
+UNCAPTIONED_SWING_DB = 3.0
 SYLLABLE_SMOOTH_S = 0.05
 SYLLABLE_TREND_S = 1.0
 

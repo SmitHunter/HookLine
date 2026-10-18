@@ -98,6 +98,19 @@ REACT_DB = 8.0
 REACT_NEAR_DB = 4.0
 SCARE_NEAR_S = 2.0
 SCARE_BONUS = 4.0
+# ... levels from voice-like frames only (a game bang under a word is no reaction); in a clip
+# of shouting (its median word a shout) a word at least REACT_LOUD_DB (source dBFS) within
+# REACT_TOP_DB of the clip's loudest word is a peak too, scored REACT_DB + its excess
+REACT_LOUD_DB = -16.0
+REACT_TOP_DB = 3.0
+# Beats stay out of [scare - SCARE_PRE_S, scare + SCARE_POST_S] (the payoff is the gameplay)
+# and the same round a startled reaction word: a peak word whose level jumps >= STARTLE_DB
+# within STARTLE_RISE_S of its start over the quietest of the STARTLE_BEFORE_S before it (the
+# game's sting and the shout land together; the cause is on screen then)
+SCARE_PRE_S, SCARE_POST_S = 0.5, 1.0
+STARTLE_DB = 10.0
+STARTLE_RISE_S = 0.15
+STARTLE_BEFORE_S = 0.5
 
 log = logging.getLogger(__name__)
 
@@ -198,36 +211,83 @@ def reaction_peaks(
     scares: list[float] | None = None,
 ) -> list[tuple[float, float]]:
     """(output s, score) of the streamer's reaction peaks among the spoken `words` (source
-    time): a word's loudest envelope frame REACT_DB over the clip's median word, or
-    REACT_NEAR_DB when it starts within SCARE_NEAR_S after a `scares` time; time order."""
+    time): a word's loudest voice-like envelope frame (`Envelope.voice`, when known; a word
+    with none is no reaction) REACT_DB over the clip's median word, or REACT_NEAR_DB when it
+    starts within SCARE_NEAR_S after a `scares` time, or a loud shout (REACT_LOUD_DB, within
+    REACT_TOP_DB of the loudest word); time order."""
     levels = []
     for w in words:
-        i, j = env.index(w.start), env.index(w.end)
-        levels.append(float(env.db[i : max(j, i + 1)].max()) if len(env.db) else -100.0)
-    if not levels:
+        i, j = env.index(w.start), max(env.index(w.end), env.index(w.start) + 1)
+        db = env.db[i:j]
+        if env.voice is not None and len(env.voice) == len(env.db):
+            db = db[env.voice[i:j]]
+        levels.append(float(db.max()) if len(db) else -100.0)
+    heard = [lv for lv in levels if lv > -100.0]
+    if not heard:
         return []
-    median = sorted(levels)[len(levels) // 2]
+    median = sorted(heard)[len(heard) // 2]
+    top = max(heard)
     out = []
     for w, lv in zip(words, levels, strict=True):
+        if lv <= -100.0:
+            continue
         lift = lv - median
         near = any(0.0 <= w.start - s <= SCARE_NEAR_S for s in scares or [])
-        if lift >= REACT_DB or (near and lift >= REACT_NEAR_DB):
+        score = lift + (SCARE_BONUS if near else 0.0)
+        shout = lv >= REACT_LOUD_DB and lv >= top - REACT_TOP_DB
+        if shout:
+            score = max(score, REACT_DB + lv - REACT_LOUD_DB)
+        if lift >= REACT_DB or (near and lift >= REACT_NEAR_DB) or shout:
             t = _to_output_time(w.start, keep)
             if t is not None:
-                out.append((t, round(lift + (SCARE_BONUS if near else 0.0), 3)))
+                out.append((t, round(score, 3)))
+    return sorted(out)
+
+
+def startle_times(
+    words: list[Word], env: Envelope, keep: list[tuple[float, float]], peaks: list[float]
+) -> list[float]:
+    """Output times among the reaction `peaks` (output s) whose word (source time) starts
+    with a sharp onset: STARTLE_DB over the quietest frame of the STARTLE_BEFORE_S before it,
+    within STARTLE_RISE_S."""
+    out = []
+    for w in words:
+        t = _to_output_time(w.start, keep)
+        if t is None or not any(abs(t - p) < 1e-3 for p in peaks):
+            continue
+        before = env.db[env.index(w.start - STARTLE_BEFORE_S) : env.index(w.start)]
+        rise = env.db[env.index(w.start) : env.index(w.start + STARTLE_RISE_S) + 1]
+        if len(before) and len(rise) and float(rise.max() - before.min()) >= STARTLE_DB:
+            out.append(t)
+    return out
+
+
+def beat_avoid(
+    seam: float | None,
+    scares: list[float],
+    spikes: list[tuple[float, float]],
+    startles: list[float],
+    keep: list[tuple[float, float]],
+) -> list[list[float]]:
+    """Output spans a full-cam beat stays out of: the EARLIER tag after the `seam`, each
+    scare (source s) from SCARE_PRE_S before to SCARE_POST_S after, the gameplay `spikes`
+    (source spans) and each startled reaction (`startles`, output s) like a scare."""
+    out = [[seam, round(seam + SEAM_TAG_S, 3)]] if seam is not None else []
+    near = [(s - SCARE_PRE_S, s + SCARE_POST_S) for s in scares]
+    out += _to_output_spans([*near, *spikes], keep)
+    out += [[round(t - SCARE_PRE_S, 3), round(t + SCARE_POST_S, 3)] for t in startles]
     return sorted(out)
 
 
 def mix_format(path: Path) -> str:
     """aformat pinning a room-tone mix input to float planar at MIX_RATE in `path`'s audio
-    channel layout (mono / stereo; other counts keep their own layout)."""
+    channel layout: mono stays mono, stereo and wider sources (5.1, 7.1) mix in stereo."""
     res = _run(
         ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries",
          "stream=channels", "-of", "csv=p=0", str(path)]
     )  # fmt: skip
-    layout = {"1": "mono", "2": "stereo"}.get(res.stdout.strip())
-    fmt = f"aformat=sample_fmts=fltp:sample_rates={MIX_RATE}"
-    return f"{fmt}:channel_layouts={layout}" if layout else fmt
+    layout = "mono" if res.stdout.strip() == "1" else "stereo"
+    return f"aformat=sample_fmts=fltp:sample_rates={MIX_RATE}:channel_layouts={layout}"
 
 
 def room_tone(duration: float) -> str:
@@ -370,6 +430,7 @@ def render_clip(
     idle_gaps: list[tuple[float, float]] | None = None,
     profile: LayoutProfile | None = None,
     scares: list[float] | None = None,
+    spikes: list[tuple[float, float]] | None = None,
 ) -> dict:
     """Write the finished clip to `dst`; returns sidecar extras (segments, layout, keep_ranges,
     removed_s, cut_times, zoom_steps, zoom_levels, overlay_bands, seam, ass, ass_sha1,
@@ -403,7 +464,8 @@ def render_clip(
     gives the static black bars (no per-clip detection) and, for a stream with a facecam
     overlay (unless `settings.facecam` overrides), the fixed STACKED template for every scene,
     with up to two full-cam reaction beats at the streamer's reaction peaks (`scares`: the
-    VOD's game-transient times, source s); the sidecar's `layout_profile` records its cam."""
+    VOD's scare times, source s; beats stay clear of them and of the gameplay `spikes`,
+    source spans: `beat_avoid`); the sidecar's `layout_profile` records its cam."""
     work_dir.mkdir(parents=True, exist_ok=True)
     dst.parent.mkdir(parents=True, exist_ok=True)
     name = dst.stem.split("-", 1)[0]
@@ -513,10 +575,11 @@ def render_clip(
         # the edge guard's holds/shifts, once: the graph and the sidecar get the same steps
         steps, layouts = guard_zoom(layouts, in_w, in_h, steps, cuts)
         if any(lay.cam_rect is not None for lay in layouts):
-            # full-cam reaction beats, never under the EARLIER tag
-            tag = [(seam, seam + SEAM_TAG_S)] if seam is not None else []
+            # full-cam reaction beats, never under the EARLIER tag nor over a scare / spike
             peaks = reaction_peaks(spoken, env, keep, scares)
-            layouts = plan_cam_beats(peaks, layouts, cuts, duration, avoid=tag)
+            startles = startle_times(spoken, env, keep, [t for t, _ in peaks])
+            avoid = beat_avoid(seam, scares or [], spikes or [], startles, keep)
+            layouts = plan_cam_beats(peaks, layouts, cuts, duration, avoid=avoid)  # type: ignore[arg-type]
         layouts = [
             lay.model_copy(
                 update={

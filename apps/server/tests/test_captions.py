@@ -10,6 +10,7 @@ from hookline.captions.ass import (
     CAPTION_BELOW,
     CAPTION_LATE_MIN_Y,
     CAPTION_MIN_Y,
+    STACKED_CAPTION_EARLY_Y,
     STACKED_CAPTION_Y,
     STACKED_HOOK_Y,
     build_ass,
@@ -106,7 +107,8 @@ def test_min_duration_and_centisecond_format():
 def test_caption_y_for():
     st = SceneLayout(start=0, end=5, kind="STACKED")
     ft = SceneLayout(start=0, end=5, kind="FIT_BLUR")
-    assert caption_y_for([st, ft]) == STACKED_CAPTION_Y
+    assert caption_y_for([st, ft]) == STACKED_CAPTION_EARLY_Y  # under the hook on the seam
+    assert caption_y_for([st, ft], late=True) == STACKED_CAPTION_Y
     assert caption_y_for([ft, st]) == 1180
     assert caption_y_for([]) == 1180
 
@@ -171,7 +173,9 @@ def test_hook_and_caption_placement_per_layout():
     assert (hook_y_for([]), caption_y_for([])) == (360, 1180)
     assert (hook_y_for([_lay("FIT_BLUR")]), caption_y_for([_lay("FIT_BLUR")])) == (360, 1180)
     stacked = [_lay("STACKED"), _lay("FIT_BLUR")]
-    assert (hook_y_for(stacked), caption_y_for(stacked)) == (STACKED_HOOK_Y, STACKED_CAPTION_Y)
+    assert (hook_y_for(stacked), caption_y_for(stacked)) == (
+        STACKED_HOOK_Y, STACKED_CAPTION_EARLY_Y
+    )  # fmt: skip
     assert hook_y_for([_lay("FACE_TRACK")]) == 360  # no face box: default
 
 
@@ -824,25 +828,39 @@ def test_stacked_captions_sit_on_the_seam():
     top, bottom = STACKED_CAPTION_Y - CAPTION_ABOVE, STACKED_CAPTION_Y + CAPTION_BELOW
     assert top < STACK_CAM_H < bottom
     assert bottom - STACK_CAM_H == pytest.approx(0.05 * STACK_GAME_H, abs=4)
-    # the hook title goes below the caption, inside Q4
-    assert STACKED_HOOK_Y - 156 >= bottom + 48 and STACKED_HOOK_Y + 156 <= 1250
+    # the hook title sits over the cam panel's lower band and the seam (not the gameplay's
+    # centre, 1340), the captions shown with it 48 px under its box, inside Q4
+    assert STACKED_HOOK_Y - 156 < STACK_CAM_H < STACKED_HOOK_Y + 156
+    assert STACKED_HOOK_Y + 156 < STACK_CAM_H + STACK_GAME_H / 2 - 200
+    assert STACKED_CAPTION_EARLY_Y - CAPTION_ABOVE == STACKED_HOOK_Y + 156 + 48
+    assert STACKED_CAPTION_EARLY_Y <= 1180
 
 
-def test_stacked_early_captions_clear_a_low_head_without_reaching_the_hook():
-    """The STACKED hook sits under the seam captions: a caption moved down off the cam
-    panel's head while the hook is up stays TEXT_SEPARATION above the hook box."""
-    from hookline.captions.ass import CAPTION_BELOW, TEXT_SEPARATION
+def test_stacked_hook_clears_a_low_head_and_its_captions_go_under_it():
+    """A low chin in the cam panel pushes the seam hook down (clear of the chin by
+    CAPTION_FACE_GAP); the captions shown with it stay TEXT_SEPARATION under its box, in Q4."""
+    from hookline.captions.ass import (
+        CAPTION_ABOVE,
+        CAPTION_BELOW,
+        CAPTION_FACE_GAP,
+        HOOK_HALF,
+        TEXT_SEPARATION,
+    )
 
-    head = [(t / 4, 300.0, 300.0, 780.0, 745.0, None) for t in range(13)]  # chin at 745
+    rows = [[t / 4, 300.0, 300.0, 780.0, 700.0, None] for t in range(13)]  # chin at 700
+    lay = SceneLayout(start=0, end=3, kind="STACKED", face_px=rows)
+    hy, cy = hook_y_for([lay]), caption_y_for([lay])
+    assert hy - HOOK_HALF >= 700 + CAPTION_FACE_GAP
+    assert cy - CAPTION_ABOVE >= hy + HOOK_HALF + TEXT_SEPARATION and cy <= 1180
+    head = [(r[0], r[1], r[2], r[3], r[4], None) for r in rows]
     hook_text = "Parks. Open space. All under siege."
     ass = build_ass(
-        [w(0.2, 1.0, "HELLO"), w(1.0, 2.0, "THERE")], hook_text, 3.0,
-        STACKED_CAPTION_Y, STACKED_HOOK_Y, faces=head,
-    )  # fmt: skip
+        [w(0.2, 1.0, "HELLO"), w(1.0, 2.0, "THERE")], hook_text, 3.0, cy, hy, faces=head
+    )
     caps = "\n".join(ln for ln in ass.splitlines() if ln.startswith("Dialogue") and ",Cap," in ln)
     ys = [int(m) for m in re.findall(r"\\pos\(\d+,(\d+)\)", caps)]
-    hook_top = STACKED_HOOK_Y - 136 - 20  # a two-line hook box
-    assert ys and all(y + CAPTION_BELOW <= hook_top - TEXT_SEPARATION for y in ys)
+    assert ys and all(y - CAPTION_ABOVE >= hy + HOOK_HALF + TEXT_SEPARATION for y in ys)
+    assert all(y + CAPTION_BELOW <= 1250 for y in ys)
 
 
 def test_stacked_caption_and_hook_lines_clear_the_cam_panel_head():
@@ -855,8 +873,10 @@ def test_stacked_caption_and_hook_lines_clear_the_cam_panel_head():
         rows += [[2.25, 0, 400, 1080, 1100, None]]  # a full-cam beat row
         return SceneLayout(start=0, end=2.5, kind="STACKED", face_px=rows)
 
-    assert caption_y_for([lay(600)]) == STACKED_CAPTION_Y  # chin well above the seam line
-    y = caption_y_for([lay(732)])
+    assert caption_y_for([lay(600)], late=True) == STACKED_CAPTION_Y  # chin above the line
+    y = caption_y_for([lay(732)], late=True)
     assert y == 732 + CAPTION_FACE_GAP + CAPTION_ABOVE
-    assert hook_y_for([lay(732)]) == y + 61 + 48 + HOOK_HALF
-    assert hook_y_for([lay(760)]) + HOOK_HALF <= 1250  # capped: the hook stays inside Q4
+    assert hook_y_for([lay(500)]) == STACKED_HOOK_Y  # centred on the seam
+    assert hook_y_for([lay(732)]) == 732 + CAPTION_FACE_GAP + HOOK_HALF
+    # capped: the captions under it stay inside Q4
+    assert caption_y_for([lay(760)]) <= 1180 and hook_y_for([lay(760)]) + HOOK_HALF <= 1250

@@ -87,12 +87,54 @@ def test_template_patches_fit_and_beats_render(src, tmp_path):
     assert probe_duration(out) == pytest.approx(4.0, abs=0.1)
 
 
-def test_full_cam_geometry_keeps_the_chin_above_the_caption_line():
-    lay = _template()
-    fg_h, y = full_cam_geometry(lay, 1280, 720)
-    assert fg_h == pytest.approx(1080 * 200 / 201, abs=8)  # even px crop
-    chin = y + (521 - 362) / 200 * fg_h
-    assert chin <= BEAT_CHIN_Y + 1 and y >= 0
+def _beat(cam, head):
+    """A template layout of a cam (x0, y0, x1, y1 px of 1280x720) with that head box."""
+    prof = PROFILE.model_copy(
+        update={"cam": cam, "outer": (cam[0] - 2, cam[1] - 2, cam[2] + 2, cam[3] + 2),
+                "head": head, "face": (head[0] + 10, head[1] + 20, head[2] - 10, head[3]),
+                "masks": []}
+    )  # fmt: skip
+    t = stack_template(prof, None, SIZE)
+    return SceneLayout(start=0.0, end=4.0, kind="STACKED", **t)
+
+
+@pytest.mark.parametrize(
+    ("cam", "head"),
+    [
+        ((46, 362, 247, 562), (105, 390, 208, 521)),  # the audited square cam
+        ((900, 20, 1260, 222), (1040, 40, 1130, 200)),  # a 16:9 cam
+        ((1000, 100, 1200, 400), (1050, 180, 1150, 330)),  # a portrait cam
+        ((60, 400, 300, 535), (130, 402, 230, 534)),  # a head taller than a 0.8 window
+    ],
+)
+def test_full_cam_geometry_large_head_centred_window(cam, head):
+    """A beat shows a head-centred window of the cam at least 1080x1350 (a wide cam is
+    cropped round the head, never shrunk into letterbox bands), the whole head in it, the
+    chin at most BEAT_CHIN_Y, the picture inside the frame."""
+    lay = _beat(cam, head)
+    (ww, wh, wx, wy), (pw, ph), top = full_cam_geometry(lay, 1280, 720)
+    assert cam[0] <= wx and wx + ww <= cam[2] + 1 and cam[1] <= wy and wy + wh <= cam[3] + 1
+    assert wx <= head[0] + 1 and head[2] <= wx + ww + 1  # the whole head width ...
+    left = (OUT_W - pw) / 2
+    assert left + (head[0] - wx) / ww * pw >= 0 and left + (head[2] - wx) / ww * pw <= OUT_W
+    assert wy <= head[1] + 1 and head[3] <= wy + wh + 1  # top of the hair to the chin
+    wide = (cam[2] - cam[0]) / (cam[3] - cam[1]) > 0.8
+    if wide and (head[2] - head[0]) * 1.1 <= 0.8 * (cam[3] - cam[1]):
+        assert ww / wh == pytest.approx(0.8, abs=0.02)  # 1080x1350
+    if (head[3] - head[1]) / wh * 1350 <= BEAT_CHIN_Y - 40:  # else the head fills it: smaller
+        assert pw >= OUT_W or ph == OUT_H  # 1080 wide (sides past the frame when widened)
+        assert ph >= 1350 or ph == OUT_H
+    chin = top + (head[3] - wy) / wh * ph
+    assert chin <= BEAT_CHIN_Y + 2
+    assert top + (head[1] - wy) / wh * ph >= 0  # the head top on screen
+
+
+def test_beat_render_vignette_and_edge_fill(src, tmp_path):
+    lay = _template(0.0, 4.0, cam_beats=[(1.0, 3.5)])
+    f = scene_filter(lay, 1280, 720, "a", "b")
+    assert "vignette" in f
+    out = _render(src, reframe_graph([lay], 1280, 720), tmp_path / "beat.mp4")
+    assert probe_size(out) == (1080, 1920)
 
 
 def test_stacked_face_px_head_in_the_cam_panel_and_in_beats():
@@ -105,15 +147,43 @@ def test_stacked_face_px_head_in_the_cam_panel_and_in_beats():
         assert eye is None and 0 <= top < bottom <= STACK_CAM_H  # head inside the cam panel
         assert 0 <= x0 < x1 <= OUT_W
     assert beat
-    for _, _, top, _, bottom, _ in beat:  # the big full-cam head, its chin on BEAT_CHIN_Y
-        assert bottom == pytest.approx(BEAT_CHIN_Y, abs=2) and top > STACK_CAM_H / 2
+    for _, x0, top, x1, bottom, _ in beat:  # the big full-cam head, its chin on BEAT_CHIN_Y
+        assert bottom == pytest.approx(BEAT_CHIN_Y, abs=2) and 0 <= top < STACK_CAM_H / 2
+        assert x1 - x0 > 0.5 * OUT_W  # a large head
 
 
-def test_plan_zoom_template_keeps_the_head_in_the_cam_panel():
+def test_plan_zoom_template_punches_the_gameplay_when_the_cam_cannot():
+    """The audited cam (its head fills the panel, a 5x upscale) has no headroom for a visible
+    zoom (1.02-1.035 before): the steps zoom the gameplay panel instead, >= 1.08, about its
+    centre, recorded as such; the cam panel and its head stay put."""
+    from hookline.media.reframe import STACK_PUNCH_MIN, rendered_zoom_steps
+
     lay = plan_zoom(_template(), 1280, 720)
-    assert lay.zoom_anchor is not None
-    top = lay.zoom_level(1.2)
-    assert top <= ZOOM_IN + 1e-6  # a soft (5x upscaled) cam: zooms stay small
+    assert lay.zoom_panel == "game" and lay.zoom_anchor is None
+    assert lay.zoom_level(ZOOM_IN) >= STACK_PUNCH_MIN >= 1.08
+    assert lay.zoom_level(1.2) >= lay.zoom_level(ZOOM_IN)
+    steps = [(0.0, 1.0), (1.0, 1.2), (2.0, ZOOM_IN)]
+    assert [z for _, z in rendered_zoom_steps([lay], steps)][1:] == [
+        pytest.approx(lay.zoom_level(1.2)), pytest.approx(lay.zoom_level(ZOOM_IN))
+    ]  # fmt: skip
+    still = stacked_face_px(lay, 1280, 720, [(0.0, 1.0)])
+    zoomed = stacked_face_px(lay, 1280, 720, [(0.0, 1.2)])
+    assert still == zoomed  # the cam panel does not zoom
+    f = scene_filter(lay, 1280, 720, "a", "b", zoom_steps=steps)
+    cam_chain = f.split("[b_cam]")[0].split(";")[-1]
+    game_chain = f.split("[b_game]")[0].split(";")[-1]
+    assert "eval=frame" not in cam_chain and "eval=frame" in game_chain
+
+
+def test_plan_zoom_template_keeps_cam_zoom_with_headroom():
+    """A big cam with a small head has room to punch the cam panel itself (>= 1.08)."""
+    prof = PROFILE.model_copy(
+        update={"cam": (20, 300, 420, 600), "outer": (18, 298, 422, 602),
+                "head": (190, 380, 250, 450), "face": (200, 400, 240, 450), "masks": []}
+    )  # fmt: skip
+    t = stack_template(prof, None, SIZE)
+    lay = plan_zoom(SceneLayout(start=0.0, end=4.0, kind="STACKED", **t), 1280, 720)
+    assert lay.zoom_panel == "speaker" and lay.zoom_level(1.2) >= 1.08
     rows = stacked_face_px(lay, 1280, 720, [(0.0, 1.2)])
     assert all(r[2] >= 0 and r[4] <= STACK_CAM_H for r in rows)
 

@@ -95,7 +95,21 @@ _CROP_SAMPLES = 15
 # Full-cam reaction beats (wave G-layout): the cam's chin lands at most here, so a caption fits
 # below it inside Q4 (caption line 1180 - 39 px visible above it - a 40 px face gap).
 BEAT_CHIN_Y = 1100
+# ... the beat shows a head-centred window of the cam at this aspect (1080x1350: a large
+# head, the blurred fill only at the edges), the head kept whole with BEAT_HEAD_PAD of its
+# size round it, its top at least BEAT_HEAD_MIN px down; under a light vignette
+BEAT_ASPECT = 1080 / 1350
+BEAT_MIN_H = 1350
+BEAT_HEAD_PAD = 1.1
+BEAT_HEAD_MIN = 0
+BEAT_HEAD_TOP = 40  # ... and a head taller than BEAT_CHIN_Y less this is shown smaller
+BEAT_VIGNETTE = "vignette=angle=0.35"
 PATCH_BLUR = "gblur=sigma=16"  # an overlay inside the gameplay panel, blurred over
+# A template STACKED cam whose headroom caps its top zoom under STACK_PUNCH_MIN (an invisible
+# 1.02-1.035) zooms the gameplay panel instead, about its centre: levels up to ZOOM_TOP (the
+# upscale allowing, MAX_UPSCALE), at least GAME_ZOOM_MIN at the top so ZOOM_IN shows >= 1.08.
+STACK_PUNCH_MIN = 1.08
+GAME_ZOOM_MIN = 1.14
 
 
 def detect_crop(
@@ -1645,19 +1659,48 @@ def _box_px(
     return w, h, x, y
 
 
-def full_cam_geometry(layout: SceneLayout, in_w: int, in_h: int) -> tuple[float, float]:
-    """(height, top y) in output px of a full-cam beat's cam picture: the whole cam
-    (`cam_rect`) at the full output width, centred, raised so the chin (the head box's
-    bottom) lands at BEAT_CHIN_Y at most -- the caption goes under the chin."""
+def full_cam_geometry(
+    layout: SceneLayout, in_w: int, in_h: int
+) -> tuple[tuple[int, int, int, int], tuple[int, int], float]:
+    """A full-cam beat's picture: (the cam window, an even crop (w, h, x, y) inside
+    `cam_rect`; its output size (w, h); its top y). The window is head-centred at
+    BEAT_ASPECT (1080x1350; a wide cam is cropped round the head, not shrunk into bands), as
+    tall as the cam for a wider cam, as wide as it for a narrower one, never cutting the head
+    (a head taller than the window: the window grows to hold it); shown 1080 wide (at most
+    the frame tall), centred, raised so the chin (the head box's bottom) lands at
+    BEAT_CHIN_Y at most -- the caption goes under the chin -- but never above the head top's
+    BEAT_HEAD_MIN."""
     assert layout.cam_rect is not None
-    cw, ch, _, cy = _box_px(layout.cam_rect, in_w, in_h)
-    fg_h = _even(OUT_W * ch / cw)
-    y = (OUT_H - fg_h) / 2
+    cw, ch, cx, cy = _box_px(layout.cam_rect, in_w, in_h)
     if layout.head_box is not None:
-        _, hy, _, hh = layout.head_box
-        chin = ((hy + hh) * in_h - cy) / ch * fg_h
-        y = min(y, BEAT_CHIN_Y - chin)
-    return fg_h, float(max(int(y), 0))
+        bx, by, bw, bh = layout.head_box
+        hx0, hy0, hx1, hy1 = bx * in_w, by * in_h, (bx + bw) * in_w, (by + bh) * in_h
+    else:
+        hx0, hy0, hx1, hy1 = cx, cy, cx + cw, cy + ch
+    head_w, head_h = hx1 - hx0, hy1 - hy0
+    if cw / ch > BEAT_ASPECT:
+        wh = ch
+        ww = min(max(_even(ch * BEAT_ASPECT), _even(head_w * BEAT_HEAD_PAD)), cw)
+    else:
+        ww = cw
+        wh = min(max(_even(cw / BEAT_ASPECT), _even(head_h * BEAT_HEAD_PAD)), ch)
+    wx = min(max(round((hx0 + hx1) / 2 - ww / 2), cx), cx + cw - ww)
+    wy = min(max(round((hy0 + hy1) / 2 - wh / 2), cy), cy + ch - wh)
+    pw, ph = OUT_W, _even(OUT_W * wh / ww)
+    if ph < BEAT_MIN_H:  # a window widened for the head: as tall, its sides past the frame
+        pw, ph = _even(BEAT_MIN_H * ww / wh), BEAT_MIN_H
+    if ph > OUT_H:
+        pw, ph = _even(OUT_H * ww / wh), OUT_H
+    head_px = head_h / wh * ph
+    if head_px > BEAT_CHIN_Y - BEAT_HEAD_TOP:  # a head filling the window: shown smaller
+        f = (BEAT_CHIN_Y - BEAT_HEAD_TOP) / head_px
+        pw, ph = _even(pw * f), _even(ph * f)
+    top = (OUT_H - ph) / 2
+    if layout.head_box is not None:
+        chin = (hy1 - wy) / wh * ph
+        head_top = (hy0 - wy) / wh * ph
+        top = max(min(top, BEAT_CHIN_Y - chin), BEAT_HEAD_MIN - head_top)
+    return (ww, wh, wx, wy), (pw, ph), float(int(top))
 
 
 def _track_w(in_w: int, in_h: int) -> int:
@@ -1785,10 +1828,12 @@ def _template_filter(
     gw, gh, gx, gy = _box_px(layout.game_box, in_w, in_h)  # type: ignore[arg-type]
     parts = [f"[{label_in}]split={3 if beats else 2}[{o}_a][{o}_b]" + (f"[{o}_c]" if beats else "")]
     cam_up = max(OUT_W / cw, STACK_CAM_H / ch)
+    game = layout.zoom_panel == "game"  # the steps zoom the gameplay panel, not the cam
+    cam_zoom = "" if game else _zoom(zoom, OUT_W, STACK_CAM_H, layout.anchor_px(STACK_CAM_H), flags)
+    game_zoom = _zoom(zoom, OUT_W, STACK_GAME_H, None, flags) if game else ""
     parts.append(
         f"[{o}_a]crop={cw}:{ch}:{cx}:{cy},{_fill(OUT_W, STACK_CAM_H, flags)}"
-        f"{_zoom(zoom, OUT_W, STACK_CAM_H, layout.anchor_px(STACK_CAM_H), flags)}"
-        f"{_sharpen(cam_up)}[{o}_cam]"
+        f"{cam_zoom}{_sharpen(cam_up)}[{o}_cam]"
     )
     chain, cur = f"[{o}_b]crop={gw}:{gh}:{gx}:{gy}", f"{o}_g0"
     parts.append(f"{chain}[{cur}]")
@@ -1810,24 +1855,28 @@ def _template_filter(
         parts.append(
             f"[{cur}]split=2[{o}_fb][{o}_ff];[{o}_fb]{_fill(OUT_W, STACK_GAME_H)},{BLUR}[{o}_fbo];"
             f"[{o}_ff]scale={fw}:{fh}{flags}{_sharpen(fw / gw)}[{o}_ffo];"
-            f"[{o}_fbo][{o}_ffo]overlay=(W-w)/2:(H-h)/2[{o}_game]"
+            f"[{o}_fbo][{o}_ffo]overlay=(W-w)/2:(H-h)/2{game_zoom}[{o}_game]"
         )
     else:
-        parts.append(f"[{cur}]scale={OUT_W}:{STACK_GAME_H}{flags}{_sharpen(OUT_W / gw)}[{o}_game]")
+        parts.append(
+            f"[{cur}]scale={OUT_W}:{STACK_GAME_H}{flags}{game_zoom}{_sharpen(OUT_W / gw)}[{o}_game]"
+        )
     if not beats:
         parts.append(f"[{o}_cam][{o}_game]vstack,setsar=1[{o}]")
         return ";".join(parts)
     parts.append(f"[{o}_cam][{o}_game]vstack[{o}_st]")
     rw, rh, rx, ry = _box_px(layout.cam_rect, in_w, in_h)  # type: ignore[arg-type]
-    fg_h, top = full_cam_geometry(layout, in_w, in_h)
+    (ww, wh, wx, wy), (pw, ph), top = full_cam_geometry(layout, in_w, in_h)
     when = "+".join(
         f"between(t\\,{_fmt(a - layout.start)}\\,{_fmt(b - layout.start)})" for a, b in beats
     )
+    # the whole cam blurred as the edge fill, the head-centred window large over it
     parts.append(
         f"[{o}_c]crop={rw}:{rh}:{rx}:{ry},split=2[{o}_cb][{o}_cf];"
         f"[{o}_cb]{_fill(OUT_W, OUT_H)},{BLUR}[{o}_cbo];"
-        f"[{o}_cf]scale={OUT_W}:{_even(fg_h)}{LANCZOS}{_sharpen(OUT_W / rw)}[{o}_cfo];"
-        f"[{o}_cbo][{o}_cfo]overlay=0:{int(top)}[{o}_full];"
+        f"[{o}_cf]crop={ww}:{wh}:{wx - rx}:{wy - ry},scale={pw}:{ph}{LANCZOS}"
+        f"{_sharpen(pw / ww)},{BEAT_VIGNETTE}[{o}_cfo];"
+        f"[{o}_cbo][{o}_cfo]overlay=(W-w)/2:{int(top)}[{o}_full];"
         f"[{o}_st][{o}_full]overlay=0:0:enable='{when}',setsar=1[{o}]"
     )
     return ";".join(parts)
@@ -1947,22 +1996,26 @@ def stacked_face_px(
         return []
     hx, hy, hw, hh = layout.head_box
     fx, fy, fw, fh = layout.facecam
-    zoom = zoom_at_fn(steps or [(0.0, 1.0)], layout)
+    # the cam panel holds still when the steps zoom the gameplay panel
+    zoom = zoom_at_fn(
+        [(0.0, 1.0)] if layout.zoom_panel == "game" else steps or [(0.0, 1.0)], layout
+    )
     ay = layout.anchor_px(STACK_CAM_H)
     full = None
     if layout.cam_beats and layout.cam_rect is not None:
         full = full_cam_geometry(layout, in_w, in_h)
-        fg_h, top = full
-        rx, ry, rw, rh = layout.cam_rect
+        (ww, wh, wx, wy), (pw, ph), top = full
+        left = (OUT_W - pw) / 2
     out: list[list[float | None]] = []
     n = max(math.ceil((layout.end - layout.start) / SAMPLE_STEP - 1e-9), 1)
     for k in range(n + 1):
         t = min(layout.start + k * SAMPLE_STEP, layout.end)
         if full is not None and any(a <= t < b for a, b in layout.cam_beats):
             row = [
-                (hx - rx) / rw * OUT_W, top + (hy - ry) / rh * fg_h,
-                (hx + hw - rx) / rw * OUT_W, top + (hy + hh - ry) / rh * fg_h,
+                left + (hx * in_w - wx) / ww * pw, top + (hy * in_h - wy) / wh * ph,
+                left + ((hx + hw) * in_w - wx) / ww * pw, top + ((hy + hh) * in_h - wy) / wh * ph,
             ]  # fmt: skip
+            row = [min(max(v, 0.0), lim) for v, lim in zip(row, (OUT_W, OUT_H) * 2, strict=True)]
         else:
             z = zoom(t - layout.start)
 
@@ -2113,6 +2166,18 @@ def plan_zoom(layout: SceneLayout, in_w: int, in_h: int) -> SceneLayout:
         and (sign := _shift_sign(plan, in_w, in_h))
     ):
         plan = plan.model_copy(update={"step_shift": sign * STEP_SHIFT})
+    if (
+        _kind(layout) == "STACKED"
+        and layout.game_box is not None
+        and plan.zoom_level(ZOOM_TOP) < STACK_PUNCH_MIN
+    ):
+        # the cam can't punch visibly: the gameplay panel does, about its centre
+        gw, gh, _, _ = _box_px(layout.game_box, in_w, in_h)
+        game_up = OUT_W / gw if not layout.game_fit else min(OUT_W / gw, STACK_GAME_H / gh)
+        cap = max(min(ZOOM_TOP, MAX_UPSCALE / game_up), GAME_ZOOM_MIN)
+        plan = plan.model_copy(
+            update={"zoom_panel": "game", "base_zoom": 1.0, "zoom_cap": cap, "zoom_anchor": None}
+        )
     return plan
 
 

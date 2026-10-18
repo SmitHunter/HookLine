@@ -77,6 +77,10 @@ BEAT_LEAD = 0.3
 MAX_BEATS = 2
 BEAT_AFTER = 3.0
 BEAT_GAP = 2.0
+# A beat never overlaps an `avoid` span (the EARLIER tag; [scare - 0.5 s, scare + 1 s]; a
+# gameplay spike): it moves to just after the span, the reaction continuing, when that is at
+# most BEAT_SHIFT_MAX after the peak; else that peak gets none.
+BEAT_SHIFT_MAX = 1.5
 
 
 class SceneLayout(BaseModel):
@@ -123,6 +127,11 @@ class SceneLayout(BaseModel):
     patches: list[Box] = []
     cam_beats: list[tuple[float, float]] = []
     fit_src: Box | None = Field(default=None, exclude=True)  # the pillarbox picture found
+    # Which panel the zoom steps zoom (`reframe.plan_zoom`): the speaker's (FACE_TRACK frame,
+    # cam panel, SPLIT panels, FIT_BLUR picture) or, in a template STACKED scene whose cam has
+    # no headroom for a visible punch, the gameplay panel ("game"); `zoom_level` is then the
+    # gameplay panel's zoom
+    zoom_panel: Literal["speaker", "game"] = "speaker"
 
     def zoom_level(self, s: float) -> float:
         """Rendered zoom for schedule level `s` (1.0 / ZOOM_IN / ZOOM_TOP): base_zoom times
@@ -660,13 +669,20 @@ def plan_cam_beats(
     `peaks` (output s, score): BEAT_S long from BEAT_LEAD before the peak, inside one
     template STACKED scene (cam shown, gameplay cropped) at least BEAT_GAP from its inner
     bounds, from BEAT_AFTER on and BEAT_GAP before the end, no cut inside, BEAT_GAP from
-    other beats and clear of the `avoid` spans; at most MAX_BEATS."""
+    other beats; clear of the `avoid` spans (the EARLIER tag, scares, gameplay spikes:
+    moved just past them, at most BEAT_SHIFT_MAX after the peak); at most MAX_BEATS."""
     chosen: list[tuple[int, float, float]] = []
+    spans = sorted(avoid or [])
     for t, _ in sorted(peaks, key=lambda p: -p[1]):
         if len(chosen) >= MAX_BEATS:
             break
-        a = round(max(t - BEAT_LEAD, 0.0), 3)
+        a = max(t - BEAT_LEAD, 0.0)
+        while (hit := next((q for p, q in spans if a < q and a + BEAT_S > p), None)) is not None:
+            a = hit  # the reaction after the scare / spike
+        a = round(a, 3)
         b = round(a + BEAT_S, 3)
+        if a - t > BEAT_SHIFT_MAX + 1e-9:
+            continue
         if a < BEAT_AFTER or b > duration - BEAT_GAP:
             continue
         i = next((k for k, lay in enumerate(layouts) if lay.start <= a < lay.end), None)
@@ -682,8 +698,6 @@ def plan_cam_beats(
         if any(a + 1e-6 < c < b - 1e-6 for c in cuts):
             continue
         if any(a < q + BEAT_GAP and b > p - BEAT_GAP for _, p, q in chosen):
-            continue
-        if any(a < q and b > p for p, q in avoid or []):
             continue
         chosen.append((i, a, b))
     out = list(layouts)
