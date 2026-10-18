@@ -237,9 +237,13 @@ def test_fit_to_signals_moves_off_screens_and_extends_the_payoff():
     p = fit_to_signals(pick(67.6, 101.6), words, s, max_s=50.0)
     assert p.start == pytest.approx(69.5)
     assert p.end == pytest.approx(106.8 + 2.5)  # the catch
-    # round 1: a clip ending on a sentence end keeps its punchline when the scare is > 4 s on
-    done = [*words[:-1], W(98.2, 101.6, "No!")]
-    assert fit_to_signals(pick(67.6, 101.6), done, s, max_s=50.0).end == pytest.approx(101.6)
+    # a shout ("No!", mid-chase) is no punchline: the late catch is still its payoff
+    shout = [*words[:-1], W(98.2, 101.6, "No!")]
+    assert fit_to_signals(pick(67.6, 101.6), shout, s, max_s=50.0).end == pytest.approx(109.3)
+    # round 1: a clip ending on a punchline keeps it when the scare is > 4 s on
+    done = [*words[:-1], *sentence(98.2, "That was a close one.")]
+    end = done[-1].end
+    assert fit_to_signals(pick(67.6, end), done, s, max_s=50.0).end == pytest.approx(end)
 
 
 # --- 4. cold-open seam -------------------------------------------------------------------------

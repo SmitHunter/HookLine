@@ -300,6 +300,20 @@ def _sentence_start(prev: Word | None, word: Word) -> bool:
     return prev is None or _ends_sentence(prev) or word.start - prev.end >= _SENTENCE_GAP_S
 
 
+def _ends_on_punchline(spoken: list[Word]) -> bool:
+    """`spoken` (in order) ends on a finished sentence that is not a shout (an exclamation of
+    at most PAYOFF_SHOUT_WORDS words)."""
+    if not spoken or not _ends_sentence(spoken[-1]):
+        return False
+    n = 1
+    for prev, word in zip(spoken[-2::-1], spoken[::-1]):
+        if _sentence_start(prev, word):
+            break
+        n += 1
+    shout = spoken[-1].text.rstrip(_CLOSERS).endswith("!") and n <= PAYOFF_SHOUT_WORDS
+    return not shout
+
+
 def _filler_start(ws: list[Word]) -> bool:
     """The words open on a filler (`FILLER_OPENERS`) that refinement may trim."""
     two = " ".join(_norm(w) for w in ws[:2])
@@ -487,9 +501,11 @@ PAYOFF_SCARE_S = 8.5
 PAYOFF_REACT_S = 2.5
 PAYOFF_SAID_MAX_S = 6.0
 PAYOFF_MIN_S = 0.2  # an extension leaving less than this after the scare is not made
-# A clip already ending on a sentence end (its punchline) is not extended to a scare more than
-# PAYOFF_PUNCHLINE_S after its end (stream 03: "...gonna run?" was run on into "Who? Dodge!").
+# A clip already ending on a punchline -- a finished sentence (stream 03: "...gonna run?") -- is
+# not extended to a scare more than PAYOFF_PUNCHLINE_S after its end; a shout (an exclamation of
+# at most PAYOFF_SHOUT_WORDS words: "No!", stream 04 mid-chase) is no punchline and still is.
 PAYOFF_PUNCHLINE_S = 4.0
+PAYOFF_SHOUT_WORDS = 4
 # A screen run starts somewhere in its first flagged 4 fps frame: an end stays this far clear.
 STATIC_EDGE_S = 0.25
 
@@ -679,7 +695,7 @@ def extend_payoff(
     PAYOFF_SCARE_S after its end, with no static screen between, moves the end to
     PAYOFF_REACT_S after the scare -- or to the end of the sentence said in that time (at
     most PAYOFF_SAID_MAX_S after the scare) -- but never into a static screen nor mid-word.
-    Not made when the clip already ends on a sentence end (its punchline) and the scare is
+    Not made when the clip already ends on a punchline (`_ends_on_punchline`) and the scare is
     more than PAYOFF_PUNCHLINE_S after the end. Shortened in 0.5 s steps (each moved off a
     word, earlier) to fit `max_s` (counted without `edit_gaps`); not made when even
     PAYOFF_MIN_S after the scare does not fit. Logs."""
@@ -688,9 +704,9 @@ def extend_payoff(
     if scare is None:
         return pick
     spoken = _spoken(pick, words)
-    if spoken and _ends_sentence(spoken[-1]) and scare - pick.end > PAYOFF_PUNCHLINE_S:
+    if _ends_on_punchline(spoken) and scare - pick.end > PAYOFF_PUNCHLINE_S:
         log.info(
-            "clip %r: ends on a sentence end; payoff scare at %.2fs (%.1f s on) not added",
+            "clip %r: ends on a punchline; payoff scare at %.2fs (%.1f s on) not added",
             pick.title, scare, scare - pick.end,
         )  # fmt: skip
         return pick
