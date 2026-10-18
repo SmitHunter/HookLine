@@ -180,6 +180,7 @@ def probe_fps(path: Path) -> float:
 
 
 _SEEK_PREROLL_S = 1.0
+SPLICE_FADE_S = 0.008  # audio fade out / in at every splice between segments
 
 
 def cut_segments(
@@ -197,7 +198,8 @@ def cut_segments(
     Each piece is decoded from a seek point ~1 s early and cut with trim/atrim, so the output
     timeline is exactly the sum of the segments when their bounds lie on the source frame
     grid: video takes the frames whose timestamps fall in [start, end) (bounds shifted half a
-    frame to absorb rounding), audio is sample-trimmed to the same span."""
+    frame to absorb rounding), audio is sample-trimmed to the same span and fades out / in over
+    SPLICE_FADE_S at every join (lengths unchanged: the video stays frame-exact)."""
     if fps is None:
         fps = probe_fps(src)
     half = 0.5 / fps
@@ -209,11 +211,17 @@ def cut_segments(
         seek = max(0.0, round((start - _SEEK_PREROLL_S) * fps) / fps)
         a, b = start - seek, end - seek
         cmd += ["-ss", f"{seek:.6f}", "-t", f"{b + 1:.6f}", "-i", str(src)]
+        # an 8 ms fade on each side of every splice: no click where the waveform jumps
+        fades = ""
+        if i > 0:
+            fades += f",afade=t=in:st=0:d={SPLICE_FADE_S:g}"
+        if i + 1 < len(segments):
+            fades += f",afade=t=out:st={max(b - a - SPLICE_FADE_S, 0.0):.6f}:d={SPLICE_FADE_S:g}"
         parts.append(
             f"[{i}:v]trim=start={max(a - half, 0):.6f}:end={b - half:.6f},"
             f"setpts=PTS-STARTPTS[v{i}]"
             + (
-                f";[{i}:a]atrim=start={a:.6f}:end={b:.6f},asetpts=PTS-STARTPTS[a{i}]"
+                f";[{i}:a]atrim=start={a:.6f}:end={b:.6f},asetpts=PTS-STARTPTS{fades}[a{i}]"
                 if with_audio
                 else ""
             )
