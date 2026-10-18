@@ -944,22 +944,20 @@ def test_render_clip_facecam_override_beats_the_profile(
     assert extras["layout"][0]["game_box"] is None and extras["layout_profile"] is None
 
 
-def test_beat_avoid_spans_cover_scares_spikes_startles_and_the_tag():
+def test_beat_avoid_spans_cover_scares_spikes_and_the_tag():
     """Output spans a full-cam beat must stay out of: the EARLIER tag, [scare - 0.5 s,
-    scare + 1 s], gameplay spikes (source spans) and startled reaction words (a sharp onset
-    right at the word: the cause is on screen then), all through the keep ranges."""
+    scare + 1 s] and gameplay spikes (source spans), all through the keep ranges (startled
+    words go to plan_cam_beats apart: never blocking their own beat)."""
     from hookline.pipeline.render import beat_avoid
 
     keep = [(100.0, 110.0), (120.0, 130.0)]
     spans = beat_avoid(
-        seam=None, scares=[105.0, 125.0, 115.0], spikes=[(121.0, 123.0)], startles=[4.0],
-        keep=keep,
+        seam=None, scares=[105.0, 125.0, 115.0], spikes=[(121.0, 123.0)], keep=keep
     )  # fmt: skip
     assert [4.5, 6.0] in spans and [14.5, 16.0] in spans  # scares (one in a cut: dropped)
     assert [11.0, 13.0] in spans  # the spike
-    assert [3.5, 5.0] in spans  # the startle (already output s)
     assert all(not (a < 10.0 < b and b - a > 5) for a, b in spans)
-    assert [1.2, 2.4] in beat_avoid(seam=1.2, scares=[], spikes=[], startles=[], keep=keep)
+    assert [1.2, 2.4] in beat_avoid(seam=1.2, scares=[], spikes=[], keep=keep)
 
 
 def test_startle_times_sharp_onsets_at_peak_words():
@@ -972,8 +970,9 @@ def test_startle_times_sharp_onsets_at_peak_words():
     db[700:790] = -20.0  # a shout at 8.0 s that builds up (no jump)
     env = Envelope(t0=0.0, hop=0.01, db=db)
     words = [Word(start=5.0, end=5.4, text="Oh!"), Word(start=8.0, end=8.4, text="no")]
-    assert startle_times(words, env, [(0.0, 20.0)], peaks=[5.0, 8.0]) == [5.0]
-    assert startle_times(words, env, [(2.0, 20.0)], peaks=[3.0]) == [3.0]  # output s
+    scares = [5.1, 8.1]  # a game sting at each (round 2: no sting, no startle)
+    assert startle_times(words, env, [(0.0, 20.0)], [5.0, 8.0], scares) == [5.0]
+    assert startle_times(words, env, [(2.0, 20.0)], [3.0], scares) == [3.0]  # output s
 
 
 def test_mix_format_pins_every_channel_count_to_a_layout(monkeypatch):

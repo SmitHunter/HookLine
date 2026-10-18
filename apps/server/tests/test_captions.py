@@ -877,6 +877,8 @@ def test_stacked_caption_and_hook_lines_clear_the_cam_panel_head():
     y = caption_y_for([lay(732)], late=True)
     assert y == 732 + CAPTION_FACE_GAP + CAPTION_ABOVE
     assert hook_y_for([lay(500)]) == STACKED_HOOK_Y  # centred on the seam
-    assert hook_y_for([lay(732)]) == 732 + CAPTION_FACE_GAP + HOOK_HALF
+    assert hook_y_for([lay(700)]) == 700 + CAPTION_FACE_GAP + HOOK_HALF  # still straddles
+    # round 2: a chin too low to straddle puts the box just below the seam, no further
+    assert hook_y_for([lay(732)]) == 760 + HOOK_HALF
     # capped: the captions under it stay inside Q4
     assert caption_y_for([lay(760)]) <= 1180 and hook_y_for([lay(760)]) + HOOK_HALF <= 1250

@@ -51,6 +51,8 @@ from hookline.models import ClipPick, Word
 from hookline.pipeline.boundaries import refine_boundaries
 from hookline.pipeline.deadair import cut_gaps, keep_ranges, remap_words, snap_ranges
 from hookline.pipeline.layout import (
+    SCARE_POST_S,
+    SCARE_PRE_S,
     SceneLayout,
     plan_cam_beats,
     plan_layouts,
@@ -104,13 +106,15 @@ SCARE_BONUS = 4.0
 REACT_LOUD_DB = -16.0
 REACT_TOP_DB = 3.0
 # Beats stay out of [scare - SCARE_PRE_S, scare + SCARE_POST_S] (the payoff is the gameplay)
-# and the same round a startled reaction word: a peak word whose level jumps >= STARTLE_DB
-# within STARTLE_RISE_S of its start over the quietest of the STARTLE_BEFORE_S before it (the
-# game's sting and the shout land together; the cause is on screen then)
-SCARE_PRE_S, SCARE_POST_S = 0.5, 1.0
+# and the same round another startled reaction word: a peak word whose level jumps
+# >= STARTLE_DB within STARTLE_RISE_S of its start over the quietest of the STARTLE_BEFORE_S
+# before it, AND whose onset is within STARTLE_NEAR_S of a game transient (scare) or a
+# flash / motion spike (the game's sting and the shout land together; the cause is on screen
+# then). A sharp onset alone is any word after a pause: no startle.
 STARTLE_DB = 10.0
 STARTLE_RISE_S = 0.15
 STARTLE_BEFORE_S = 0.5
+STARTLE_NEAR_S = 0.3
 
 log = logging.getLogger(__name__)
 
@@ -245,15 +249,27 @@ def reaction_peaks(
 
 
 def startle_times(
-    words: list[Word], env: Envelope, keep: list[tuple[float, float]], peaks: list[float]
+    words: list[Word],
+    env: Envelope,
+    keep: list[tuple[float, float]],
+    peaks: list[float],
+    scares: list[float] | None = None,
+    spikes: list[tuple[float, float]] | None = None,
 ) -> list[float]:
     """Output times among the reaction `peaks` (output s) whose word (source time) starts
-    with a sharp onset: STARTLE_DB over the quietest frame of the STARTLE_BEFORE_S before it,
-    within STARTLE_RISE_S."""
+    with a sharp onset -- STARTLE_DB over the quietest frame of the STARTLE_BEFORE_S before
+    it, within STARTLE_RISE_S -- that coincides (within STARTLE_NEAR_S) with a game transient
+    (`scares`, source s) or a flash / motion spike (`spikes`, source spans)."""
+    near = STARTLE_NEAR_S
     out = []
     for w in words:
         t = _to_output_time(w.start, keep)
         if t is None or not any(abs(t - p) < 1e-3 for p in peaks):
+            continue
+        game = any(abs(w.start - s) <= near for s in scares or []) or any(
+            a - near <= w.start <= b + near for a, b in spikes or []
+        )
+        if not game:
             continue
         before = env.db[env.index(w.start - STARTLE_BEFORE_S) : env.index(w.start)]
         rise = env.db[env.index(w.start) : env.index(w.start + STARTLE_RISE_S) + 1]
@@ -266,16 +282,15 @@ def beat_avoid(
     seam: float | None,
     scares: list[float],
     spikes: list[tuple[float, float]],
-    startles: list[float],
     keep: list[tuple[float, float]],
 ) -> list[list[float]]:
     """Output spans a full-cam beat stays out of: the EARLIER tag after the `seam`, each
-    scare (source s) from SCARE_PRE_S before to SCARE_POST_S after, the gameplay `spikes`
-    (source spans) and each startled reaction (`startles`, output s) like a scare."""
+    scare (source s) from SCARE_PRE_S before to SCARE_POST_S after and the gameplay `spikes`
+    (source spans). Startled reaction words (`startle_times`) go to `plan_cam_beats` apart:
+    they keep other peaks' beats off them, never their own."""
     out = [[seam, round(seam + SEAM_TAG_S, 3)]] if seam is not None else []
     near = [(s - SCARE_PRE_S, s + SCARE_POST_S) for s in scares]
     out += _to_output_spans([*near, *spikes], keep)
-    out += [[round(t - SCARE_PRE_S, 3), round(t + SCARE_POST_S, 3)] for t in startles]
     return sorted(out)
 
 
@@ -577,9 +592,9 @@ def render_clip(
         if any(lay.cam_rect is not None for lay in layouts):
             # full-cam reaction beats, never under the EARLIER tag nor over a scare / spike
             peaks = reaction_peaks(spoken, env, keep, scares)
-            startles = startle_times(spoken, env, keep, [t for t, _ in peaks])
-            avoid = beat_avoid(seam, scares or [], spikes or [], startles, keep)
-            layouts = plan_cam_beats(peaks, layouts, cuts, duration, avoid=avoid)  # type: ignore[arg-type]
+            startles = startle_times(spoken, env, keep, [t for t, _ in peaks], scares, spikes)
+            avoid = [(a, b) for a, b in beat_avoid(seam, scares or [], spikes or [], keep)]
+            layouts = plan_cam_beats(peaks, layouts, cuts, duration, avoid, startles)
         layouts = [
             lay.model_copy(
                 update={
@@ -623,6 +638,7 @@ def render_clip(
         out_label = "[vfinal]"
 
     audio_args: list[str] = []
+    audio_graph = ""  # the room-tone mix (filter graph), when there is one
     last_end = max((w.end for w in out_words), default=None)  # the end fade spares it
     audio_map = ["-map", "0:a?"]
     if audio is not None and bed:
@@ -632,15 +648,30 @@ def render_clip(
         # negotiation (the mono bed against the stereo clip) the planned loudness came out
         # ~0.7 dB low (podcast clips at -14.9 LUFS) and the peaks ~3 dB over the plan
         fmt = mix_format(inter)
-        graph += (
-            f";[0:a]{audio.af},{fmt}[amain];{room_tone(duration)},{fmt}[abed];"
+        audio_graph = (
+            f"[0:a]{audio.af},{fmt}[amain];{room_tone(duration)},{fmt}[abed];"
             f"[amain][abed]amix=inputs=2:duration=first:normalize=0,"
             f"{audio_fades(duration, last_end)}[aout]"
         )
+        graph += ";" + audio_graph
         audio_map = ["-map", "[aout]"]
         log.info("%s: digital silence in the cut; room tone at %g dBFS", name, ROOM_TONE_DB)
     elif audio is not None:  # the clip has audio
         audio_args = ["-af", f"{audio.af},{audio_fades(duration, last_end)}"]
+    master_wav = work_dir / f"{name}.master.wav"
+
+    def audio_master() -> Path:
+        """The clip's audio exactly as mixed for the final encode, lossless (the true-peak
+        safety net re-encodes from it, never from the AAC)."""
+        if audio_map == ["-map", "[aout]"]:
+            mix = ["-lavfi", audio_graph, "-map", "[aout]"]
+        else:
+            mix = ["-map", "0:a", *audio_args]
+        _run(
+            ["ffmpeg", "-hide_banner", "-y", "-i", str(inter), *mix,
+             "-c:a", "pcm_s24le", "-ar", "48000", str(master_wav)]
+        )  # fmt: skip
+        return master_wav
 
     tmp = dst.with_suffix(".tmp.mp4")
     _run(
@@ -658,7 +689,8 @@ def render_clip(
     )  # fmt: skip
     os.replace(tmp, dst)
     if audio and audio.mode != "skip":
-        ensure_true_peak(dst)
+        ensure_true_peak(dst, master=audio_master)
+        master_wav.unlink(missing_ok=True)
     inter.unlink(missing_ok=True)
 
     kept = sum(e - s for s, e in keep)

@@ -85,12 +85,12 @@ STACKED_CAPTION_Y = STACK_CAM_H + round(SEAM_OVERLAP * STACK_GAME_H) - CAPTION_B
 # ... moved down to clear a streamer's chin in the cam panel, at most this far (829)
 STACKED_CAPTION_MAX_Y = SAFE_BOTTOM - 2 * HOOK_HALF - TEXT_SEPARATION - CAPTION_BELOW
 # The STACKED hook title (and EARLIER tag) sits over the cam panel's lower band and the seam,
-# centred on it (a two-line box 604-916), lowered to clear the chin (CAPTION_FACE_GAP) -- never
-# over the gameplay's centre; the captions shown with it go TEXT_SEPARATION under its box
-# (1003), the later ones back on the seam. At most STACKED_HOOK_MAX_Y, so those captions
-# still fit Q4 (937).
+# centred on it (a two-line box 604-916), lowered to clear the chin (CAPTION_FACE_GAP) while
+# it still straddles the seam; a chin too low for that (a large head) puts the box just
+# below the seam (its top on it: 916), never further down over the gameplay. The captions
+# shown with it go TEXT_SEPARATION under its box (<= 1159), the later ones back on the seam.
 STACKED_HOOK_Y = STACK_CAM_H
-STACKED_HOOK_MAX_Y = CAPTION_MAX_Y - CAPTION_ABOVE - TEXT_SEPARATION - HOOK_HALF
+STACKED_HOOK_MAX_Y = STACK_CAM_H + HOOK_HALF
 STACKED_CAPTION_EARLY_Y = STACKED_HOOK_Y + HOOK_HALF + TEXT_SEPARATION + CAPTION_ABOVE
 HOOK_Y = 360  # requested centre; clamped so the box stays in Q4 (1 line: 378, 2 lines: 446)
 # A rendered face sample (`SceneLayout.face_px`): output s, core x0, top, x1, bottom, eye y px
@@ -659,7 +659,8 @@ def _stacked_caption_y(layouts: list[SceneLayout], until: float | None) -> int:
 
 def _stacked_hook_y(layouts: list[SceneLayout], until: float | None) -> int:
     """The STACKED hook centre: on the seam (STACKED_HOOK_Y), lowered so its two-line box
-    clears the cam panel's chin by CAPTION_FACE_GAP, at most STACKED_HOOK_MAX_Y."""
+    clears the cam panel's chin by CAPTION_FACE_GAP while straddling the seam; at most
+    STACKED_HOOK_MAX_Y (the box just below the seam: the panel edge parts it from the chin)."""
     chin = _stacked_chin(layouts, until)
     if chin is None:
         return STACKED_HOOK_Y

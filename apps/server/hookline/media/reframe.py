@@ -106,10 +106,14 @@ BEAT_HEAD_TOP = 40  # ... and a head taller than BEAT_CHIN_Y less this is shown 
 BEAT_VIGNETTE = "vignette=angle=0.35"
 PATCH_BLUR = "gblur=sigma=16"  # an overlay inside the gameplay panel, blurred over
 # A template STACKED cam whose headroom caps its top zoom under STACK_PUNCH_MIN (an invisible
-# 1.02-1.035) zooms the gameplay panel instead, about its centre: levels up to ZOOM_TOP (the
-# upscale allowing, MAX_UPSCALE), at least GAME_ZOOM_MIN at the top so ZOOM_IN shows >= 1.08.
+# 1.02-1.035) zooms the gameplay panel instead, about its centre: levels up to ZOOM_TOP, the
+# total upscale within MAX_UPSCALE and every static overlay in the panel (`game_static`) kept
+# whole with OVERLAY_MARGIN of the panel to spare; only when that still allows GAME_ZOOM_MIN
+# at the top (ZOOM_IN then shows >= 1.07), else the steps stay on the cam. The cam keeps its
+# base level (`cam_zoom`).
 STACK_PUNCH_MIN = 1.08
 GAME_ZOOM_MIN = 1.14
+OVERLAY_MARGIN = 0.02  # (the overlay boxes are already grown by their join, ~8 px at 1280)
 
 
 def detect_crop(
@@ -1613,6 +1617,17 @@ def _zoom(expr: str, w: int, h: int, ay: float | None = None, flags: str = "") -
     return f",scale=w='{sw}':h='{sh}':eval=frame{flags},crop={w}:{h}:x='{x}':y='{y}'"
 
 
+def _static_zoom(z: float, w: int, h: int, ay: float | None = None, flags: str = "") -> str:
+    """`_zoom` by a constant `z` (configure-time sizes: no per-frame eval); empty at 1."""
+    if z <= 1.0 + 1e-9:
+        return ""
+    sw, sh = _even(w * z), _even(h * z)
+    ay = h / 2 if ay is None else min(max(ay, 0.0), float(h))
+    x = min(round(w / 2 * (z - 1)), sw - w)
+    y = min(round(ay * (z - 1)), sh - h)
+    return f",scale={sw}:{sh}{flags},crop={w}:{h}:{x}:{y}"
+
+
 def _sharpen(factor: float) -> str:
     return f",{SHARPEN}" if factor > SHARPEN_ABOVE else ""
 
@@ -1739,7 +1754,9 @@ def scene_filter(
     `zoom_steps` (output time, from `zoom_schedule`) zoom the speaker panel after the layout,
     each level mapped through the scene's plan (`plan_zoom`, `SceneLayout.zoom_level`) and
     scaled about its anchor row (`SceneLayout.anchor_px`): FACE_TRACK whole frame, STACKED
-    facecam panel, both SPLIT panels, FIT_BLUR foreground. Steps at `cut_times` (output s)
+    facecam panel, both SPLIT panels, FIT_BLUR foreground -- or, in a template STACKED scene
+    planned `zoom_panel == "game"`, the gameplay panel about its centre (the cam panel then
+    held at its `cam_zoom`). Steps at `cut_times` (output s)
     and at the scene's own bounds (camera changes) land in one frame, the others ease. Pass steps already through `guard_zoom` (the edge
     guard's holds; the same steps go to the sidecar). A FACE_TRACK crop follows its track with
     the edge guard and gaze lead (`_track_plan`, the rendered zoom at each moment) plus the
@@ -1829,7 +1846,11 @@ def _template_filter(
     parts = [f"[{label_in}]split={3 if beats else 2}[{o}_a][{o}_b]" + (f"[{o}_c]" if beats else "")]
     cam_up = max(OUT_W / cw, STACK_CAM_H / ch)
     game = layout.zoom_panel == "game"  # the steps zoom the gameplay panel, not the cam
-    cam_zoom = "" if game else _zoom(zoom, OUT_W, STACK_CAM_H, layout.anchor_px(STACK_CAM_H), flags)
+    ay = layout.anchor_px(STACK_CAM_H)
+    if game:  # the cam held at its base level
+        cam_zoom = _static_zoom(layout.cam_zoom, OUT_W, STACK_CAM_H, ay, flags)
+    else:
+        cam_zoom = _zoom(zoom, OUT_W, STACK_CAM_H, ay, flags)
     game_zoom = _zoom(zoom, OUT_W, STACK_GAME_H, None, flags) if game else ""
     parts.append(
         f"[{o}_a]crop={cw}:{ch}:{cx}:{cy},{_fill(OUT_W, STACK_CAM_H, flags)}"
@@ -1996,10 +2017,14 @@ def stacked_face_px(
         return []
     hx, hy, hw, hh = layout.head_box
     fx, fy, fw, fh = layout.facecam
-    # the cam panel holds still when the steps zoom the gameplay panel
-    zoom = zoom_at_fn(
-        [(0.0, 1.0)] if layout.zoom_panel == "game" else steps or [(0.0, 1.0)], layout
-    )
+    # the cam panel holds still (at its base level) when the steps zoom the gameplay panel
+    if layout.zoom_panel == "game":
+
+        def zoom(_t: float) -> float:
+            return layout.cam_zoom
+
+    else:
+        zoom = zoom_at_fn(steps or [(0.0, 1.0)], layout)
     ay = layout.anchor_px(STACK_CAM_H)
     full = None
     if layout.cam_beats and layout.cam_rect is not None:
@@ -2171,14 +2196,49 @@ def plan_zoom(layout: SceneLayout, in_w: int, in_h: int) -> SceneLayout:
         and layout.game_box is not None
         and plan.zoom_level(ZOOM_TOP) < STACK_PUNCH_MIN
     ):
-        # the cam can't punch visibly: the gameplay panel does, about its centre
+        # the cam can't punch visibly: the gameplay panel does, about its centre -- within
+        # the upscale limit and never cropping a static overlay at its edge
         gw, gh, _, _ = _box_px(layout.game_box, in_w, in_h)
         game_up = OUT_W / gw if not layout.game_fit else min(OUT_W / gw, STACK_GAME_H / gh)
-        cap = max(min(ZOOM_TOP, MAX_UPSCALE / game_up), GAME_ZOOM_MIN)
-        plan = plan.model_copy(
-            update={"zoom_panel": "game", "base_zoom": 1.0, "zoom_cap": cap, "zoom_anchor": None}
-        )
+        cap = min(ZOOM_TOP, MAX_UPSCALE / game_up, _overlay_cap(layout, in_w, in_h))
+        if cap >= GAME_ZOOM_MIN - 1e-9:
+            plan = plan.model_copy(
+                update={
+                    "zoom_panel": "game",
+                    "cam_zoom": plan.zoom_level(1.0),
+                    "base_zoom": 1.0,
+                    "zoom_cap": cap,
+                    "zoom_anchor": None,
+                }
+            )
     return plan
+
+
+def _overlay_cap(layout: SceneLayout, in_w: int, in_h: int) -> float:
+    """The largest gameplay-panel zoom (about its centre) that keeps every `game_static`
+    overlay inside the panel with OVERLAY_MARGIN of it to spare (inf without overlays)."""
+    assert layout.game_box is not None
+    gx, gy, gw, gh = layout.game_box
+    fw, fh = float(OUT_W), float(STACK_GAME_H)
+    if layout.game_fit:  # the picture fitted whole in the panel (`_template_filter`)
+        pw, ph, _, _ = _box_px(layout.game_box, in_w, in_h)
+        fw, fh = OUT_W, OUT_W * ph / pw
+        if fh > STACK_GAME_H:
+            fw, fh = STACK_GAME_H * pw / ph, STACK_GAME_H
+    cap = math.inf
+    m = OVERLAY_MARGIN
+    for bx, by, bw, bh in layout.game_static:
+        u0 = ((OUT_W - fw) / 2 + (bx - gx) / gw * fw) / OUT_W
+        u1 = ((OUT_W - fw) / 2 + (bx + bw - gx) / gw * fw) / OUT_W
+        v0 = ((STACK_GAME_H - fh) / 2 + (by - gy) / gh * fh) / STACK_GAME_H
+        v1 = ((STACK_GAME_H - fh) / 2 + (by + bh - gy) / gh * fh) / STACK_GAME_H
+        # zoom z shows [0.5 - 0.5 / z, 0.5 + 0.5 / z] of each axis
+        for lo, hi in ((u0, u1), (v0, v1)):
+            if lo < 0.5:
+                cap = min(cap, 0.5 / (0.5 - lo + m))
+            if hi > 0.5:
+                cap = min(cap, 0.5 / (hi + m - 0.5))
+    return cap
 
 
 def _merge_short(layouts: list[SceneLayout]) -> list[SceneLayout]:

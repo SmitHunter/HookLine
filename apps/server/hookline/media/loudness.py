@@ -4,6 +4,8 @@ import json
 import logging
 import os
 import re
+import shutil
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -319,11 +321,14 @@ TP_LIMIT_DEEP_DB = -4.0
 TP_LIMIT_LOSS = 0.5
 
 
-def _reencode_audio(src: Path, dst: Path, af: str) -> None:
+def _reencode_audio(video: Path, dst: Path, af: str, audio: Path | None = None) -> None:
+    """`video`'s picture (copied) with its audio -- or `audio`'s, a lossless master of it --
+    through `af`, encoded to AAC once."""
+    inputs = ["-i", str(video)] + (["-i", str(audio)] if audio is not None else [])
     _run(
         [
-            "ffmpeg", "-hide_banner", "-y", "-i", str(src),
-            "-map", "0:v", "-map", "0:a", "-c:v", "copy",
+            "ffmpeg", "-hide_banner", "-y", *inputs,
+            "-map", "0:v", "-map", "1:a" if audio is not None else "0:a", "-c:v", "copy",
             "-af", af,
             "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
             "-movflags", "+faststart", str(dst),
@@ -331,39 +336,57 @@ def _reencode_audio(src: Path, dst: Path, af: str) -> None:
     )  # fmt: skip
 
 
-def ensure_true_peak(dst: Path) -> float | None:
+def ensure_true_peak(dst: Path, master: Callable[[], Path | None] | None = None) -> float | None:
     """Post-encode safety net: AAC can overshoot the limiter ceiling. When `dst`'s true peak
     is above -1.2 dBTP, re-encode only its audio: first through a peak limiter at TP_LIMIT_DB,
     then TP_LIMIT_DEEP_DB (the loudness stays); if neither brings the peak under -1.2 dBTP for
-    at most TP_LIMIT_LOSS of loudness, with a volume trim instead (from the original) to land
-    at about -1.5, re-measured and trimmed again while still over. Returns the loudness
-    change in dB (None when nothing was done)."""
+    at most TP_LIMIT_LOSS of loudness, with a volume trim instead to land at about -1.5,
+    re-measured and, still over, the whole correction applied again to the same source (one
+    AAC generation, never a trim of a trim). Every re-encode reads the pre-AAC master that
+    `master` builds (lazily, only once something must be done: the clip's audio as mixed,
+    lossless), else the clip's original audio. Returns the loudness change in dB (None when
+    nothing was done)."""
     m = measure_loudness(dst)
     if m is None or m.tp <= TP_TRIM_ABOVE:
         return None
+    src = master() if master is not None else None
+    orig = None
+    if src is None:  # no master: the trims all start from the clip as encoded
+        orig = dst.with_suffix(".orig" + dst.suffix)
+        shutil.copyfile(dst, orig)
     tmp = dst.with_suffix(".trim" + dst.suffix)
-    for ceiling in (TP_LIMIT_DB, TP_LIMIT_DEEP_DB):
-        lim = LIMITER.format(lim=10 ** (ceiling / 20))
-        _reencode_audio(dst, tmp, f"aresample={LIMIT_RATE},{lim}")
-        after = measure_loudness(tmp)
-        if after is not None and after.tp <= TP_TRIM_ABOVE and m.i - after.i <= TP_LIMIT_LOSS:
+    video = orig or dst
+
+    def encode(af: str) -> None:
+        _reencode_audio(video, tmp, af, src)
+
+    try:
+        for ceiling in (TP_LIMIT_DB, TP_LIMIT_DEEP_DB):
+            lim = LIMITER.format(lim=10 ** (ceiling / 20))
+            encode(f"aresample={LIMIT_RATE},{lim}")
+            after = measure_loudness(tmp)
+            if after is not None and after.tp <= TP_TRIM_ABOVE and m.i - after.i <= TP_LIMIT_LOSS:
+                os.replace(tmp, dst)
+                log.info(
+                    "audio: true-peak limit %.1f: %.2f -> TP %.2f, I %.2f -> %.2f",
+                    ceiling, m.tp, after.tp, m.i, after.i,
+                )  # fmt: skip
+                return round(after.i - m.i, 2)
+        total, tp = 0.0, m.tp
+        for _ in range(2):  # the trim, then once more if AAC still rings over
+            total = round(total + TP_TRIM_TARGET - tp, 2)
+            encode(f"volume={total:.2f}dB")
             os.replace(tmp, dst)
+            after = measure_loudness(dst)
             log.info(
-                "audio: true-peak limit %.1f: %.2f -> TP %.2f, I %.2f -> %.2f",
-                ceiling, m.tp, after.tp, m.i, after.i,
+                "audio: true-peak trim %.2f dB -> TP %s",
+                total, f"{after.tp:.2f}" if after else "?",
             )  # fmt: skip
-            return round(after.i - m.i, 2)
-    total, tp = 0.0, m.tp
-    for _ in range(2):  # the trim, then once more if AAC still rings over
-        trim = round(TP_TRIM_TARGET - tp, 2)
-        _reencode_audio(dst, tmp, f"volume={trim:.2f}dB")
-        os.replace(tmp, dst)
-        total += trim
-        after = measure_loudness(dst)
-        log.info(
-            "audio: true-peak trim %.2f dB -> TP %s", trim, f"{after.tp:.2f}" if after else "?"
-        )
-        if after is None or after.tp <= TP_TRIM_ABOVE:
-            break
-        tp = after.tp
-    return round(total, 2)
+            if after is None or after.tp <= TP_TRIM_ABOVE:
+                break
+            tp = after.tp
+        return round(total, 2)
+    finally:
+        tmp.unlink(missing_ok=True)
+        if orig is not None:
+            orig.unlink(missing_ok=True)

@@ -158,7 +158,7 @@ def test_near_silent_clip_not_boosted(
     from hookline.pipeline import render as render_mod
 
     trims = []
-    monkeypatch.setattr(render_mod, "ensure_true_peak", lambda p: trims.append(p))
+    monkeypatch.setattr(render_mod, "ensure_true_peak", lambda p, **k: trims.append(p))
     dst, _ = _render(near_silent_video, tmp_path, sample_pick, settings, final_argvs)
     assert trims == []  # near-silent audio is skipped, so no true-peak check either
     m = measure_loudness(dst)
@@ -272,7 +272,8 @@ def test_ensure_true_peak_acts_when_the_trim_still_overshoots(
     real = loud_mod._run
     monkeypatch.setattr(loud_mod, "_run", lambda cmd: (cmds.append(cmd), real(cmd))[1])
     trim = ensure_true_peak(copy)
-    assert len(cmds) == 4 and "volume=-1.10dB" in cmds[2] and "volume=-0.50dB" in cmds[3]
+    # round 2: the whole correction re-applied to the original audio, not a trim of the trim
+    assert len(cmds) == 4 and "volume=-1.10dB" in cmds[2] and "volume=-1.60dB" in cmds[3]
     assert trim == pytest.approx(-1.6)
 
 
@@ -282,7 +283,7 @@ def test_render_runs_true_peak_check(
     from hookline.pipeline import render as render_mod
 
     checked = []
-    monkeypatch.setattr(render_mod, "ensure_true_peak", lambda p: checked.append(p))
+    monkeypatch.setattr(render_mod, "ensure_true_peak", lambda p, **k: checked.append(p))
     dst, _ = _render(quiet_speech_video, tmp_path, sample_pick, settings, final_argvs)
     assert checked == [dst]
 

@@ -10,7 +10,14 @@ import numpy as np
 from pydantic import BaseModel, Field
 
 from hookline.media.ffmpeg import FFmpegError, probe_duration, probe_size
-from hookline.pipeline.profile import BAR_CONTENT, BAR_LIMIT, LayoutProfile, PxBox, ring_visible
+from hookline.pipeline.profile import (
+    BAR_CONTENT,
+    BAR_LIMIT,
+    LayoutProfile,
+    PxBox,
+    ring_visible,
+    static_edges,
+)
 from hookline.vision.faces import Crop, Face, sample_frames
 
 LayoutKind = Literal["STACKED", "FACE_TRACK", "SPLIT", "FIT_BLUR"]
@@ -63,10 +70,19 @@ PILLAR_W = 320
 # average >= PILLAR_STEP gray over the PILLAR_EDGE columns of bar outside it (a vignette fades)
 PILLAR_EDGE = 3
 PILLAR_STEP = 20.0
+# Static overlays in the gameplay panel (`game_overlays`), from a scene's PILLAR_W samples
+# (>= OVERLAY_SAMPLES of them): static edges (profile.static_edges) joined over OVERLAY_JOIN
+# px, at least OVERLAY_MIN_PX of them, their box at most OVERLAY_MAX of the gameplay box and
+# clear of its edges by OVERLAY_EDGE px (the picture's own edge, a cut-off object).
+OVERLAY_SAMPLES = 4
+OVERLAY_JOIN = 2
+OVERLAY_MIN_PX = 12
+OVERLAY_MAX = 0.2
+OVERLAY_EDGE = 2
 # The cam hidden (BRB, a full-screen cutscene, a Just Chatting stretch with the overlay off):
 # a face at least JC_FACE_MIN of the frame tall in most samples is the streamer full frame
 # (`classify_scene`: FACE_TRACK / SPLIT); otherwise FIT_BLUR.
-JC_FACE_MIN = 0.2
+JC_FACE_MIN = 0.12  # sit-back Just Chatting: a face 15-20% of the frame tall
 FIT_TRIM = 0.15  # an overlay at a fitted picture's side edge is cut off when it costs <= this
 # Full-cam reaction beats: the cam alone (whole, blurred background) for BEAT_S at the
 # strongest reaction peaks, starting BEAT_LEAD before the peak; at most MAX_BEATS per clip,
@@ -81,6 +97,9 @@ BEAT_GAP = 2.0
 # gameplay spike): it moves to just after the span, the reaction continuing, when that is at
 # most BEAT_SHIFT_MAX after the peak; else that peak gets none.
 BEAT_SHIFT_MAX = 1.5
+# ... a scare's span: [scare - SCARE_PRE_S, scare + SCARE_POST_S] (the payoff is the gameplay);
+# a startled reaction word gets the same (render.startle_times)
+SCARE_PRE_S, SCARE_POST_S = 0.5, 1.0
 
 
 class SceneLayout(BaseModel):
@@ -132,6 +151,11 @@ class SceneLayout(BaseModel):
     # no headroom for a visible punch, the gameplay panel ("game"); `zoom_level` is then the
     # gameplay panel's zoom
     zoom_panel: Literal["speaker", "game"] = "speaker"
+    # ... the cam panel's own (static) zoom then: the cam plan's base level, kept
+    cam_zoom: float = 1.0
+    # Static overlays inside the gameplay panel's box (a game's "REC" / "VIDRES" text, a HUD
+    # element), normalized source boxes: a gameplay punch never crops them (`plan_zoom`)
+    game_static: list[Box] = []
 
     def zoom_level(self, s: float) -> float:
         """Rendered zoom for schedule level `s` (1.0 / ZOOM_IN / ZOOM_TOP): base_zoom times
@@ -518,6 +542,43 @@ def pillarbox(frames: np.ndarray, keep_out: list[Box]) -> Box | None:
     return (left / w, 0.0, (w - left - right) / w, 1.0)
 
 
+def game_overlays(frames: np.ndarray, game: Box, keep_out: list[Box]) -> list[Box]:
+    """Static overlays (normalized boxes) inside the gameplay box `game` from a scene's gray
+    (n, H, W) samples (`crop` space): static edges outside the `keep_out` boxes (cam, label;
+    blurred anyway), joined over OVERLAY_JOIN px into components of >= OVERLAY_MIN_PX edge
+    pixels, each box at most OVERLAY_MAX of the gameplay box and OVERLAY_EDGE px clear of its
+    edges. [] with fewer than OVERLAY_SAMPLES samples (too few to tell static from slow)."""
+    import cv2
+
+    n, h, w = frames.shape
+    if n < OVERLAY_SAMPLES:
+        return []
+    x0, y0 = max(int(game[0] * w), 0), max(int(game[1] * h), 0)
+    x1, y1 = min(math.ceil((game[0] + game[2]) * w), w), min(math.ceil((game[1] + game[3]) * h), h)
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        return []
+    edges = static_edges(frames, (x0, y0, x1, y1))
+    for bx, by, bw, bh in keep_out:
+        edges[
+            max(int(by * h) - y0, 0) : max(math.ceil((by + bh) * h) - y0, 0),
+            max(int(bx * w) - x0, 0) : max(math.ceil((bx + bw) * w) - x0, 0),
+        ] = False
+    k = 2 * OVERLAY_JOIN + 1
+    joined = cv2.dilate(edges.astype(np.uint8), np.ones((k, k), np.uint8))
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(joined, connectivity=8)
+    gw, gh = x1 - x0, y1 - y0
+    out = []
+    for c in range(1, count):
+        cx, cy, cw, ch, _ = (int(v) for v in stats[c])
+        if int(edges[labels == c].sum()) < OVERLAY_MIN_PX or cw * ch > OVERLAY_MAX * gw * gh:
+            continue
+        e = OVERLAY_EDGE
+        if cx < e or cy < e or cx + cw > gw - e or cy + ch > gh - e:
+            continue
+        out.append(((x0 + cx) / w, (y0 + cy) / h, cw / w, ch / h))
+    return sorted(out)
+
+
 def classify_profile_scene(
     start: float,
     end: float,
@@ -531,7 +592,8 @@ def classify_profile_scene(
     """A scene of a profiled stream: the fixed STACKED template when the cam's border (or its
     picture just inside it) shows in >= CAM_SHOWN of the `ring_frames` (gray crops of the
     source at px `origin`), its
-    gameplay fitted when the `wide` samples (gray, `crop` space) are pillarboxed; the cam
+    gameplay fitted when the `wide` samples (gray, `crop` space) are pillarboxed, its static
+    overlays noted (`game_overlays`: a gameplay punch keeps them whole); the cam
     hidden (BRB, a full-screen cutscene): FIT_BLUR of the gameplay. Never FACE_TRACK: the
     only face that matters is the streamer's, in the cam. A pillarbox picture within
     PILLAR_SYMMETRY of the previous scene's (`prev_fit`) is taken as that one: one cutscene,
@@ -548,6 +610,7 @@ def classify_profile_scene(
     if near and all(abs(a - b) <= PILLAR_SYMMETRY for a, b in zip(fit, prev_fit, strict=True)):  # type: ignore[arg-type]
         fit = prev_fit
     tpl = stack_template(profile, crop, profile.size, fit=fit)
+    tpl["game_static"] = game_overlays(wide, tpl["game_box"], keep_out)
     return SceneLayout(start=start, end=end, kind="STACKED", fit_src=fit, **tpl)
 
 
@@ -652,7 +715,8 @@ def merge_same(layouts: list[SceneLayout]) -> list[SceneLayout]:
             and not tracked
             and all(getattr(prev, k) == getattr(lay, k) for k in _GEOMETRY)
         ):
-            out[-1] = prev.model_copy(update={"end": lay.end})
+            static = sorted({*prev.game_static, *lay.game_static})
+            out[-1] = prev.model_copy(update={"end": lay.end, "game_static": static})
         else:
             out.append(lay)
     return out
@@ -664,18 +728,22 @@ def plan_cam_beats(
     cuts: list[float],
     duration: float,
     avoid: list[tuple[float, float]] | None = None,
+    startles: list[float] | None = None,
 ) -> list[SceneLayout]:
     """`layouts` with full-cam reaction beats (`cam_beats`, output s) at the strongest
     `peaks` (output s, score): BEAT_S long from BEAT_LEAD before the peak, inside one
     template STACKED scene (cam shown, gameplay cropped) at least BEAT_GAP from its inner
     bounds, from BEAT_AFTER on and BEAT_GAP before the end, no cut inside, BEAT_GAP from
-    other beats; clear of the `avoid` spans (the EARLIER tag, scares, gameplay spikes:
-    moved just past them, at most BEAT_SHIFT_MAX after the peak); at most MAX_BEATS."""
+    other beats; clear of the `avoid` spans (the EARLIER tag, scares, gameplay spikes) and of
+    [startle - SCARE_PRE_S, startle + SCARE_POST_S] round every startled reaction word
+    (`startles`, output s) but the peak's own -- moved just past them, at most BEAT_SHIFT_MAX
+    after the peak; at most MAX_BEATS."""
     chosen: list[tuple[int, float, float]] = []
-    spans = sorted(avoid or [])
     for t, _ in sorted(peaks, key=lambda p: -p[1]):
         if len(chosen) >= MAX_BEATS:
             break
+        others = [(s - SCARE_PRE_S, s + SCARE_POST_S) for s in startles or [] if abs(s - t) > 1e-3]
+        spans = sorted([*((p, q) for p, q in avoid or []), *others])
         a = max(t - BEAT_LEAD, 0.0)
         while (hit := next((q for p, q in spans if a < q and a + BEAT_S > p), None)) is not None:
             a = hit  # the reaction after the scare / spike
