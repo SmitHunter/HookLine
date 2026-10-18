@@ -87,8 +87,10 @@ def test_snap_onsets_ignores_words_without_a_pause_and_far_rises():
     env = _env([(0.5, 1.0), (1.05, 1.3), (2.0, 2.5)])
     words = [_w(0.5, 1.0), _w(1.1, 1.3)]  # 0.1 s gap: not a pause
     assert snap_onsets(words, env, THR) == words
-    far = [_w(0.5, 1.0), _w(2.5, 2.8)]  # the rise at 2.0 is 0.5 s away (> 0.25 s window)
-    assert snap_onsets(far, _env([(0.5, 1.0), (2.0, 2.8)]), THR)[1].start == 2.5
+    far = [_w(0.5, 1.0), _w(2.5, 2.8)]  # wave F: a rise 0.5 s before, after a pause: taken
+    assert snap_onsets(far, _env([(0.5, 1.0), (2.0, 2.8)]), THR)[1].start == pytest.approx(2.0)
+    after = [_w(0.5, 1.0), _w(1.5, 1.8)]  # a rise 0.5 s after the start: out of reach
+    assert snap_onsets(after, _env([(0.5, 1.0), (2.0, 2.8)]), THR)[1].start == 1.5
 
 
 def test_snap_onsets_never_crosses_the_previous_word_or_its_own_end():
@@ -111,7 +113,7 @@ def test_tail_end_snaps_past_the_last_word_into_silence():
     env = _env([(1.0, 2.12)])  # the word's energy runs 0.12 s past its transcribed end
     end = tail_end(2.0, 1.95, 10.0, env, THR)
     assert 2.12 <= end <= 2.0 + 0.35 + 1e-9
-    assert end == pytest.approx(2.12 + 0.08, abs=0.011)  # settles a little into the silence
+    assert end == pytest.approx(2.12 + 0.2, abs=0.011)  # wave F: 0.2 s into the silence
 
 
 def test_tail_end_never_reaches_the_next_word_nor_shortens():
@@ -151,7 +153,7 @@ def test_noise_bed_between_words_still_ends_words_and_snaps_onsets():
     assert ends[0].end == pytest.approx(1.42, abs=0.011)  # not stretched to the next word
     onsets = snap_onsets(ends, env, thr)
     assert onsets[1].start == pytest.approx(2.0, abs=0.011)
-    assert tail_end(2.6, 2.6, 10.0, env, thr) == pytest.approx(2.68, abs=0.011)
+    assert tail_end(2.6, 2.6, 10.0, env, thr) == pytest.approx(2.80, abs=0.011)  # wave F: +0.2
 
 
 def test_refine_word_ends_without_an_energy_fall_extends_at_most_0_6_s():
@@ -174,7 +176,7 @@ def test_protected_words_cap_the_refined_end():
 def test_tail_ignores_a_next_word_start_without_an_audible_onset():
     # clip 01: DTW put "I" at 362.74 inside the sound of "alone." (voiced to ~362.87)
     env = _env([(1.0, 2.25)])
-    assert tail_end(2.0, 2.0, 2.1, env, THR) == pytest.approx(2.33, abs=0.011)
+    assert tail_end(2.0, 2.0, 2.1, env, THR) == pytest.approx(2.45, abs=0.011)  # fall + 0.2
     # ... but an audible onset of the next word still stops it
     heard = _env([(1.0, 2.05), (2.15, 2.6)])
     assert tail_end(2.0, 2.0, 2.15, heard, THR) <= 2.10 + 1e-9
@@ -201,4 +203,218 @@ def test_tail_never_swallows_a_whole_audible_next_word():
     end = tail_end(2.0, 2.0, 2.1, env, THR, next_end=2.2)
     assert end <= 2.1 - 0.05 + 1e-9
     # a next word running past the fall (DTW put its start inside the last word) is ignored
-    assert tail_end(2.0, 2.0, 2.1, env, THR, next_end=2.6) == pytest.approx(2.33, abs=0.011)
+    assert tail_end(2.0, 2.0, 2.1, env, THR, next_end=2.6) == pytest.approx(2.45, abs=0.011)
+
+
+# --- fix wave F: onsets after pauses, final and silent words, splices, tail ---------------
+
+
+def test_snap_onsets_reanchors_a_late_onset_to_the_first_voiced_frame_within_0_7_s():
+    # clip 03: "reveal." is voiced from 1.72 s, DTW put it at 2.30 s (580 ms late)
+    env = _env([(0.5, 1.0), (1.72, 2.4)])
+    words = [_w(0.5, 1.0, "the"), _w(2.30, 2.45, "reveal.")]
+    out = snap_onsets(words, env, THR)
+    assert out[1].start == pytest.approx(1.72, abs=0.011)
+    assert out[1].end == 2.45
+    # never before the previous word's end, nor past 0.7 s back
+    near = [_w(0.5, 1.6, "the"), _w(2.30, 2.45, "reveal.")]
+    assert snap_onsets(near, _env([(0.5, 2.4)]), THR)[1].start >= 1.6
+    far = [_w(0.5, 1.0), _w(2.8, 3.0)]
+    assert snap_onsets(far, _env([(0.5, 1.0), (1.9, 3.0)]), THR)[1].start == 2.8
+
+
+def test_anchor_words_clamps_the_final_words_to_the_last_voiced_frame():
+    from hookline.pipeline.timing import anchor_words
+
+    # clip 02: "direct action." -- audio ends 1.9 s, DTW put "action." at 2.1 s
+    env = _env([(0.5, 1.9)])
+    words = [_w(0.5, 1.45, "take"), _w(1.45, 2.1, "direct"), _w(2.1, 2.3, "action.")]
+    out = anchor_words(words, env, THR, clip_end=2.4)
+    assert out[-1].end <= 1.9 + 0.011 and out[-1].start < out[-1].end
+    assert out[-2].end <= out[-1].start + 1e-9 and out[-2].start == 1.45
+    assert out[0] == words[0]
+
+
+def test_anchor_words_moves_a_word_over_silence_to_the_nearest_voiced_run():
+    from hookline.pipeline.timing import anchor_words
+
+    env = _env([(0.5, 1.0), (1.6, 2.0), (3.0, 3.5)])
+    words = [_w(0.5, 1.0, "a"), _w(1.1, 1.4, "b"), _w(3.0, 3.5, "c")]  # "b": 0% voiced
+    out = anchor_words(words, env, THR, clip_end=4.0)
+    assert out[1].start == pytest.approx(1.6, abs=0.011) and out[1].end <= 2.0 + 0.011
+    assert out[1].end - out[1].start == pytest.approx(0.3, abs=0.011)
+    assert out[0] == words[0] and out[2] == words[2]
+    # mid-clip, nothing voiced between its neighbours: left alone (clip 04 "had ... literally":
+    # taking a share of the next word's sound made "literally" 150 ms late)
+    mid = [_w(0.5, 1.0, "a"), _w(1.1, 1.4, "had"), _w(1.5, 2.0, "literally"), _w(2.2, 2.6, "x")]
+    env = _env([(0.5, 1.0), (1.5, 2.0), (2.2, 2.6)])
+    assert anchor_words(mid, env, THR, clip_end=4.0)[1:3] == mid[1:3]
+    # the clip's last spoken word: a silent word right before it shares its sound
+    lone = [_w(0.5, 1.0, "a"), _w(1.1, 1.4, "b"), _w(1.5, 2.0, "c")]
+    out = anchor_words(lone, _env([(0.5, 1.0), (1.5, 2.0)]), THR, clip_end=4.0)
+    assert (out[1].start, out[1].end, out[2].start) == pytest.approx((1.5, 1.75, 1.75))
+
+
+def test_uncaptioned_speech_finds_voiced_stretches_without_words():
+    from hookline.pipeline.timing import uncaptioned_speech
+
+    env = _env([(0.5, 1.0), (1.3, 2.8), (3.0, 3.2)])
+    words = [_w(0.5, 1.0), _w(2.5, 2.8), _w(3.0, 3.2)]
+    assert uncaptioned_speech(words, env, THR, [(0.0, 4.0)]) == [
+        (pytest.approx(1.3, abs=0.011), pytest.approx(2.45, abs=0.06))
+    ]
+    # a short breath (< 0.3 s) is not speech; outside the kept ranges nothing counts
+    assert uncaptioned_speech(words, _env([(1.3, 1.5)]), THR, [(0.0, 4.0)]) == []
+    assert uncaptioned_speech(words, env, THR, [(0.0, 1.2), (2.5, 4.0)]) == []
+
+
+def test_snap_splices_moves_a_range_start_out_of_a_dropped_word_tail():
+    from hookline.pipeline.timing import snap_splices
+
+    # clip 01: the drop ends at 2.5 s but "alone." (dropped) sounds until 2.6; the first kept
+    # word starts at 2.8: the kept range now starts in the quiet between
+    env = _env([(1.0, 1.9), (2.1, 2.6), (2.8, 3.5)])
+    words = [_w(1.0, 1.9, "kept."), _w(2.1, 2.6, "alone."), _w(2.8, 3.5, "And")]
+    keep = [(0.5, 2.0), (2.5, 4.0)]
+    out = snap_splices(keep, words, env, THR, fps=30)
+    (a0, e0), (s1, e1) = out
+    assert (a0, e1) == (0.5, 4.0)  # the clip's own bounds stay
+    assert 2.6 <= s1 < 2.8 and abs(s1 * 30 - round(s1 * 30)) < 1e-6
+    assert 1.9 <= e0 <= 2.1 and abs(e0 * 30 - round(e0 * 30)) < 1e-6
+    # never further than 0.15 s, never into a kept word's sound
+    tight = snap_splices([(0.5, 2.0), (2.5, 4.0)], words, _env([(1.0, 1.95), (2.05, 3.5)]),
+                         THR, fps=30)  # fmt: skip
+    assert abs(tight[1][0] - 2.5) <= 0.15 + 1e-9 and tight[0][1] >= 1.95 - 1e-9
+
+
+def test_tail_end_leaves_0_2_to_0_3_s_after_the_last_word():
+    env = _env([(1.0, 2.02)])  # the word falls silent at once
+    end = tail_end(2.0, 2.0, 10.0, env, THR)
+    assert 2.02 + 0.2 - 0.011 <= end <= 2.02 + 0.3 + 1e-9
+    capped = tail_end(2.0, 2.0, 10.0, _env([(1.0, 3.0)]), THR)
+    assert capped <= 2.3 + 1e-9  # no silence in reach: at most 0.3 s past the last word
+
+
+# --- fix wave F, real-clip follow-ups: fragments past the window, ramps, shared words -------
+
+
+def test_snap_splices_skips_a_short_dropped_fragment_and_moves_a_misplaced_kept_word():
+    from hookline.pipeline.timing import snap_splices
+
+    # clip 01: the kept range starts at 2.67 inside the tail of the dropped "alone." (sounding
+    # 2.56-2.86); DTW put the kept "I" mostly past that sound (2.80-3.05), its real onset is
+    # 3.14 (a kept word mostly inside the burst is that burst and keeps it -- unless it has its
+    # own onset just after it, see round 2; this "I" is not mostly inside: the burst goes)
+    env = _env([(1.0, 1.9), (2.0, 2.42), (2.56, 2.86), (3.14, 3.5)])
+    words = [_w(1.0, 1.9, "kept."), _w(2.28, 2.6, "alone."), _w(2.80, 3.05, "I"),
+             _w(3.3, 3.5, "put")]  # fmt: skip
+    keep, out = snap_splices([(0.5, 2.0), (2.67, 4.0)], words, env, THR, fps=30, adjust=True)
+    assert 2.86 <= keep[1][0] < 3.14
+    i_word = next(w for w in out if w.text == "I")
+    assert i_word.start >= keep[1][0] and i_word.start == pytest.approx(3.14, abs=0.011)
+    # a long continuing run is the kept speech itself: never skipped
+    long_env = _env([(1.0, 1.9), (2.0, 3.6)])
+    keep2, _ = snap_splices([(0.5, 2.0), (2.67, 4.0)], words, long_env, THR, fps=30, adjust=True)
+    assert abs(keep2[1][0] - 2.67) <= 0.15 + 1e-9
+
+
+def test_snap_onsets_reanchors_through_a_ramped_onset():
+    # clip 02 "mainstream": the onset ramps (-46, -44, -47, then -32): no clean 50 ms of quiet
+    # right before it, still the first voiced run in the window
+    env = _env([(0.5, 1.0), (3.6, 4.4)])
+    db = env.db.copy()
+    db[358], db[359], db[360], db[361], db[362] = -46.0, -31.0, -33.0, -31.0, -15.0
+    env = Envelope(t0=0.0, hop=HOP, db=db)
+    words = [_w(0.5, 1.0, "So,"), _w(3.9, 4.05, "mainstream")]
+    assert snap_onsets(words, env, THR)[1].start == pytest.approx(3.59, abs=0.011)
+
+
+def test_anchor_words_shares_the_next_words_sound_when_none_is_between():
+    from hookline.pipeline.timing import anchor_words
+
+    # clip 02 end: "direct" (DTW 1.58-1.73) sits over silence; "direct action." is the one
+    # burst 1.80-2.0 that DTW gave "action." alone
+    env = _env([(0.5, 1.48), (1.8, 2.0)])
+    words = [_w(0.5, 1.48, "community,"), _w(1.58, 1.73, "direct"), _w(1.8, 2.45, "action.")]
+    out = anchor_words(words, env, THR, clip_end=2.45)
+    assert out[1].start == pytest.approx(1.8, abs=0.011)
+    assert out[1].end == pytest.approx(out[2].start) and out[2].end <= 2.0 + 0.011
+    assert out[2].start - out[1].start == pytest.approx(0.2 * 6 / 13, abs=0.02)
+
+
+def test_uncaptioned_speech_bridges_syllable_gaps():
+    from hookline.pipeline.timing import uncaptioned_speech
+
+    # clip 02: three short bursts between "So," and "mainstream" (gaps < 0.2 s): one stretch
+    env = _env([(0.5, 1.0), (1.44, 1.66), (1.8, 1.83), (2.04, 2.14), (2.6, 3.0)])
+    words = [_w(0.5, 1.0), _w(2.6, 3.0)]
+    (span,) = uncaptioned_speech(words, env, THR, [(0.0, 4.0)])
+    assert span[0] == pytest.approx(1.44, abs=0.011) and span[1] == pytest.approx(2.14, abs=0.011)
+
+
+# --- fix wave F review round 1: reviewer probes as regressions -----------------------------
+
+
+def test_snap_splices_keeps_a_kept_word_its_burst_starts_with():
+    from hookline.pipeline.timing import snap_splices
+
+    # case A: the dropped "um" runs straight into the kept "so" (one sound 0.7-1.25)
+    env = _env([(0.3, 0.6), (0.7, 1.25), (1.45, 2.0)])
+    words = [_w(0.3, 0.6, "okay"), _w(0.7, 0.95, "um"), _w(1.0, 1.25, "so"),
+             _w(1.45, 2.0, "what")]  # fmt: skip
+    keep, out = snap_splices([(0.0, 0.65), (1.0, 3.0)], words, env, THR, fps=30, adjust=True)
+    assert keep[1][0] <= 1.0 + 1e-9 and out[2] == words[2]
+    # case B: the kept range starts at its short word's own sound (0.98-1.2); the dropped
+    # "um" has no sound of its own there
+    env = _env([(0.3, 0.6), (0.98, 1.2), (1.4, 2.0)])
+    words = [_w(0.3, 0.6, "okay"), _w(0.7, 0.9, "um"), _w(1.0, 1.2, "I"), _w(1.4, 2.0, "think")]
+    keep, out = snap_splices([(0.0, 0.65), (1.0, 3.0)], words, env, THR, fps=30, adjust=True)
+    assert keep[1][0] <= 1.0 + 1e-9 and out[2] == words[2]
+
+
+def test_snap_onsets_takes_the_run_leading_into_the_word_not_a_click():
+    # reviewer probe: a 40 ms click at 1.30, the word's sound from 1.85, DTW start 1.9
+    env = _env([(0.5, 1.0), (1.3, 1.34), (1.85, 2.3)])
+    out = snap_onsets([_w(0.5, 1.0, "a"), _w(1.9, 2.3, "word")], env, THR)
+    assert out[1].start == pytest.approx(1.85, abs=0.011)
+
+
+def test_anchor_words_keeps_words_in_their_own_ranges_sound():
+    from hookline.pipeline.timing import anchor_words
+
+    # the last kept range (2.0-3.0) is quiet: its word must not be squashed into the earlier
+    # range's speech
+    env = _env([(0.5, 1.4)])
+    words = [_w(0.5, 1.4, "said."), _w(2.1, 2.4, "Yes.")]
+    out = anchor_words(words, env, THR, clip_end=3.0, ranges=[(0.0, 1.5), (2.0, 3.0)])
+    assert out == words
+
+
+def test_snap_onsets_chains_back_over_a_short_gap_inside_the_word():
+    # clip 03 "reveal.": sound 3.34-3.85, a 50 ms stop, 3.90-4.02; DTW start 3.98 (640 ms
+    # late): the onset is the start of the whole utterance, not of its last syllable
+    env = _env([(2.5, 3.05), (3.34, 3.85), (3.90, 4.02)])
+    out = snap_onsets([_w(2.5, 3.05, "really"), _w(3.98, 4.5, "reveal.")], env, THR)
+    assert out[1].start == pytest.approx(3.34, abs=0.011)
+
+
+# --- fix wave F review round 2: burst-skip tie-break ---------------------------------------
+
+
+def test_snap_splices_skips_a_burst_whose_kept_word_has_its_own_onset_after_it():
+    from hookline.pipeline.timing import snap_splices
+
+    # clip 01 28.57: DTW put the kept "I" (2.62-2.92) 80% inside the dropped "alone."'s sound
+    # (2.56-2.86); the real "I" sounds from 3.14, within its span end + 0.3 s: the burst is
+    # skipped and "I" moves to its onset
+    env = _env([(1.0, 1.9), (2.0, 2.42), (2.56, 2.86), (3.14, 3.25), (3.4, 3.7)])
+    words = [_w(1.0, 1.9, "kept."), _w(2.28, 2.6, "alone."), _w(2.62, 2.92, "I"),
+             _w(3.4, 3.7, "put")]  # fmt: skip
+    keep, out = snap_splices([(0.5, 2.0), (2.67, 4.0)], words, env, THR, fps=30, adjust=True)
+    assert 2.86 <= keep[1][0] < 3.14  # no "...lone" fragment
+    i_word = next(w for w in out if w.text == "I")
+    assert i_word.start == pytest.approx(3.14, abs=0.011) and i_word.start >= keep[1][0]
+    # its only onset after the burst is the next kept word's: the burst is that word (kept)
+    late = [*words[:3], _w(3.14, 3.5, "put")]
+    keep2, out2 = snap_splices([(0.5, 2.0), (2.67, 4.0)], late, env, THR, fps=30, adjust=True)
+    assert keep2[1][0] <= 2.67 + 1e-9 and out2[2] == late[2]

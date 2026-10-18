@@ -32,7 +32,7 @@ SENTENCES = [
     "Nobody saw it coming.",
     "And that was the end.",
 ]
-CHECK_IDS = ["Q1", "Q2", "Q3", "Q4", "Q4b", "Q5", "Q6", "Q7", "Q8"]
+CHECK_IDS = ["Q1", "Q2", "Q3", "Q3b", "Q4", "Q4b", "Q5", "Q6", "Q7", "Q8"]
 
 
 def _words(t0: float = 0.2) -> list[Word]:
@@ -549,3 +549,73 @@ def test_audit_job_probes_the_workspace_source_for_old_sidecars(good_mp4, tmp_pa
     side.write_text(json.dumps(_sidecar(source_video_kbps=1059.1)), encoding="utf-8")
     audit_job(out / "job1", ws / "job1")
     assert seen[0] is None and seen[1] > 0 and seen[2] == 1059.1
+
+
+# --- fix wave F: per-sample faces (Q4b), reframe snaps (Q7), uncaptioned speech (Q3b) ------
+
+
+def _dip_layout(dip: bool) -> list[dict]:
+    """A face clear of the 1180 caption line (median box at y 480-960) whose per-sample core
+    dips over it at 2.25-2.5 s (a head dip between the page's sampled frames)."""
+    samples = []
+    for k in range(int(DUR * 4)):
+        t = k * 0.25 + 0.125
+        low = dip and 2.25 <= t <= 2.5
+        y0, y1 = (1100, 1500) if low else (576, 960)
+        samples.append([t, 300, y0, 780, y1, y0 + 80])
+    return [
+        {"start": 0.0, "end": DUR, "kind": "FACE_TRACK", "face_box": [0.25, 0.25],
+         "face_px": samples}
+    ]  # fmt: skip
+
+
+def test_q4b_checks_per_sample_faces_over_each_whole_page(good_mp4, tmp_path):
+    ass = _ass(tmp_path)
+    by = _by_id(audit_clip(good_mp4, _sidecar(layout=_dip_layout(True)), ass))
+    assert not by["Q4b"].ok and by["Q4b"].value > 0.10, by["Q4b"]
+    assert _by_id(audit_clip(good_mp4, _sidecar(layout=_dip_layout(False)), ass))["Q4b"].ok
+
+
+def test_q7_counts_reframe_snaps():
+    from hookline.quality import _check_pacing
+
+    lay = {"start": 0.0, "end": 20.0, "kind": "FACE_TRACK", "shift_steps": [], "snaps": []}
+    side = {"cut_times": [], "layout": [lay], "zoom_steps": [[0.0, 1.0], [4.5, 1.072]]}
+    assert not _check_pacing(side, 13.0).ok
+    snapped = {**side, "layout": [{**lay, "snaps": [9.0]}]}
+    assert _check_pacing(snapped, 13.0).ok  # a reframe snap is a framing change
+
+
+def test_q3b_warns_on_uncaptioned_speech(good_mp4, tmp_path):
+    ass = _ass(tmp_path)
+    by = _by_id(audit_clip(good_mp4, _sidecar(uncaptioned_speech=[[1.0, 1.6]]), ass))
+    assert by["Q3b"].ok and by["Q3b"].status == "warn" and "1.00-1.60" in by["Q3b"].detail
+    assert _by_id(audit_clip(good_mp4, _sidecar(uncaptioned_speech=[]), ass))["Q3b"].status == (
+        "pass"
+    )
+
+
+# --- fix wave F review round 1: eye line as the core top, samples held to the scene bounds ---
+
+
+def _px_layout(eye, samples=None):
+    rows = samples or [[k * 0.25 + 0.125, 300, 980, 780, 1400, eye] for k in range(32)]
+    return [{"start": 0.0, "end": DUR, "kind": "FACE_TRACK", "face_box": [0.5, 0.2],
+             "face_px": rows}]  # fmt: skip
+
+
+def test_q4b_face_core_starts_at_the_eye_line_when_landmarks_exist():
+    from hookline.quality import _face_share
+
+    box = (300, 1000, 780, 1060)  # text on the forehead: under the 20% line, above the eyes
+    assert _face_share(box, _px_layout(1080), [], 2.0, (1.5, 2.5)) == 0.0
+    assert _face_share(box, _px_layout(None), [], 2.0, (1.5, 2.5)) > 0.10  # no landmarks
+
+
+def test_q4b_holds_the_nearest_face_sample_to_the_scene_bounds():
+    from hookline.quality import _face_share
+
+    rows = [[t, 300, 1100, 780, 1400, 1180] for t in (2.125, 2.375, 2.625)]
+    box = (300, 1150, 780, 1220)
+    assert _face_share(box, _px_layout(None, rows), [], 6.5, (6.0, 7.0)) > 0.10
+    assert _face_share(box, _px_layout(None, rows), [], 0.5, (0.2, 0.8)) > 0.10

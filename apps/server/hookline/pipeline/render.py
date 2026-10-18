@@ -4,6 +4,7 @@ import hashlib
 import logging
 import os
 import re
+from itertools import pairwise
 from pathlib import Path
 
 from hookline.captions.ass import (
@@ -11,11 +12,12 @@ from hookline.captions.ass import (
     caption_words,
     caption_y_for,
     early_until,
+    face_samples,
     hook_y_for,
 )
 from hookline.config import Settings
 from hookline.fsutil import atomic_write_text
-from hookline.media.audio import Envelope, detect_silences, energy_envelope
+from hookline.media.audio import Envelope, detect_silences, digital_zero_runs, energy_envelope
 from hookline.media.ffmpeg import (
     _run,
     cut_segments,
@@ -34,10 +36,12 @@ from hookline.media.reframe import (
     detect_crop,
     detect_overlay_bands,
     face_offset,
+    face_track_px,
     guard_zoom,
     plan_zoom,
     reframe_graph,
     rendered_zoom_steps,
+    scene_snaps,
     zoom_schedule,
 )
 from hookline.media.subtitles import fonts_dir, subtitles_filter
@@ -46,10 +50,14 @@ from hookline.pipeline.boundaries import refine_boundaries
 from hookline.pipeline.deadair import cut_gaps, keep_ranges, remap_words, snap_ranges
 from hookline.pipeline.layout import SceneLayout, plan_layouts
 from hookline.pipeline.timing import (
+    anchor_words,
+    last_voiced,
     protected_words,
     refine_word_ends,
     snap_onsets,
+    snap_splices,
     tail_end,
+    uncaptioned_speech,
     voice_threshold,
 )
 from hookline.vision.faces import Crop, FaceDetector
@@ -61,7 +69,16 @@ _SENTENCE_END = (".", "!", "?")
 CAM_EDGE_LO, CAM_EDGE_HI = 0.02, 0.98  # a cam box this close to a cropped edge was cut by it
 SEAM_FLASH = (0.35, 0.6, 0.35)  # white opacity of the 3 frames around the cold-open seam
 SEAM_SLACK_S = 0.1  # frame snapping may move a cold-open range bound by up to a frame
-FADE_IN_S, FADE_OUT_S = 0.02, 0.12  # audio fades at the clip's start and end (no clicks)
+FADE_IN_S, FADE_OUT_S = 0.02, 0.2  # audio fades at the clip's start and end (no clicks)
+MIN_FADE_OUT_S = 0.08  # ... the end fade shortens to this at least to spare the last word
+# Room tone: a pink-noise bed this loud (dBFS RMS) under clips whose cut exposes digital
+# silence (a source noise gate's exact zeros) at least ZERO_RUN_S long; too quiet to move
+# the loudness. PINK_RMS_DB: anoisesrc pink noise at amplitude 1 (measured).
+ROOM_TONE_DB = -62.0
+PINK_RMS_DB = -14.3
+ZERO_RUN_S = 0.2
+CUT_SLIVER_S = 0.08  # a caption word this short next to a cut is a splice remnant: not shown
+CUT_SLIVER_NEAR_S = 0.2  # ... its mid-point this close to the cut (further on: a real word)
 
 log = logging.getLogger(__name__)
 
@@ -126,20 +143,74 @@ def emphasis_times(beats: list[str], keep: list[tuple[float, float]]) -> list[fl
     return out
 
 
-def audio_fades(duration: float) -> str:
-    """FADE_IN_S fade-in at the start and FADE_OUT_S fade-out ending at `duration`."""
+def audio_fades(duration: float, last_word_end: float | None = None) -> str:
+    """FADE_IN_S fade-in at the start and a FADE_OUT_S fade-out ending at `duration`, starting
+    no earlier than `last_word_end` (output s; the fade shortens, to MIN_FADE_OUT_S at least,
+    rather than dim the last word)."""
+    start = max(duration - FADE_OUT_S, 0.0)
+    if last_word_end is not None:
+        start = min(max(start, last_word_end), max(duration - MIN_FADE_OUT_S, 0.0))
     return (
         f"afade=t=in:st=0:d={FADE_IN_S:g},"
-        f"afade=t=out:st={max(duration - FADE_OUT_S, 0.0):.3f}:d={FADE_OUT_S:g}"
+        f"afade=t=out:st={start:.3f}:d={round(duration - start, 3):g}"
     )
+
+
+def room_tone(duration: float) -> str:
+    """lavfi source: `duration` s of pink noise at ROOM_TONE_DB RMS (a constant room-tone
+    bed; anoisesrc's pink noise at amplitude 1 measures PINK_RMS_DB)."""
+    amp = 10 ** ((ROOM_TONE_DB - PINK_RMS_DB) / 20)
+    return (
+        f"anoisesrc=color=pink:amplitude={amp:.6f}:sample_rate=48000:duration={duration:.3f}:seed=1"
+    )
+
+
+def drop_cut_slivers(
+    words: list[Word], cuts: list[float], min_s: float = CUT_SLIVER_S
+) -> list[Word]:
+    """`words` (output time) without those shorter than `min_s` next to a cut: the last word
+    before it or the first after it (by their mid-points), its mid-point within
+    CUT_SLIVER_NEAR_S of the cut -- the remnant of a word the splice cut through, a caption
+    flash. A short word further away is a real word and keeps its caption."""
+    drop: set[int] = set()
+    for c in cuts:
+        before = [i for i, w in enumerate(words) if (w.start + w.end) / 2 < c]
+        after = [i for i, w in enumerate(words) if (w.start + w.end) / 2 >= c]
+        for i in [*before[-1:], *after[:1]]:
+            w = words[i]
+            near = abs((w.start + w.end) / 2 - c) <= CUT_SLIVER_NEAR_S
+            if near and w.end - w.start < min_s:
+                drop.add(i)
+    return [w for i, w in enumerate(words) if i not in drop]
+
+
+def _word_gaps(words: list[Word]) -> list[tuple[float, float]]:
+    """Gaps (zero-length at touching boundaries) between consecutive words, output time."""
+    return [(round(a.end, 3), round(max(b.start, a.end), 3)) for a, b in pairwise(words)]
+
+
+def _to_output_spans(
+    spans: list[tuple[float, float]], keep: list[tuple[float, float]]
+) -> list[list[float]]:
+    """Source spans mapped onto the output timeline of the kept ranges (split at cuts)."""
+    out, offset = [], 0.0
+    for k0, k1 in keep:
+        for a, b in spans:
+            lo, hi = max(a, k0), min(b, k1)
+            if hi > lo:
+                out.append([round(offset + lo - k0, 3), round(offset + hi - k0, 3)])
+        offset += k1 - k0
+    return sorted(out)
 
 
 def _with_tail(
     keep: list[tuple[float, float]], words: list[Word], env: Envelope, voice_db: float
 ) -> list[tuple[float, float]]:
-    """`keep` with its last range ending a beat after the last word (`timing.tail_end`):
-    into the silence after it, at most MAX_TAIL_S past it, never into the next word. The clip
-    may then run up to MAX_TAIL_S over max_clip_s."""
+    """`keep` with its last range ending a beat after the speech (`timing.tail_end`): into the
+    silence after the range's last voiced frame (the last word's end when the envelope has
+    none), at most MAX_TAIL_S past it, never into the next word -- earlier than the range's
+    end when the transcript's last word ran on over silence. The clip may then run up to
+    MAX_TAIL_S over max_clip_s."""
     if not keep or not words:
         return keep
     start, end = keep[-1]
@@ -147,9 +218,12 @@ def _with_tail(
     if not spoken:
         return keep
     last = max(w.end for w in spoken)
+    voiced = last_voiced(env, start, end, voice_db)
+    if voiced is not None:
+        last = voiced  # the speech ends there, whatever the transcript says
     later = min((w for w in words if w.start >= end), key=lambda w: w.start, default=None)
     nxt = (later.start, later.end) if later else (float("inf"), float("inf"))
-    new_end = tail_end(last, end, nxt[0], env, voice_db, next_end=nxt[1])
+    new_end = tail_end(last, last, nxt[0], env, voice_db, next_end=nxt[1])
     return [*keep[:-1], (start, round(new_end, 3))]
 
 
@@ -221,7 +295,7 @@ def render_clip(
     Word ends and post-pause onsets are refined against the audio envelope first
     (`pipeline.timing`); the clip ends a beat after its last word (`_with_tail`, up to 0.35 s,
     so a clip may run that much over max_clip_s) and its audio fades in over 0.02 s and out
-    over 0.12 s.
+    over 0.2 s (sparing the last word).
     `overlay_bands` is the [top, bottom] px of burned-in overlay cropped away (vertical only),
     or None. `seam` is the output time where a cold open ends (None without one); it gets a
     3-frame 60% white flash and the "EARLIER…" tag. `ass`/`ass_sha1` name the burned caption file
@@ -270,11 +344,30 @@ def render_clip(
         words=protected if protect_words else None,
     )
     untailed = cut_gaps(untailed, idle_gaps or [])
-    tailed = untailed if voice_db is None else _with_tail(untailed, near, env, voice_db)
+    timed, tailed = near, untailed
+    if voice_db is not None and untailed:
+        # final words onto the last voiced frame, words over silence onto the speech; the
+        # tail follows the speech, every drop / dead-air / idle splice lands in silence
+        timed = anchor_words(near, env, voice_db, clip_end=untailed[-1][1], ranges=untailed)
+        tailed = _with_tail(untailed, timed, env, voice_db)
+        bounds = list(refined.cold_open) if refined.cold_open else []
+        tailed, timed = snap_splices(tailed, timed, env, voice_db, fps, fixed=bounds, adjust=True)  # type: ignore[misc]
     keep = snap_ranges(tailed, fps, keep_gaps=[*refined.drops, *(idle_gaps or [])])
     # words starting in the tail (no audible onset: see `tail_end`) are not captioned
-    heard = [i for i, w in enumerate(near) if not untailed or w.start < untailed[-1][1] - 1e-6]
-    spoken = [near[i] for i in heard]
+    heard = [i for i, w in enumerate(timed) if not untailed or w.start < untailed[-1][1] - 1e-6]
+    spoken = [timed[i] for i in heard]
+    # a word's survival of a cut is judged on the span dead air protected (moved along with
+    # the word when anchoring / splice snapping moved it), not on an audio-refined end that
+    # may run far past it (anchor_words / snap_splices keep the words' order and count)
+    judge = [min(timed[i].end, protected[i].end + timed[i].start - near[i].start) for i in heard]
+    uncaptioned: list[list[float]] = []
+    if voice_db is not None and untailed:
+        uncaptioned = _to_output_spans(uncaptioned_speech(spoken, env, voice_db, keep), keep)
+        if uncaptioned:
+            log.warning(
+                "%s: speech without captions at %s (output s; the transcript has no words "
+                "there)", name, ", ".join(f"{a:.2f}-{b:.2f}" for a, b in uncaptioned),
+            )  # fmt: skip
 
     inter = cut_segments(
         src, keep, work_dir / f"{name}.mkv", "libx264", quality=INTERMEDIATE_QUALITY, fps=fps
@@ -285,36 +378,48 @@ def render_clip(
     crop, bands = letterbox, None
 
     seam = seam_time(keep, refined.cold_open)
-    # punctuation-only tokens never captioned; first word (and first after the seam) capitalised
-    # a word's survival of a cut is judged on the span dead air protected, not on an
-    # audio-refined end that may run far past it
-    judge = [protected[i].end for i in heard]
-    out_words = caption_words(remap_words(spoken, keep, fps, judge_ends=judge), seam)
-    # loudness is normalised to the speech: the spoken words' spans on the clip's timeline
-    audio = plan_loudness(inter, speech=[(w.start, w.end) for w in out_words])
-    audio_args: list[str] = []
-    if audio is not None:  # the clip has audio
-        audio_args = ["-af", f"{audio.af},{audio_fades(duration)}"]
     cuts = cut_times_for(keep)
+    # punctuation-only tokens never captioned (nor shielding a splice remnant from
+    # drop_cut_slivers); the first word (and the first after the seam) capitalised once the
+    # remnants are gone
+    out_words = remap_words(spoken, keep, fps, judge_ends=judge)
+    out_words = caption_words(drop_cut_slivers(caption_words(out_words), cuts), seam)
+    # loudness is normalised to the speech: the captioned words' spans on the clip's timeline
+    audio = plan_loudness(inter, speech=[(w.start, w.end) for w in out_words])
+    # a source noise gate's digital silence exposed by the cut gets a room-tone bed (below)
+    bed = bool(audio) and bool(digital_zero_runs(inter, ZERO_RUN_S))
+    gaps = _word_gaps(out_words)
     layouts: list[SceneLayout] = []
     steps: list[tuple[float, float]] = []
     if settings.vertical:
         layouts, crop, bands = _plan_vertical(inter, detector, settings, size, letterbox)
         in_w, in_h = (crop[0], crop[1]) if crop else size
         # per-scene zoom plan (soft-source cap, small-face base zoom, headroom); the layouts
-        # carry it into the sidecar and to caption placement
-        layouts = [plan_zoom(lay, in_w, in_h) for lay in layouts]
+        # carry it into the sidecar and to caption placement; word gaps steer reframe snaps
+        layouts = [
+            plan_zoom(lay, in_w, in_h).model_copy(
+                update={"gaps": [g for g in gaps if lay.start <= g[0] < lay.end]}
+            )
+            for lay in layouts
+        ]
         steps = zoom_schedule(
             duration,
             cuts,
             emphasis_times(pick.edit_beats, keep),
             boundaries=[w.end for w in out_words if w.text.rstrip().endswith(_SENTENCE_END)],
             changes=[lay.start for lay in layouts[1:]],  # no beat step next to a camera change
+            word_gaps=gaps,
         )
         # the edge guard's holds/shifts, once: the graph and the sidecar get the same steps
         steps, layouts = guard_zoom(layouts, in_w, in_h, steps, cuts)
         layouts = [
-            lay.model_copy(update={"face_dx": face_offset(lay, in_w, in_h, steps)})
+            lay.model_copy(
+                update={
+                    "face_dx": face_offset(lay, in_w, in_h, steps),
+                    "snaps": scene_snaps(lay, in_w, in_h, steps),
+                    "face_px": face_track_px(lay, in_w, in_h, steps),
+                }
+            )
             for lay in layouts
         ]
         graph = reframe_graph(layouts, in_w, in_h, crop=crop, zoom_steps=steps, cut_times=cuts)
@@ -339,11 +444,28 @@ def render_clip(
             seam=seam,
             caption_y_late=caption_y_for(layouts, late=True),
             breaks=cuts,  # caption pages never span a cut (nor the seam)
+            faces=face_samples(layouts),  # each page clears the faces shown with it
         )
         atomic_write_text(ass, text)
         ass_ref = {"ass": ass.name, "ass_sha1": hashlib.sha1(ass.read_bytes()).hexdigest()}
         graph += f";{out_label}{subtitles_filter(ass, fonts_dir())}[vfinal]"
         out_label = "[vfinal]"
+
+    audio_args: list[str] = []
+    last_end = max((w.end for w in out_words), default=None)  # the end fade spares it
+    audio_map = ["-map", "0:a?"]
+    if audio is not None and bed:
+        # digital silence in the cut: a room-tone bed under everything, after the loudness
+        # chain (it adds nothing measurable to the loudness), faded with the clip
+        graph += (
+            f";[0:a]{audio.af}[amain];{room_tone(duration)}[abed];"
+            f"[amain][abed]amix=inputs=2:duration=first:normalize=0,"
+            f"{audio_fades(duration, last_end)}[aout]"
+        )
+        audio_map = ["-map", "[aout]"]
+        log.info("%s: digital silence in the cut; room tone at %g dBFS", name, ROOM_TONE_DB)
+    elif audio is not None:  # the clip has audio
+        audio_args = ["-af", f"{audio.af},{audio_fades(duration, last_end)}"]
 
     tmp = dst.with_suffix(".tmp.mp4")
     _run(
@@ -351,7 +473,7 @@ def render_clip(
             "ffmpeg", "-hide_banner", "-y", "-i", str(inter),
             # always a script: zoom/track expressions can outgrow the Windows command line
             *filter_graph_args(graph, work_dir / f"{name}.graph.txt", force=True),
-            "-map", out_label, "-map", "0:a?",
+            "-map", out_label, *audio_map,
             *encoder_args(encoder or pick_encoder()), "-pix_fmt", "yuv420p",
             *audio_args,
             "-c:a", "aac", "-b:a", "192k", "-ar", "48000",  # the one lossy audio encode
@@ -381,4 +503,6 @@ def render_clip(
         "seam": seam,
         **ass_ref,
         "caption_words": [[w.start, w.end, w.text] for w in out_words],
+        "uncaptioned_speech": uncaptioned,
+        "room_tone": bed,
     }

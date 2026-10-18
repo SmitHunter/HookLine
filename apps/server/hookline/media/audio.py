@@ -181,3 +181,29 @@ def momentary_db(
     starts = np.maximum(ends - k, 0)
     mean = (csum[ends] - csum[starts]) / (ends - starts) if len(power) else power
     return np.maximum(10 * np.log10(np.maximum(mean, 1e-10)), _FLOOR_DB)
+
+
+def digital_zero_runs(path: Path, min_s: float = 0.2) -> list[tuple[float, float]]:
+    """(start s, length s) of each run of exact digital silence (every sample 0, e.g. a
+    source's noise gate) at least `min_s` long in the first audio stream (downmixed to mono
+    at its own rate); [] without audio."""
+    rate = _sample_rate(path)
+    res = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(path), "-vn",
+         "-ac", "1", "-f", "s16le", "-"],
+        check=False, capture_output=True,
+    )  # fmt: skip
+    if res.returncode != 0:
+        raise FFmpegError(
+            f"ffmpeg exited with code {res.returncode}", res.stderr.decode("utf-8", "replace")
+        )
+    zero = np.frombuffer(res.stdout, np.int16) == 0
+    if not zero.any():
+        return []
+    edges = np.flatnonzero(np.diff(np.concatenate(([0], zero.astype(np.int8), [0]))))
+    need = round(min_s * rate)
+    return [
+        (round(a / rate, 3), round((b - a) / rate, 3))
+        for a, b in zip(edges[::2], edges[1::2], strict=True)
+        if b - a >= need
+    ]

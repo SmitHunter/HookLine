@@ -90,7 +90,9 @@ def test_track_expression_clamps_edges_and_interpolates():
     assert evaluate(expr, t=0) == pytest.approx(0)
     for t in (0, 0.5, 1, 1.5, 2, 2.5, 3, 10):
         assert 0 <= evaluate(expr, t=t) <= 1920 - 607
-    assert evaluate(expr, t=0) < evaluate(expr, t=0.5) < evaluate(expr, t=1)
+    # fix wave F: a move this fast (the whole frame in 1 s) is a reframe snap, not a pan
+    assert evaluate(expr, t=0) <= evaluate(expr, t=0.5) <= evaluate(expr, t=1)
+    assert evaluate(expr, t=1) == pytest.approx(1920 - 607)
 
 
 def _centre(expr: str, t: float, in_w: int = 1000, crop_w: int = 100) -> float:
@@ -258,8 +260,9 @@ def test_zoom_schedule_drops_out_of_range_and_overlapping_punches():
     assert [t for t, s in steps if s == ZOOM_PUNCH] == [3.0]
 
 
-def test_zoom_schedule_early_punch_dropped_and_nothing_at_or_after_end():
-    assert [s for _, s in zoom_schedule(10.0, [], [0.3])].count(ZOOM_PUNCH) == 0
+def test_zoom_schedule_early_punch_from_zero_and_nothing_at_or_after_end():
+    # fix wave F: a beat on the opening words punches from the first frame (was dropped)
+    assert zoom_schedule(10.0, [], [0.3])[0] == (0.0, ZOOM_PUNCH)
     steps = zoom_schedule(10.0, [], [9.0])  # release would land at 10.4
     assert (9.0, ZOOM_PUNCH) in steps and all(t < 10.0 for t, _ in steps)
     assert all(t < 9.0 for t, _ in zoom_schedule(9.0, [], []))
@@ -606,6 +609,7 @@ def test_track_keeps_a_leaning_face_inside_the_crop():
     for t, x in kfs:
         left = evaluate(expr, t=t)
         margin = 0.08 * crop_w - 1e-6  # wave D: the edge guard's margin
+        face_w = 0.17 * 0.8  # fix wave F: the hard constraint is the face core
         assert left + margin <= (x - face_w / 2) * in_w
         assert (x + face_w / 2) * in_w <= left + crop_w - margin
 
@@ -980,7 +984,8 @@ def test_track_edge_guard_keeps_a_fast_lean_inside_the_crop():
     in_w, cw = 1920, 486
     expr = track_x_expr(kfs, in_w=in_w, crop_w=cw, face_w=0.13, widths=ws)
     for (t, x), w in zip(kfs, ws, strict=True):
-        assert _inside(evaluate(expr, t), cw, x, w, in_w, 0.08), t
+        # fix wave F: the hard constraint is the face core (FACE_CORE of the box) + margin
+        assert _inside(evaluate(expr, t), cw, x, w * 0.8, in_w, 0.08), t
 
 
 def test_track_edge_guard_still_ignores_a_single_stray_sample():
@@ -1394,7 +1399,8 @@ def test_hold_spans_later_pulse_does_not_block_an_earlier_one_and_no_pumping():
     held, shifts = _hold_spans(
         sched, [(13.256, 14.1), (25.267, 26.3)], [], lambda _: Fit(), (0, 30)
     )
-    assert {t for t, v in shifts if v} == {13.256, 14.9, 25.267}
+    # (fix wave F: cadence pulses may fill the long stretches around them too)
+    assert {13.256, 14.9, 25.267} <= {t for t, v in shifts if v}
     # a hold that starts on a zoom step never returns within CUT_QUIET of its start
     held, _ = _hold_spans(
         [(0.0, 1.0), (7.992, ZOOM_IN)], [(7.992, 8.44)], [], lambda _: Fit(), (0, 20)
@@ -1465,5 +1471,332 @@ def test_guard_property_over_random_scenes(block):
             free = 1 < left < w - cw - 1 and 1 < vl and vl + vis < w - 1
             if not free or not R._guardable(fw, cw / w / z * (0.5 - R.GUARD_MARGIN)):
                 continue
-            m = min(x * w - fw * w / 2 - vl, vl + vis - x * w - fw * w / 2) / vis
+            core = fw * R.FACE_CORE / 2  # fix wave F: the face core keeps the margin
+            m = min(x * w - core * w - vl, vl + vis - x * w - core * w) / vis
             assert m >= R.GUARD_MARGIN - R.GUARD_JITTER, (seed, t, m)
+
+
+# --- fix wave F: reframe snaps instead of whip pans; step shift modelled; beats punch ------
+
+_LEAN05 = (
+    [0.52] * 8 + [0.56, 0.62, 0.70, 0.77, 0.80, 0.80, 0.79, 0.74, 0.66, 0.58, 0.55] + [0.55] * 8
+)
+_LEAN05_W = (
+    [0.13] * 8 + [0.14, 0.15, 0.16, 0.17, 0.17, 0.17, 0.16, 0.15, 0.14, 0.13, 0.13] + [0.13] * 8
+)
+
+
+def _per_frame_moves(expr: str, t1: float, fps: int = 30) -> list[tuple[float, float]]:
+    vals = [(k / fps, evaluate(expr, k / fps)) for k in range(int(t1 * fps) + 1)]
+    return [(b[0], b[1] - a[1]) for a, b in pairwise(vals)]
+
+
+@pytest.mark.parametrize("in_w", [1920, 1280])
+def test_track_fast_lean_snaps_instead_of_whip_panning(in_w):
+    # clip 05: the lean needs ~600 src px/s; the crop either pans at <= 150 px/s (scaled with
+    # the source width) or reframes in one frame, and keeps the face in the margin throughout
+    kfs = [(i * 0.25, x) for i, x in enumerate(_LEAN05)]
+    cw = round(in_w * 486 / 1920 / 2) * 2
+    expr = track_x_expr(kfs, in_w=in_w, crop_w=cw, face_w=0.13, widths=_LEAN05_W)
+    limit = 150 * in_w / 1920 / 30 + 0.5  # px per frame
+    moves = _per_frame_moves(expr, kfs[-1][0])
+    jumps = [(t, d) for t, d in moves if abs(d) > limit]
+    assert 1 <= len(jumps) <= 3, jumps  # out and back: reframes, not a whip pan
+    for (t, x), w in zip(kfs, _LEAN05_W, strict=True):
+        assert _inside(evaluate(expr, t), cw, x, w * 0.8, in_w, 0.08), t  # the core
+
+
+def test_track_snaps_are_reported_and_prefer_a_word_gap():
+    from hookline.media.reframe import track_snaps
+
+    kfs = [(i * 0.25, x) for i, x in enumerate(_LEAN05)]
+    kw = {"in_w": 1920, "crop_w": 486, "face_w": 0.13, "widths": _LEAN05_W}
+    snaps = track_snaps(kfs, **kw)
+    assert snaps and all(0 < t < kfs[-1][0] for t in snaps)
+    first = snaps[0]
+    gap = (round(first - 0.2, 3), round(first - 0.12, 3))
+    expr = track_x_expr(kfs, gaps=[gap], **kw)
+    for (t, x), w in zip(kfs, _LEAN05_W, strict=True):
+        assert _inside(evaluate(expr, t), 486, x, w * 0.8, 1920, 0.08), t  # the core
+    # a gap further back than SNAP_GAP_S is ignored
+    assert track_snaps(kfs, gaps=[(first - 1.0, first - 0.6)], **kw)[0] == first
+
+
+def test_track_slow_drift_still_pans_without_snaps():
+    from hookline.media.reframe import track_snaps
+
+    kfs = [(i * 0.25, 0.4 + 0.02 * i * 0.25) for i in range(40)]  # 38 px/s
+    expr = track_x_expr(kfs, in_w=1920, crop_w=486, face_w=0.1)
+    assert track_snaps(kfs, in_w=1920, crop_w=486, face_w=0.1) == []
+    assert all(abs(d) <= 150 / 30 + 0.5 for _, d in _per_frame_moves(expr, 9.75))
+    assert evaluate(expr, 9.75) > evaluate(expr, 0) + 50  # it does follow
+
+
+def test_track_single_stray_detection_never_snaps():
+    from hookline.media.reframe import track_snaps
+
+    kfs = [(i * 0.25, 0.5) for i in range(12)]
+    kfs[6] = (1.5, 0.85)
+    assert track_snaps(kfs, in_w=1920, crop_w=486, face_w=0.13) == []
+
+
+def test_scene_snaps_are_on_the_output_timeline():
+    from hookline.media.reframe import guard_zoom, scene_snaps
+
+    lay = plan_zoom(_lean_at(3.0, 3.0 + 0.25 * len(_LEAN05), _LEAN05, fw=0.13), 1920, 864)
+    lay = lay.model_copy(update={"track_w": list(_LEAN05_W)})
+    held, (lay,) = guard_zoom([lay], 1920, 864, [(0.0, 1.0)], [])
+    snaps = scene_snaps(lay, 1920, 864, held)
+    assert snaps and all(lay.start < t < lay.end for t in snaps)
+
+
+# fuzz seeds where a flat scene's step shift broke the guard margin (reviewer round 4)
+_STEP_SHIFT_SEEDS = [325, 361, 428, 454, 456, 468, 551, 678, 732, 791, 854, 868, 896, 972,
+                     1049, 1052, 1102, 1165, 1194, 1324]  # fmt: skip
+
+
+def _check_guard_property(seed: int) -> None:
+    from hookline.media import reframe as R
+
+    w, h = 1920, 864
+    cw = R._track_w(w, h)
+    lay0, sched, cuts = _fuzz_scene(seed)
+    held, (lay,) = R.guard_zoom([lay0], w, h, sched, cuts)
+    rel = [(t - lay.start, x) for t, x in lay.track_x]
+    kw = R._track_kw(lay, w, h, held)  # the crop as rendered: a flat scene's step shift too
+    del kw["gaps"]
+    for a, b in R.track_guard_spans(**kw):
+        for k in range(int((b - a) / 0.05)):
+            u = a + k * 0.05
+            assert R._level_at(held, u) == 1.0, (seed, (a, b), u, held)
+    # a beat never becomes a zoom-out
+    for t, v in sched:
+        if v == ZOOM_PUNCH and t > 0:
+            before = R._level_at([st for st in held if st[0] < t - 1e-9], t)
+            assert R._level_at(held, t) >= before, (seed, t, held)
+    fit = R._SceneFit(lay, w, h, held)
+    sh = sorted(lay.shift_steps)
+    for t, v in sh:
+        if v:
+            off = next((u for u, vv in sh if u > t and not vv), lay.end)
+            assert fit.fits(None, t, min(off + R.ZOOM_EASE, lay.end), shift=v), (seed, t)
+    chain = scene_filter(lay, w, h, "a", "b", zoom_steps=held, cut_times=cuts)
+    xe = chain.split("crop=", 1)[1].split(":", 3)[2].replace(r"\,", ",")
+    ze = zoom_expr(held, offset=0, length=lay.end, level=lay.zoom_level, instant=cuts)
+    ts, xs, ws = R._track_faces(rel, lay.face_w, None)
+    for t, x, fw in zip(ts, xs, ws, strict=True):
+        left, z = evaluate(xe, t), evaluate(ze, t)
+        vis = cw / z
+        vl = left + cw / 2 - vis / 2
+        free = 1 < left < w - cw - 1 and 1 < vl and vl + vis < w - 1
+        if not free or not R._guardable(fw, cw / w / z * (0.5 - R.GUARD_MARGIN)):
+            continue
+        core = fw * R.FACE_CORE / 2  # the face core keeps the margin
+        m = min(x * w - core * w - vl, vl + vis - x * w - core * w) / vis
+        assert m >= R.GUARD_MARGIN - 0.002, (seed, t, m)  # the hard constraint, rounding aside
+
+
+@pytest.mark.parametrize("seed", _STEP_SHIFT_SEEDS)
+def test_guard_property_holds_for_step_shift_scenes(seed):
+    lay0, _, _ = _fuzz_scene(seed)
+    assert lay0.zoom_level(ZOOM_PUNCH) <= lay0.zoom_level(1.0) + 0.03  # flat scenes
+    _check_guard_property(seed)
+
+
+@pytest.mark.parametrize("block", range(6))
+def test_guard_property_beats_never_zoom_out(block):
+    for seed in range(block * 50, block * 50 + 50):
+        _check_guard_property(seed)
+
+
+def test_zoom_schedule_beat_at_the_clip_start_punches_from_zero():
+    steps = zoom_schedule(10.0, [], [0.0])
+    assert steps[0] == (0.0, ZOOM_PUNCH)
+    assert (1.4, 1.0) in steps
+
+
+def test_cut_in_a_shrunken_placement_span_gets_a_level_change():
+    # reviewer round 4, seed 89: the placement span 2.8-4.75 shrinks to 2.8-3.75 on the final
+    # schedule; the cut at 3.965 then sits outside every hold and gets a framing change
+    from hookline.media import reframe as R
+
+    lay0, sched, cuts = _fuzz_scene(89)
+    assert 3.965 in cuts
+    held, (lay,) = R.guard_zoom([lay0], 1920, 864, sched, cuts)
+    changed = R._level_at(held, 3.965) != R._level_at(
+        [st for st in held if st[0] < 3.965 - 1e-9], 3.965
+    )
+    if changed or any(abs(t - 3.965) < 1e-6 and v for t, v in lay.shift_steps):
+        return
+    # no change: only because none is safe (the guard fires under a zoom-in there and no
+    # crop pulse fits) -- the cut was given its attempt against the final spans
+
+    def spans_at(steps):
+        kw = R._track_kw(lay, 1920, 864, steps)
+        del kw["gaps"]
+        return R.track_guard_spans(**kw)
+
+    assert R._violations(R._dedupe([*held, (3.965, ZOOM_IN)]), spans_at)
+    fit = R._SceneFit(lay, 1920, 864, held)
+    assert not any(fit.fits(None, 3.965, 4.665, shift=s) for s in (0.04, -0.04))
+
+
+def test_beat_inside_a_hold_punches_when_the_guard_allows():
+    # a lean early in the scene holds the base; by the beat (4.6 s, in the hold's tail) the
+    # face is back and steady: the beat punches in (a zoom change upward), not a pulse
+    from hookline.media.reframe import guard_zoom
+
+    xs = [0.5] * 6 + [0.62, 0.72, 0.76, 0.76, 0.7, 0.6] + [0.5] * 28
+    lay = plan_zoom(_lean_at(0, 10, xs, fw=0.1), 1920, 864)
+    sched = zoom_schedule(10.0, [], [4.6])
+    held, _ = guard_zoom([lay], 1920, 864, sched, [])
+    p = next(t for t, v in sched if v == ZOOM_PUNCH)
+    before = max((v for t, v in held if t < p - 1e-9), default=1.0)
+    at = [v for t, v in held if abs(t - p) < 1e-6]
+    assert at and at[0] > 1.0, held
+    assert at[0] >= before
+
+
+# --- fix wave F item 9: a framing change at least every ZOOM_MAX_GAP s ----------------------
+
+
+def _framing_changes(held, lay, cuts, end):
+    times = {0.0, end, *cuts, *(t for t, _ in held), *(t for t, _ in lay.shift_steps)}
+    times |= set(lay.snaps)
+    return sorted(t for t in times if 0 <= t <= end)
+
+
+def test_zoom_schedule_fillers_prefer_the_largest_word_gap_without_punctuation():
+    # a 15 s unpunctuated sentence: fillers sit at its biggest pauses near the even split
+    gaps = [(3.3, 3.35), (4.0, 4.3), (7.0, 7.05), (7.6, 7.7), (11.9, 11.95)]
+    steps = zoom_schedule(15.0, [], [], word_gaps=gaps)
+    fillers = [t for t, _ in steps[1:]]
+    assert all(b - a <= 4.5 + 1e-9 for a, b in pairwise([0.0, *fillers, 15.0]))
+    assert fillers[0] == pytest.approx(4.15)  # the longer pause beats the nearer one
+    assert all(any(a <= t <= b for a, b in gaps) for t in fillers)
+
+
+def test_guard_keeps_a_framing_change_every_max_gap_through_a_long_hold():
+    # wave E clip 03: a cut at 8.6 s, then one long unpunctuated sentence the guard holds at
+    # base (she keeps leaning); the fillers inside the hold are dropped, so the guard must put
+    # a framing change (level step or pulse) back at a word gap at least every ZOOM_MAX_GAP
+    from hookline.media.reframe import ZOOM_MAX_GAP, guard_zoom
+
+    xs = [0.5 + 0.1 * math.sin(i / 3.0) for i in range(4 * 24)]
+    lay = plan_zoom(_lean_at(0, 24, xs, fw=0.13), 1920, 864)
+    word_gaps = [(round(8.6 + k * 0.7, 2), round(8.6 + k * 0.7 + 0.08, 2)) for k in range(20)]
+    lay = lay.model_copy(update={"gaps": word_gaps})
+    cuts = [8.6]
+    sched = zoom_schedule(24.0, cuts, [], word_gaps=word_gaps)
+    held, (out,) = guard_zoom([lay], 1920, 864, sched, cuts)
+    marks = _framing_changes(held, out, cuts, 24.0)
+    worst = max(b - a for a, b in pairwise(marks))
+    assert worst <= ZOOM_MAX_GAP + 1e-6, (marks, held, out.shift_steps)
+
+
+def test_face_track_px_maps_each_sample_through_crop_and_zoom():
+    from hookline.media.reframe import face_track_px
+
+    lay = _lean_at(0, 4, [0.5] * 16, fw=0.1).model_copy(
+        update={"track_face": [(0.3, 0.3, 0.42)] * 15 + [(0.5, 0.3, 0.62)]}
+    )
+    px = face_track_px(lay, 1920, 864, [(0.0, 1.0)])
+    assert len(px) == 16
+    t, x0, top, x1, bottom, eye = px[0]
+    assert t == 0.0 and x0 + x1 == pytest.approx(1080, abs=2)  # centred face, centred crop
+    assert (x1 - x0) == pytest.approx(0.1 * 1920 / 486 * 1080, abs=2)
+    assert top == pytest.approx((0.3 + 0.2 * 0.3) * 1920, abs=1)  # the core: top 20% off
+    assert bottom == pytest.approx(0.6 * 1920, abs=1) and eye == pytest.approx(0.42 * 1920, abs=1)
+    zoomed = face_track_px(lay, 1920, 864, [(0.0, 1.12)])
+    assert zoomed[0][3] - zoomed[0][1] > x1 - x0  # a zoom-in grows the face
+    assert face_track_px(lay.model_copy(update={"track_face": []}), 1920, 864, []) == []
+
+
+# --- fix wave F review round 1 ------------------------------------------------------------
+
+
+def test_track_snap_moves_back_into_a_word_gap_where_the_new_framing_fits():
+    # a 0.18 jump: one snap; the new framing already holds the face core a little before
+    # the moment the old one stops holding it, so a word gap there takes the snap
+    from hookline.media.reframe import track_snaps
+
+    kfs = [(i * 0.25, x) for i, x in enumerate([0.5] * 8 + [0.68] * 20)]
+    kw = {"in_w": 1920, "crop_w": 486, "face_w": 0.1}
+    (first,) = track_snaps(kfs, **kw)
+    gap = (round(first - 0.055, 3), round(first - 0.025, 3))
+    (moved,) = track_snaps(kfs, gaps=[gap], **kw)
+    assert moved != first and gap[0] - 1e-6 <= moved <= gap[1] + 1e-6
+    expr = track_x_expr(kfs, gaps=[gap], **kw)
+    for t, x in kfs:
+        assert _inside(evaluate(expr, t), 486, x, 0.08, 1920, 0.08), t
+
+
+def test_track_swaying_subject_pans_instead_of_snapping():
+    # reviewer probe: +-0.1 sway with a 4 s period needs ~100 px/s of crop motion: a
+    # speed-capped pan that anticipates it, at most one snap per 2.5 s
+    from hookline.media.reframe import track_snaps
+
+    xs = [0.5 + 0.1 * math.sin(2 * math.pi * i * 0.25 / 4.0) for i in range(120)]
+    kfs = [(i * 0.25, x) for i, x in enumerate(xs)]
+    snaps = track_snaps(kfs, in_w=1920, crop_w=486, face_w=0.1)
+    assert len(snaps) <= 30 / 2.5
+    expr = track_x_expr(kfs, in_w=1920, crop_w=486, face_w=0.1)
+    for t, x in kfs:
+        assert _inside(evaluate(expr, t), 486, x, 0.08, 1920, 0.08), t
+
+
+def test_step_offset_models_the_eased_shift():
+    from hookline.media.reframe import ZOOM_EASE, _step_offset
+
+    lay = _FLAT.model_copy(update={"step_shift": 0.04})
+    steps = [(0.0, 1.0), (2.0, ZOOM_IN)]
+    shift = 0.04 * 1214 / 3840
+    eased = _step_offset(lay, steps, 3840, 2160)
+    assert eased(1.9) == 0.0 and eased(2.0 + ZOOM_EASE + 0.01) == pytest.approx(shift)
+    assert eased(2.0 + ZOOM_EASE / 2) == pytest.approx(shift / 2, rel=1e-3)  # mid-ease
+    at_cut = _step_offset(lay.model_copy(update={"cuts": [2.0]}), steps, 3840, 2160)
+    assert at_cut(2.0 + ZOOM_EASE / 2) == pytest.approx(shift)  # a cut's shift is instant
+
+
+def test_punch_in_returns_exactly_on_the_camera_change():
+    from hookline.media.reframe import _punch_in
+
+    calls = []
+
+    def spans_at(steps):
+        calls.append(steps)
+        return []
+
+    levels = [(0.0, 1.0)]
+    out = _punch_in(levels, [(0.0, 1.0), (4.5, ZOOM_PUNCH)], [], (0.0, 5.0), spans_at)
+    assert (4.5, ZOOM_PUNCH) in out
+    # round 3: the return sits on the camera change (instant there, `scene_filter`), so the
+    # punch never carries into the next scene; nothing else past the punch
+    assert (5.0, 1.0) in out and all(t <= 5.0 for t, _ in out)
+
+
+def test_face_track_px_leaves_a_missing_eye_line_unset():
+    from hookline.media.reframe import face_track_px
+
+    lay = _lean_at(0, 2, [0.5] * 8, fw=0.1).model_copy(
+        update={"track_face": [(0.3, 0.3, None)] * 8}
+    )
+    px = face_track_px(lay, 1920, 864, [(0.0, 1.0)])
+    assert px and all(row[5] is None for row in px)  # the caption falls back to the 20% core
+
+
+# --- fix wave F review round 3: a punch never carries across a camera change -------------
+
+
+def test_punch_in_returns_at_the_scene_end_instantly():
+    from hookline.media.reframe import _level_at, _punch_in
+
+    sched = [(0.0, 1.0), (9.0, ZOOM_IN)]
+    out = _punch_in(sched, sched, cuts=[4.4], scene=(0, 5), spans_at=lambda _s: [])
+    assert _level_at(out, 4.5) > 1.0  # the cut got its punch ...
+    assert (5.0, 1.0) in out and _level_at(out, 6.0) == 1.0  # ... which ends at the scene end
+    # the next scene starts on the returned level in its first frame: no ease across the change
+    lay = SceneLayout(start=5, end=12, kind="FIT_BLUR")
+    chain = scene_filter(lay, 1920, 864, "a", "b", zoom_steps=out, cut_times=[4.4])
+    s = chain.split("scale=w='trunc(1080*(", 1)[1].split(")/2)*2'", 1)[0].replace("\\,", ",")
+    assert evaluate(s, 0.0) == pytest.approx(1.0) and evaluate(s, 0.1) == pytest.approx(1.0)

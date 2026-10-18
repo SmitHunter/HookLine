@@ -27,7 +27,7 @@ def face_yaw(right_eye: Point, left_eye: Point, nose: Point) -> float | None:
 
 class Face(NamedTuple):
     """A detected face, normalized 0..1 relative to the frame (x, y = top-left); `yaw` from
-    its landmarks (`face_yaw`), None when unknown."""
+    its landmarks (`face_yaw`) and `eye_y` the eye line, None when unknown."""
 
     x: float
     y: float
@@ -35,6 +35,7 @@ class Face(NamedTuple):
     h: float
     score: float
     yaw: float | None = None
+    eye_y: float | None = None  # the eye line (mean of the eye landmarks), normalized
 
     @property
     def cx(self) -> float:
@@ -71,7 +72,9 @@ class FaceDetector:
             if x1 <= x0 or y1 <= y0:
                 continue
             yaw = face_yaw((r[4], r[5]), (r[6], r[7]), (r[8], r[9]))
-            faces.append(Face(x0 / w, y0 / h, (x1 - x0) / w, (y1 - y0) / h, float(r[14]), yaw))
+            eye = min(max((float(r[5]) + float(r[7])) / 2 / h, 0.0), 1.0)
+            box = (x0 / w, y0 / h, (x1 - x0) / w, (y1 - y0) / h)
+            faces.append(Face(*box, float(r[14]), yaw, eye))
         return sorted(faces, key=lambda f: f.score, reverse=True)
 
 

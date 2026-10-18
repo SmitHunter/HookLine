@@ -1,3 +1,4 @@
+import re
 import subprocess
 from itertools import pairwise
 from pathlib import Path
@@ -732,3 +733,82 @@ def test_a_stutter_across_a_removed_dash_stays_two_caption_words():
     ass = build_ass(caption_words(words), "", 2)
     caps = [e for e in _events(ass) if ",Cap," in e]
     assert len(caps) == 3  # one event per spoken word: I, I, WENT.
+
+
+# --- fix wave F: captions clear the face at every sample of their page --------------------
+
+
+def _page_y(text: str) -> list[tuple[float, float, int]]:
+    out = []
+    for line in text.splitlines():
+        if line.startswith("Dialogue:") and ",Cap," in line:
+            parts = line.split(",", 9)
+            y = int(re.search(r"\\pos\(\d+,(\d+)\)", parts[9]).group(1))
+            out.append((_secs(parts[1]), _secs(parts[2]), y))
+    return out
+
+
+def _secs(ts: str) -> float:
+    h, m, s = ts.split(":")
+    return int(h) * 3600 + int(m) * 60 + float(s)
+
+
+def test_build_ass_moves_only_the_pages_shown_over_a_head_dip():
+    from hookline.captions.ass import CAPTION_ABOVE, CAPTION_BELOW
+
+    words = [Word(start=0.2 + 0.4 * i, end=0.5 + 0.4 * i, text=f"w{i}.") for i in range(12)]
+    faces = []
+    for k in range(24):
+        t = k * 0.25 + 0.125
+        low = 2.0 <= t <= 2.4  # the head dips: the core reaches the 1180 caption band
+        y0, y1 = (1090, 1480) if low else (600, 980)
+        faces.append((t, 300.0, float(y0), 780.0, float(y1), y0 + 70.0))
+    text = build_ass(words, "", 6.0, faces=faces)
+    pages = _page_y(text)
+    moved = [(a, b, y) for a, b, y in pages if y != 1180]
+    assert moved and all(b > 1.9 and a < 2.5 for a, b, _ in moved)
+    for a, b, y in pages:
+        for t, _, y0, _, y1, eye in faces:
+            if a - 0.125 <= t <= b + 0.125:
+                top, bottom = y - CAPTION_ABOVE, y + CAPTION_BELOW
+                assert bottom <= eye or top >= y1, (a, b, y, t)  # the eye line tops the core
+
+
+def test_caption_y_for_counts_the_per_sample_faces():
+    lay = SceneLayout(
+        start=0, end=6, kind="FACE_TRACK", face_box=(0.3, 0.2), track_x=[(0, 0.5)],
+        face_px=[[t / 4, 300, 1000, 780, 1400, 1080] for t in range(24)],
+    )  # fmt: skip
+    # the median box (576-960 px) leaves 1180 free, the per-sample faces (1000-1400) do not
+    assert caption_y_for([lay], late=True) != 1180
+
+
+def test_page_on_the_forehead_above_the_eye_line_stays_put():
+    from hookline.captions.ass import face_samples
+
+    words = [Word(start=0.2 + 0.4 * i, end=0.5 + 0.4 * i, text=f"w{i}.") for i in range(6)]
+    # core (20% line) from 1130, eyes at 1260: the 1180 line's text (1141-1241) sits on the
+    # forehead, above the eyes -- accepted when the landmarks exist
+    lay = SceneLayout(
+        start=0, end=3, kind="FACE_TRACK", face_box=(0.5, 0.2), track_x=[(0, 0.5)],
+        face_px=[[k * 0.25 + 0.125, 300, 1130, 780, 1500, 1260] for k in range(12)],
+    )  # fmt: skip
+    text = build_ass(words, "", 3.0, faces=face_samples([lay]))
+    assert {y for _, _, y in _page_y(text)} == {1180}
+    blind = lay.model_copy(
+        update={"face_px": [[*r[:5], None] for r in lay.face_px]}  # no landmarks: 20% core
+    )
+    assert {y for _, _, y in _page_y(build_ass(words, "", 3.0, faces=face_samples([blind])))} != {
+        1180
+    }
+
+
+def test_face_samples_hold_to_the_scene_bounds():
+    from hookline.captions.ass import face_samples
+
+    lay = SceneLayout(
+        start=0, end=6, kind="FACE_TRACK", face_box=(0.5, 0.2), track_x=[(0, 0.5)],
+        face_px=[[t, 300, 1100, 780, 1400, None] for t in (2.125, 2.375)],
+    )  # fmt: skip
+    times = [s[0] for s in face_samples([lay])]
+    assert min(times) <= 0.125 + 1e-9 and max(times) >= 6.0 - 0.125 - 1e-9  # covers the scene

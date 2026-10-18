@@ -81,6 +81,9 @@ STACKED_CAPTION_Y = 700  # just below the cam/game seam (640), inside the safe b
 # a two-line hook box TEXT_SEPARATION below the 700 captions (visible to 761): 965
 STACKED_HOOK_Y = STACKED_CAPTION_Y + CAPTION_BELOW + TEXT_SEPARATION + HOOK_HALF
 HOOK_Y = 360  # requested centre; clamped so the box stays in Q4 (1 line: 378, 2 lines: 446)
+# A rendered face sample (`SceneLayout.face_px`): output s, core x0, top, x1, bottom, eye y px
+FaceSample = tuple[float, float, float, float, float, float | None]
+SAMPLE_HALF_S = 0.125  # a face sample stands for this long either side (4 fps)
 
 HEADER = f"""[Script Info]
 ScriptType: v4.00+
@@ -406,6 +409,7 @@ def build_ass(
     seam: float | None = None,
     caption_y_late: int | None = None,
     breaks: Sequence[float] = (),
+    faces: Sequence[FaceSample] = (),
 ) -> str:
     """`seam` (output s; cold opens only) adds SEAM_TAG for SEAM_TAG_S s at `hook_y`. When the
     seam falls inside the hook title's 3 s, the tag waits for the title to finish.
@@ -415,13 +419,20 @@ def build_ass(
 
     `caption_y_late` (default `caption_y`) is the caption line for groups that start once the
     hook and tag are off screen; it may sit higher (down to CAPTION_LATE_MIN_Y), e.g. above a
-    close-up's head where the hook needed that space."""
+    close-up's head where the hook needed that space.
+
+    `faces` (`face_samples`: the rendered face core per sample) move a page whose line would
+    overlap a face core or eye line shown with it to the nearest clear line (`_page_y`),
+    never above the hook box while that is up."""
     lines = [HEADER.rstrip("\n")]
     hook, fs, scale = _layout_hook(hook_text)
     windows = _windows(bool(hook), duration, seam)
     hook_end, tag_start, tag_end = windows
+    lo_early = CAPTION_MIN_Y
     if hook:
         y = _clamp_hook_y(hook_y, len(hook), fs)
+        box_bottom = y + len(hook) * fs / 2 + HOOK_PAD
+        lo_early = max(lo_early, math.ceil(box_bottom + TEXT_SEPARATION + CAPTION_ABOVE))
         tags = f"\\pos({TEXT_X},{y})\\fad(0,{HOOK_FADE_MS})" + _size_tags(fs, scale)
         body = "\\N".join(_esc(line) for line in hook)
         lines.append(_dialogue(1, 0.0, hook_end, "Hook", f"{{{tags}}}{body}"))
@@ -443,6 +454,10 @@ def build_ass(
         fit = _fit([" ".join(texts)], CAP_SIDE, CAP_MIN_FS, CAP_FONT_SIZE)
         fs, scale = fit or (CAP_MIN_FS, MIN_SCALE_X)
         y = cy if early else cy_late
+        if faces:
+            width = _line_w(" ".join(texts), fs) * scale / 100 + 2 * CAP_SIDE
+            lo = min(lo_early, y) if early else min(CAPTION_LATE_MIN_Y, y)
+            y = _page_y(y, lo, page_start, hold_end, faces, width)
         tags = f"\\pos({TEXT_X},{y})" + _size_tags(fs, scale, CAP_FONT_SIZE)
         for i, active in enumerate(group):
             start = page_start if i == 0 else active.start  # the page leads its first word
@@ -494,15 +509,99 @@ def _face_px(layout: SceneLayout) -> tuple[float, float] | None:
 Faces = list[tuple[float, float, float]]  # (weight s, top px, bottom px)
 
 
-def _faces(layouts: list[SceneLayout], until: float | None = None) -> Faces:
-    """Zoom-budgeted face-core spans of the scenes (those starting before `until`), weighted
-    by their time on screen (before `until`, when given)."""
-    return [
-        (max((lay.end if until is None else min(lay.end, until)) - lay.start, 1e-3), y0, y1)
+def face_top(sample: Sequence[float | None]) -> float:
+    """Where a face sample's core starts (px): its eye line when the landmarks gave one (text
+    above the eyes sits on forehead/hair: accepted), else the box minus its top
+    FACE_CORE_TOP."""
+    eye = sample[5]
+    return float(eye) if eye is not None else float(sample[2])  # type: ignore[arg-type]
+
+
+def held_face_px(
+    rows: Sequence[Sequence[float | None]], start: float, end: float
+) -> list[list[float | None]]:
+    """A scene's face samples with the first held back to its start and the last held on to
+    its end (copies every 2 * SAMPLE_HALF_S): before the first sample and after the last the
+    face is where it was nearest."""
+    rows = sorted((list(r) for r in rows), key=lambda r: r[0])  # type: ignore[arg-type, return-value]
+    if not rows:
+        return []
+    step = 2 * SAMPLE_HALF_S
+    out: list[list[float | None]] = []
+    t = rows[0][0] - step  # type: ignore[operator]
+    while t > start - SAMPLE_HALF_S:
+        out.insert(0, [max(t, start), *rows[0][1:]])
+        t -= step
+    out += rows
+    t = rows[-1][0] + step  # type: ignore[operator]
+    while t < end + SAMPLE_HALF_S:
+        out.append([min(t, end), *rows[-1][1:]])
+        t += step
+    return out
+
+
+def face_samples(layouts: Sequence[SceneLayout]) -> list[FaceSample]:
+    """Every scene's rendered per-sample face cores (`face_px`, held to the scene's bounds:
+    `held_face_px`), in time order; the last field the eye line, or None without landmarks."""
+    return sorted(
+        (float(s[0]), float(s[1]), float(s[2]), float(s[3]), float(s[4]), s[5])  # type: ignore[arg-type,misc]
         for lay in layouts
-        if until is None or lay.start < until
-        for _, y0, _, y1 in face_rects(lay, FACE_ZOOM_BUDGET)
+        for s in held_face_px(lay.face_px, lay.start, lay.end)
+    )
+
+
+def _faces(layouts: list[SceneLayout], until: float | None = None) -> Faces:
+    """Face-core spans of the scenes (those starting before `until`), weighted by their time
+    on screen (before `until`, when given): each rendered face sample (`face_px`: the real
+    zoom and position, the eye line counted) where the scene has them, else the median face
+    budgeted for a punch-in."""
+    out: Faces = []
+    for lay in layouts:
+        if until is not None and lay.start >= until:
+            continue
+        if lay.face_px:
+            out += [
+                (2 * SAMPLE_HALF_S, face_top(s), s[4])
+                for s in held_face_px(lay.face_px, lay.start, lay.end)
+                if until is None or s[0] < until
+            ]
+            continue
+        wt = max((lay.end if until is None else min(lay.end, until)) - lay.start, 1e-3)
+        out += [(wt, y0, y1) for _, y0, _, y1 in face_rects(lay, FACE_ZOOM_BUDGET)]
+    return out
+
+
+def _page_y(
+    default: int,
+    lo: int,
+    t0: float,
+    t1: float,
+    faces: Sequence[FaceSample],
+    text_w: float,
+) -> int:
+    """The caption line for a page shown t0..t1: `default` unless a face sample shown with it
+    (its core, or its eye line, under the text's columns) overlaps the caption's visible
+    extent; then the line in [lo, CAPTION_MAX_Y] nearest `default` that clears every such
+    sample with CAPTION_FACE_GAP to spare, else with none, else the least overlap."""
+    x0, x1 = TEXT_X - text_w / 2, TEXT_X + text_w / 2
+    near = [
+        f
+        for f in faces
+        if t0 - SAMPLE_HALF_S <= f[0] <= t1 + SAMPLE_HALF_S and f[3] >= x0 and f[1] <= x1
     ]
+
+    def overlap(y: int, gap: float) -> float:
+        top, bottom = y - CAPTION_ABOVE - gap, y + CAPTION_BELOW + gap
+        return sum(max(0.0, min(bottom, f[4]) - max(top, face_top(f))) for f in near)
+
+    if not near or overlap(default, 0) == 0:
+        return default
+    lines = [*range(CAPTION_MAX_Y, lo, -CAPTION_STEP), lo]
+    for gap in (CAPTION_FACE_GAP, 0):
+        ok = [y for y in lines if overlap(y, gap) == 0]
+        if ok:
+            return min(ok, key=lambda y: abs(y - default))
+    return min(lines, key=lambda y: (overlap(y, 0), abs(y - default)))
 
 
 def _overlap(top: float, bottom: float, faces: Faces) -> float:

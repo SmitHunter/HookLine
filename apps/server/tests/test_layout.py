@@ -393,3 +393,19 @@ def test_face_track_gaze_lead_from_median_yaw(yaws, lead):
     ]
     s = classify_scene(samples, 0, 3)
     assert s.lead == pytest.approx(lead)
+
+
+# --- fix wave F: per-sample face rows (caption placement over time) -------------------------
+
+
+def test_face_track_records_each_samples_face_row_and_eye_line():
+    samples = [
+        (t * 0.25, [Face(x=0.4, y=0.2 + 0.02 * t, w=0.2, h=0.4, score=0.9, eye_y=0.35 + 0.02 * t)])
+        for t in range(6)
+    ]
+    samples.insert(3, (0.6, []))  # a lost face holds the last row
+    s = classify_scene(samples, 0.0, 2.0)
+    assert len(s.track_face) == len(s.track_x)
+    assert s.track_face[0] == pytest.approx((0.2, 0.4, 0.35))
+    assert s.track_face[3] == pytest.approx(s.track_face[2])
+    assert Face(x=0, y=0, w=1, h=1, score=1).eye_y is None
