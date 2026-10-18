@@ -303,7 +303,8 @@ def test_snap_splices_skips_a_short_dropped_fragment_and_moves_a_misplaced_kept_
 
     # clip 01: the kept range starts at 2.67 inside the tail of the dropped "alone." (sounding
     # 2.56-2.86); DTW put the kept "I" mostly past that sound (2.80-3.05), its real onset is
-    # 3.14 (a kept word with most of its span inside the burst is the burst: never skipped)
+    # 3.14 (a kept word mostly inside the burst is that burst and keeps it -- unless it has its
+    # own onset just after it, see round 2; this "I" is not mostly inside: the burst goes)
     env = _env([(1.0, 1.9), (2.0, 2.42), (2.56, 2.86), (3.14, 3.5)])
     words = [_w(1.0, 1.9, "kept."), _w(2.28, 2.6, "alone."), _w(2.80, 3.05, "I"),
              _w(3.3, 3.5, "put")]  # fmt: skip

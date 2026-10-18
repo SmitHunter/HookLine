@@ -77,6 +77,7 @@ ROOM_TONE_DB = -62.0
 PINK_RMS_DB = -14.3
 ZERO_RUN_S = 0.2
 CUT_SLIVER_S = 0.08  # a caption word this short next to a cut is a splice remnant: not shown
+CUT_SLIVER_NEAR_S = 0.2  # ... its mid-point this close to the cut (further on: a real word)
 
 log = logging.getLogger(__name__)
 
@@ -167,14 +168,17 @@ def drop_cut_slivers(
     words: list[Word], cuts: list[float], min_s: float = CUT_SLIVER_S
 ) -> list[Word]:
     """`words` (output time) without those shorter than `min_s` next to a cut: the last word
-    before it or the first after it (by their mid-points), the remnant of a word the splice
-    cut through -- a caption flash."""
+    before it or the first after it (by their mid-points), its mid-point within
+    CUT_SLIVER_NEAR_S of the cut -- the remnant of a word the splice cut through, a caption
+    flash. A short word further away is a real word and keeps its caption."""
     drop: set[int] = set()
     for c in cuts:
         before = [i for i, w in enumerate(words) if (w.start + w.end) / 2 < c]
         after = [i for i, w in enumerate(words) if (w.start + w.end) / 2 >= c]
         for i in [*before[-1:], *after[:1]]:
-            if words[i].end - words[i].start < min_s:
+            w = words[i]
+            near = abs((w.start + w.end) / 2 - c) <= CUT_SLIVER_NEAR_S
+            if near and w.end - w.start < min_s:
                 drop.add(i)
     return [w for i, w in enumerate(words) if i not in drop]
 

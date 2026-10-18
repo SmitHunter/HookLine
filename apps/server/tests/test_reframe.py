@@ -1758,7 +1758,7 @@ def test_step_offset_models_the_eased_shift():
     assert at_cut(2.0 + ZOOM_EASE / 2) == pytest.approx(shift)  # a cut's shift is instant
 
 
-def test_punch_in_never_returns_on_the_next_scenes_start():
+def test_punch_in_returns_exactly_on_the_camera_change():
     from hookline.media.reframe import _punch_in
 
     calls = []
@@ -1770,7 +1770,9 @@ def test_punch_in_never_returns_on_the_next_scenes_start():
     levels = [(0.0, 1.0)]
     out = _punch_in(levels, [(0.0, 1.0), (4.5, ZOOM_PUNCH)], [], (0.0, 5.0), spans_at)
     assert (4.5, ZOOM_PUNCH) in out
-    assert all(t < 5.0 for t, _ in out)  # no return step on the camera change at 5.0
+    # round 3: the return sits on the camera change (instant there, `scene_filter`), so the
+    # punch never carries into the next scene; nothing else past the punch
+    assert (5.0, 1.0) in out and all(t <= 5.0 for t, _ in out)
 
 
 def test_face_track_px_leaves_a_missing_eye_line_unset():
@@ -1781,3 +1783,20 @@ def test_face_track_px_leaves_a_missing_eye_line_unset():
     )
     px = face_track_px(lay, 1920, 864, [(0.0, 1.0)])
     assert px and all(row[5] is None for row in px)  # the caption falls back to the 20% core
+
+
+# --- fix wave F review round 3: a punch never carries across a camera change -------------
+
+
+def test_punch_in_returns_at_the_scene_end_instantly():
+    from hookline.media.reframe import _level_at, _punch_in
+
+    sched = [(0.0, 1.0), (9.0, ZOOM_IN)]
+    out = _punch_in(sched, sched, cuts=[4.4], scene=(0, 5), spans_at=lambda _s: [])
+    assert _level_at(out, 4.5) > 1.0  # the cut got its punch ...
+    assert (5.0, 1.0) in out and _level_at(out, 6.0) == 1.0  # ... which ends at the scene end
+    # the next scene starts on the returned level in its first frame: no ease across the change
+    lay = SceneLayout(start=5, end=12, kind="FIT_BLUR")
+    chain = scene_filter(lay, 1920, 864, "a", "b", zoom_steps=out, cut_times=[4.4])
+    s = chain.split("scale=w='trunc(1080*(", 1)[1].split(")/2)*2'", 1)[0].replace("\\,", ",")
+    assert evaluate(s, 0.0) == pytest.approx(1.0) and evaluate(s, 0.1) == pytest.approx(1.0)

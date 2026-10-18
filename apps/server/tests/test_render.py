@@ -777,3 +777,15 @@ def test_drop_cut_slivers_removes_the_short_word_next_to_a_cut_even_a_little_off
              Word(start=1.25, end=1.6, text="lot")]  # fmt: skip
     out = drop_cut_slivers(words, cuts=[0.55])
     assert [w.text for w in out] == ["kept", "And", "a", "lot"]
+
+
+def test_drop_cut_slivers_keeps_a_short_word_away_from_the_cut():
+    from hookline.pipeline.render import drop_cut_slivers
+
+    # review round 3: a short "I" 0.5 s after a cut is a real word, not a splice remnant
+    words = [Word(start=0.0, end=1.0, text="kept"), Word(start=1.5, end=1.56, text="I"),
+             Word(start=1.6, end=2.0, text="put")]  # fmt: skip
+    assert [w.text for w in drop_cut_slivers(words, cuts=[1.0])] == ["kept", "I", "put"]
+    near = [Word(start=0.0, end=1.0, text="kept"), Word(start=1.05, end=1.11, text="up."),
+            Word(start=1.6, end=2.0, text="put")]  # fmt: skip
+    assert [w.text for w in drop_cut_slivers(near, cuts=[1.0])] == ["kept", "put"]

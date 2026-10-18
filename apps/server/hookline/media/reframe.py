@@ -1393,8 +1393,10 @@ def _punch_in(
             if any(abs(stop - b) < 1e-9 for b in beats) and lvl >= _level_at(lv, stop) - 1e-9:
                 continue  # its return would land on a beat: the beat must still rise
             trial = [st for st in out if abs(st[0] - t) >= 1e-9] + [(t, lvl)]
-            if stop < end - 1e-9 and not any(abs(u - stop) < 1e-9 for u, _ in out):
-                trial.append((round(stop, 3), back))  # (at the scene end: the camera change)
+            if not any(abs(u - stop) < 1e-9 for u, _ in out):
+                # the return; at the scene end it lands on the camera change, in one frame
+                # (`scene_filter` makes steps at scene bounds instant): never carried over
+                trial.append((round(stop, 3), back))
             sd = _dedupe(trial)
             if current is None:
                 current = violations(lv)
@@ -1662,7 +1664,7 @@ def scene_filter(
     each level mapped through the scene's plan (`plan_zoom`, `SceneLayout.zoom_level`) and
     scaled about its anchor row (`SceneLayout.anchor_px`): FACE_TRACK whole frame, STACKED
     facecam panel, both SPLIT panels, FIT_BLUR foreground. Steps at `cut_times` (output s)
-    land in one frame, the others ease. Pass steps already through `guard_zoom` (the edge
+    and at the scene's own bounds (camera changes) land in one frame, the others ease. Pass steps already through `guard_zoom` (the edge
     guard's holds; the same steps go to the sidecar). A FACE_TRACK crop follows its track with
     the edge guard and gaze lead (`_track_plan`, the rendered zoom at each moment) plus the
     guard's `shift_steps` (instant at cuts). Panels upscaled more than SHARPEN_ABOVE are
@@ -1680,7 +1682,8 @@ def scene_filter(
             offset=layout.start,
             length=layout.end - layout.start,
             level=layout.zoom_level,
-            instant=cut_times,
+            # a step on a camera change is like one on a cut: no ease across it
+            instant=[*cut_times, layout.start, layout.end],
         )
     else:
         zoom = _fmt(layout.zoom_level(1.0))
