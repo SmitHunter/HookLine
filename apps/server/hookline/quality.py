@@ -99,6 +99,8 @@ SPEECH_START_MAX = 0.5
 FIRST_WORDS_MIN = 0.6
 PACE_MAX_GAP = 5.0
 MIN_VIDEO_KBPS = 5000
+# Q8 bar for a soft source: 2.5x its video bitrate, within [2000, MIN_VIDEO_KBPS] kb/s
+SOURCE_KBPS_FACTOR, FLOOR_VIDEO_KBPS = 2.5, 2000
 # AAC is encoded at 192k; the measured average undershoots on simple audio (real clips 176-189k).
 AUDIO_KBPS, AUDIO_KBPS_RANGE = 192, (160, 200)
 MAX_CAPTION_SAMPLES = 400  # one per caption group; beyond this the widest/smallest groups win
@@ -347,8 +349,18 @@ def _check_loudness(mp4: Path) -> CheckResult:
     return CheckResult("Q1", ok, round(m.i, 2), thr, f"I={m.i:.1f} LUFS, TP={m.tp:.1f} dBTP")
 
 
-def _check_encode(info: dict) -> CheckResult:
-    thr = f"1080x1920 h264 yuv420p, video >= {MIN_VIDEO_KBPS} kb/s, aac {AUDIO_KBPS}k"
+def min_video_kbps(source_kbps: float | None) -> float:
+    """Q8's video bitrate bar: min(5000, max(2000, 2.5 x the source's video bitrate)) kb/s; a
+    low-bitrate source (soft, dark 720p) has no detail for 5 Mb/s to keep. 5000 when the
+    source bitrate is unknown (sidecars from before it was recorded)."""
+    if not source_kbps:
+        return float(MIN_VIDEO_KBPS)
+    return min(MIN_VIDEO_KBPS, max(FLOOR_VIDEO_KBPS, SOURCE_KBPS_FACTOR * source_kbps))
+
+
+def _check_encode(info: dict, source_kbps: float | None = None) -> CheckResult:
+    bar = min_video_kbps(source_kbps)
+    thr = f"1080x1920 h264 yuv420p, video >= {bar:.0f} kb/s, aac {AUDIO_KBPS}k"
     streams = info.get("streams", [])
     v = next((s for s in streams if s.get("codec_type") == "video"), None)
     a = next((s for s in streams if s.get("codec_type") == "audio"), None)
@@ -363,7 +375,7 @@ def _check_encode(info: dict) -> CheckResult:
         problems.append(f"size {size}")
     if v.get("codec_name") != "h264" or v.get("pix_fmt") != "yuv420p":
         problems.append(f"{v.get('codec_name')} {v.get('pix_fmt')}")
-    if v_kbps < MIN_VIDEO_KBPS:
+    if v_kbps < bar:
         problems.append(f"video {v_kbps:.0f} kb/s")
     lo, hi = AUDIO_KBPS_RANGE
     if a is None or a.get("codec_name") != "aac" or not lo <= a_kbps <= hi:
@@ -607,7 +619,7 @@ def audit_clip(
             actual_first_words=sidecar.get("first_words") or "",
         ),
         _check_pacing(sidecar, duration),
-        _check_encode(_probe(mp4)),
+        _check_encode(_probe(mp4), sidecar.get("source_video_kbps")),
     ]
 
 

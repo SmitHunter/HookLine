@@ -1,6 +1,7 @@
 import json
 import re
 import subprocess
+import wave
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -148,3 +149,35 @@ def detect_silences(
         spans.append((open_at, end))
     clipped = [(max(a, start), min(b, end)) for a, b in spans]
     return [(a, b) for a, b in clipped if b > a]
+
+
+MOMENTARY_HOP = 0.1
+MOMENTARY_WINDOW = 0.4
+_BLOCK_HOPS = 600  # hops read per block: a multi-hour VOD never sits in memory at once
+
+
+def momentary_db(
+    wav: Path, hop: float = MOMENTARY_HOP, window: float = MOMENTARY_WINDOW
+) -> np.ndarray:
+    """Short-term loudness of a 16-bit PCM WAV every `hop` s: `db[k]` (dBFS mean power,
+    floored at -100) is the `window` s ending at (k + 1) * hop (shorter at the start). Read in
+    blocks with the `wave` module, so it costs well under a second per hour of 16 kHz audio."""
+    with wave.open(str(wav), "rb") as w:
+        if w.getsampwidth() != 2:
+            raise FFmpegError(f"{wav} is not 16-bit PCM")
+        rate, channels = w.getframerate(), w.getnchannels()
+        n = max(1, round(hop * rate))
+        powers: list[np.ndarray] = []
+        while raw := w.readframes(n * _BLOCK_HOPS):
+            x = np.frombuffer(raw, np.int16).astype(np.float64) / 32768.0
+            if channels > 1:
+                x = x[: len(x) // channels * channels].reshape(-1, channels).mean(axis=1)
+            m = len(x) // n
+            powers.append((x[: m * n].reshape(m, n) ** 2).mean(axis=1))
+    power = np.concatenate(powers) if powers else np.zeros(0)
+    k = max(1, round(window / hop))
+    csum = np.concatenate([[0.0], np.cumsum(power)])
+    ends = np.arange(1, len(power) + 1)
+    starts = np.maximum(ends - k, 0)
+    mean = (csum[ends] - csum[starts]) / (ends - starts) if len(power) else power
+    return np.maximum(10 * np.log10(np.maximum(mean, 1e-10)), _FLOOR_DB)

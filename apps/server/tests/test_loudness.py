@@ -1,8 +1,11 @@
+from pathlib import Path
+
 import pytest
 
 from hookline.media.ffmpeg import _run
 from hookline.media.loudness import (
     COMPRESSOR,
+    SPEECH_SWAY_DB,
     Loudness,
     ensure_true_peak,
     loudnorm_filter,
@@ -119,10 +122,14 @@ def test_low_crest_clip_is_linear_and_minus_14(
     _check_render(steady_quiet_video, tmp_path, sample_pick, settings, final_argvs, "linear")
 
 
-def test_speech_like_clip_is_dynamic_and_minus_14(
+def test_speech_like_clip_is_levelled_linear_and_minus_14(
     quiet_speech_video, sample_pick, settings, tmp_path, final_argvs
 ):
-    _check_render(quiet_speech_video, tmp_path, sample_pick, settings, final_argvs, "dynamic")
+    """Wave G-select: its 16 dB swings (LRA ~16) are levelled to <= 8 LU, so loudnorm goes
+    linear (before the leveler it had to go dynamic)."""
+    _check_render(quiet_speech_video, tmp_path, sample_pick, settings, final_argvs, "linear")
+    m = measure_loudness(tmp_path / "out" / "01-x.mp4")
+    assert m.lra <= 8.0
 
 
 def test_high_crest_clip_lands_on_target(
@@ -137,7 +144,9 @@ def test_high_crest_clip_lands_on_target(
     dst, _ = _render(high_crest_video, tmp_path, sample_pick, settings, final_argvs)
     m = measure_loudness(dst)
     print(f"high crest -> I={m.i} TP={m.tp}")
-    assert m.i == pytest.approx(-14.0, abs=0.5)
+    # wave G-select: the whole clip may sit up to SPEECH_SWAY_DB off -14 so its speech lands
+    # on -14 (its "words" are the loud bursts here)
+    assert m.i == pytest.approx(-14.0, abs=0.5 + SPEECH_SWAY_DB)
     assert m.tp <= -1.0
 
 
@@ -271,3 +280,97 @@ def test_render_without_audio_stream(
     assert "-af" not in final
     assert _run(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries",
                  "stream=index", "-of", "csv=p=0", str(dst)]).stdout.strip() == ""  # fmt: skip
+
+
+# --- wave G-select: speech-gated loudness and a loudness range <= 8 LU -------------------------
+
+GAME_SPEECH = [(2.0 * k, 2.0 * k + 1.6) for k in range(15) if k not in (4, 10)]
+
+
+@pytest.fixture(scope="module")
+def game_clip(tmp_path_factory) -> Path:
+    """30 s: speech-like bursts (1.6 s on / 0.4 s off) at about -30 LUFS, with two 1.5 s game
+    stingers (at 8 s and 20 s) 14 dB above the speech: voice under game, LRA well over 8."""
+    out = tmp_path_factory.mktemp("game") / "game.mkv"
+    speech = r"if(lt(mod(t\,2)\,1.6)\,1\,0)*(1-between(t\,8\,10)-between(t\,20\,22))"
+    sting = r"8*(between(t\,8\,9.5)+between(t\,20\,21.5))"
+    graph = (
+        f"[1:a]volume='{speech}':eval=frame[s];[2:a]volume='{sting}':eval=frame[g];"
+        "[s][g]amix=inputs=2:normalize=0[a]"
+    )
+    _run(["ffmpeg", "-hide_banner", "-v", "error", "-y",
+          "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=25:duration=30",
+          "-f", "lavfi", "-i", "anoisesrc=color=pink:seed=3:amplitude=0.2:sample_rate=48000:duration=30",
+          "-f", "lavfi", "-i", "anoisesrc=color=white:seed=5:amplitude=0.03:sample_rate=48000:duration=30",
+          "-filter_complex",
+          graph,
+          "-map", "0:v", "-map", "[a]", "-c:v", "libx264", "-c:a", "pcm_s16le", str(out)])  # fmt: skip
+    return out
+
+
+def _apply(src: Path, af: str, dst: Path) -> Path:
+    _run(["ffmpeg", "-hide_banner", "-v", "error", "-y", "-i", str(src), "-vn", "-af", af,
+          "-c:a", "aac", "-b:a", "192k", "-ar", "48000", str(dst)])  # fmt: skip
+    return dst
+
+
+def test_game_clip_fixture_has_voice_under_game(game_clip):
+    from hookline.media.loudness import speech_filter
+
+    whole = measure_loudness(game_clip)
+    speech = measure_loudness(game_clip, speech_filter(GAME_SPEECH))
+    print(f"fixture: I={whole.i} LRA={whole.lra} speech I={speech.i}")
+    assert whole.lra > 8 and whole.i - speech.i > 4
+
+
+def test_speech_lands_near_the_target_and_the_range_is_compressed(game_clip, tmp_path):
+    from hookline.media.loudness import MAX_LRA, plan_loudness, speech_filter
+
+    plan = plan_loudness(game_clip, speech=GAME_SPEECH)
+    out = _apply(game_clip, plan.af, tmp_path / "out.m4a")
+    m = measure_loudness(out)
+    s = measure_loudness(out, speech_filter(GAME_SPEECH))
+    print(f"speech-gated: I={m.i} TP={m.tp} LRA={m.lra} speech I={s.i} ({plan.mode})")
+    assert MAX_LRA == 8.0
+    assert m.i == pytest.approx(-14.0, abs=1.0) and m.tp <= -1.0
+    assert m.lra <= 8.0
+    assert s.i >= -15.5  # the voice is no longer buried under the game
+
+
+def test_speech_filter_selects_the_spans_and_merges_close_ones():
+    from hookline.media.loudness import speech_filter
+
+    f = speech_filter([(1.0, 1.5), (1.6, 3.0), (5.0, 6.25)])
+    assert f.startswith("aselect='") and f.endswith(",asetpts=N/SR/TB")
+    assert "between(t\\,1.000\\,3.000)+between(t\\,5.000\\,6.250)'" in f
+    assert speech_filter([(1.0, 2.0)]) is None  # under 3 s of speech: not gated
+
+
+def test_plan_without_speech_spans_keeps_the_whole_clip_target(monkeypatch, tmp_path):
+    from hookline.media import loudness as loud_mod
+
+    calls = []
+
+    def fake(path, pre=None):
+        calls.append(pre)
+        return _m(-20.0, tp=-8.0, lra=6.0)
+
+    monkeypatch.setattr(loud_mod, "measure_loudness", fake)
+    plan = loud_mod.plan_loudness(tmp_path / "x.mkv")
+    assert "loudnorm=I=-14:" in plan.af and all("aselect" not in (c or "") for c in calls)
+    assert all((c or "").count("acompressor") <= 1 for c in calls)  # LRA 6: no leveler
+
+
+def test_render_passes_the_spoken_spans_to_the_loudness_plan(
+    quiet_speech_video, sample_pick, settings, tmp_path, final_argvs, monkeypatch
+):
+    from hookline.pipeline import render as render_mod
+
+    seen = []
+    real = render_mod.plan_loudness
+    monkeypatch.setattr(
+        render_mod, "plan_loudness", lambda p, speech=None: seen.append(speech) or real(p, speech)
+    )
+    _render(quiet_speech_video, tmp_path, sample_pick, settings, final_argvs)
+    (spans,) = seen
+    assert spans and all(b > a for a, b in spans) and spans[0][0] < 1.0

@@ -1,9 +1,17 @@
+import numpy as np
+
 from hookline.pipeline.signals import (
     CLIP_MARKER,
+    SCARE_MARKER,
+    SIGNALS_VERSION,
     Signals,
+    audio_onsets,
+    flash_seconds,
     heat_markers,
     heat_seconds,
     loud_seconds,
+    low_motion,
+    scare_seconds,
 )
 
 
@@ -120,3 +128,90 @@ def test_heat_seconds_cover_whole_runs():
     heat = heat_seconds(Signals(duration=600, loudness=loud + [-40.0] * 500, chat=chat))
     assert set(range(20, 25)) <= heat
     assert 305 in heat and 100 not in heat and 450 not in heat
+
+
+# --- wave G-select: game-audio transients, visual flashes, scare markers ----------------------
+
+
+def _env(n_s: int, base: float = -45.0) -> np.ndarray:
+    return np.full(n_s * 10, base)  # 0.1 s hop
+
+
+def test_audio_onset_needs_a_10db_jump_within_half_a_second():
+    db = _env(60)
+    db[200:215] = -18.0  # sharp: -45 -> -18 at 20.0 s
+    db[400:430] = np.linspace(-45, -18, 30)  # a slow 3 s swell: under 5 dB per 0.5 s
+    db[430:440] = -18.0
+    every, game = audio_onsets(db, 0.1, [])
+    assert every == [20] and game == [20]
+
+
+def test_audio_onset_must_be_loud_against_the_vod():
+    db = _env(60)
+    db[200:215] = -34.0  # an 11 dB jump, but under median + 12 (-33)
+    db[450:460] = -38.0
+    assert audio_onsets(db, 0.1, []) == ([], [])
+    quiet = _env(60, base=-80.0)
+    quiet[200:215] = -50.0  # +30 dB jump, but under the -35 dBFS floor
+    assert audio_onsets(quiet, 0.1, []) == ([], [])
+
+
+def test_onsets_inside_speech_are_not_game_transients():
+    db = _env(60)
+    db[200:215] = -15.0  # a shout at 20.0 s
+    db[300:315] = -15.0  # a stinger at 30.0 s, no words near it
+    every, game = audio_onsets(db, 0.1, [(20.05, 20.6)])
+    assert every == [20, 30] and game == [30]
+
+
+def test_flash_needs_a_big_jump_over_the_local_motion():
+    motion = [2.0] * 90
+    motion[20] = 80.0  # a flash in a calm scene
+    motion[40:80] = [45.0] * 40  # busy gameplay: big diffs, but nothing stands out
+    motion[60] = 90.0
+    assert flash_seconds(motion) == {20}
+    assert flash_seconds([1.0] * 30) == set() and flash_seconds([]) == set()
+
+
+def _sig(**kw) -> Signals:
+    base = {"duration": 100, "loudness": [-40.0] * 100, "version": SIGNALS_VERSION}
+    return Signals(**{**base, **kw})
+
+
+def test_scares_are_game_transients_and_flashes_with_a_sound():
+    motion = [2.0] * 100
+    motion[30] = motion[70] = 90.0
+    sig = _sig(motion=motion, onsets=[12, 31], transients=[12])
+    # the transient at 12; the flash at 30 has a sound 1 s later; the flash at 70 is silent
+    assert scare_seconds(sig) == {12, 30}
+    assert scare_seconds(_sig()) == set()  # signals cached before scares existed
+
+
+def test_scare_marker_once_per_burst_and_in_heat():
+    sig = _sig(motion=[2.0] * 100, onsets=[10, 12, 14, 40], transients=[10, 12, 14, 40])
+    m = heat_markers(sig)
+    assert SCARE_MARKER == "⚡scare"
+    assert {k: v for k, v in m.items() if SCARE_MARKER in v} == {
+        10: [SCARE_MARKER],
+        40: [SCARE_MARKER],
+    }
+    assert {10, 12, 14, 40} <= heat_seconds(sig)
+
+
+def test_scare_marker_is_described_in_the_prompt():
+    from hookline.pipeline.select import SYSTEM_PROMPT
+
+    assert SCARE_MARKER in SYSTEM_PROMPT
+
+
+def test_low_motion_spans():
+    motion = [1.0] * 20 + [12.0] * 5 + [1.0] * 20
+    assert low_motion(motion, 2.0, 15.0)
+    assert not low_motion(motion, 15.0, 30.0)
+    assert not low_motion(motion, 40.0, 60.0)  # past the end: unknown, not low
+    assert not low_motion(None, 2.0, 15.0)
+
+
+def test_signals_without_new_fields_are_an_old_version():
+    old = Signals.model_validate_json('{"duration": 5, "loudness": [-30.0]}')
+    assert old.version < SIGNALS_VERSION and old.motion is None and old.transients is None

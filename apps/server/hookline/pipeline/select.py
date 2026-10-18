@@ -32,7 +32,7 @@ from hookline.models import (
 )
 from hookline.pipeline.boundaries import FILLER_OPENERS
 from hookline.pipeline.deadair import MIN_PIECE_S
-from hookline.pipeline.signals import CLIP_MARKER
+from hookline.pipeline.signals import CLIP_MARKER, SCARE_MARKER
 from hookline.transcript_text import (
     compact_transcript,
     ends_sentence,
@@ -102,7 +102,10 @@ Some lines end with markers in angle brackets, such as `⟨🔥chat×4 🔊loud�
 and audio reactions inside that sentence: `🔥chat×N` means chat activity ran about N times the \
 usual rate, and `🔊loud` means the audio got far louder than normal. An emoji after \
 `🔥chat×N` says what chat was reacting with (😂 laughing, 🏆 hype, 💀 a fail, 😱 shock), and \
-`<<CLIP_MARKER>>` means chat is asking for a clip. Treat them as evidence of \
+`<<CLIP_MARKER>>` means chat is asking for a clip. `<<SCARE_MARKER>>` means something \
+sudden happened in the video itself, at or just before that line: a sharp game sound (a \
+stinger, a crash, a scream) or a flash on screen. A reaction line marked with it is reacting \
+to that event, which is the cause the viewer must see. Treat them as evidence of \
 emotional intensity, not a requirement: a moment without markers can still be great, and a \
 marked one can still be a poor clip.
 
@@ -182,6 +185,15 @@ slurs, sexual content and gore.
 - A loud reaction is the payoff, not the opening: start 3–8 seconds earlier on the cause, so \
 the viewer sees what the streamer is reacting to. The cause line is then your `first_words` \
 and must still work cold.
+- Gameplay reactions (a jumpscare, a death, a clutch, a chase): the cause is often on screen, \
+not in the words. Show 2–4 seconds of the cause before the reaction: when the reaction line \
+carries `<<SCARE_MARKER>>` or follows a pause, start on the line before that pause, not on \
+the reaction itself. For example (invented): "Okay, the vent's open, let me take a peek." \
+then a sudden crash, then "Nope. Absolutely not." starts on the peek line. End within 3 \
+seconds after the payoff: the scream, the escape, the "I made it!". Never run on into a \
+death, loading or menu screen, a respawn or a new attempt at the same section: a long pause \
+after a death or a win usually means one of those, and the next lines ("Okay, again.", \
+"Which way now?") belong to a new attempt, not to this clip.
 - When the streamer is answering chat, the viewer never saw the question. Put the question in \
 `hook_text` so the answer lands.
 
@@ -287,8 +299,10 @@ Return the number of candidates requested, ranked best first, each with its verd
 material is thin, still return them, mark the weak ones `skip` and score them honestly. Never \
 pick a moment that overlaps a range you are told to avoid.
 """
-SYSTEM_PROMPT = SYSTEM_PROMPT.replace("<<CLIP_MARKER>>", CLIP_MARKER).replace(
-    "<<PACKAGING_RULES>>\n", PACKAGING_RULES
+SYSTEM_PROMPT = (
+    SYSTEM_PROMPT.replace("<<CLIP_MARKER>>", CLIP_MARKER)
+    .replace("<<SCARE_MARKER>>", SCARE_MARKER)
+    .replace("<<PACKAGING_RULES>>\n", PACKAGING_RULES)
 )
 
 _SCORE_MAX = {

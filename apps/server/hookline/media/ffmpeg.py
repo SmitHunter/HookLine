@@ -3,6 +3,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 from pathlib import Path
 
 _ENCODER_PREFERENCE = ("h264_nvenc", "h264_amf", "libx264")
@@ -13,8 +14,9 @@ _ENCODER_QUALITY_ARGS: dict[str, list[str]] = {
     # CRF 17 capped at 10 Mb/s (VBV) keeps detail on upscaled faces without runaway sizes.
     "libx264": ["-preset", "veryfast", "-crf", "17", "-maxrate", "10M", "-bufsize", "20M"],
     # The requested QVBR mode (-rc qvbr / hqvbr) fails to initialise on this AMD driver (error 4),
-    # so use constant-QP: quality-driven like CRF, bitrate scales with the content.
-    "h264_amf": ["-rc", "cqp", "-qp_i", "18", "-qp_p", "20", "-qp_b", "22"],
+    # so use constant-QP: quality-driven like CRF, bitrate scales with the content. QP 16/18/20
+    # (wave G-select): soft dark sources posterise at 18/20/22; B-frames added when supported.
+    "h264_amf": ["-rc", "cqp", "-qp_i", "16", "-qp_p", "18", "-qp_b", "20"],
     "h264_nvenc": ["-rc", "vbr", "-cq", "18", "-b:v", "0"],
 }
 
@@ -35,8 +37,35 @@ def filter_graph_args(graph: str, script: Path, force: bool = False) -> list[str
 
 
 def encoder_args(encoder: str) -> list[str]:
-    """`-c:v <encoder>` plus that encoder's rate-control options."""
-    return ["-c:v", encoder, *_ENCODER_QUALITY_ARGS.get(encoder, [])]
+    """`-c:v <encoder>` plus that encoder's rate-control options (AMF: `-bf 2` when the
+    hardware takes B-frames, see `amf_b_frames`)."""
+    extra = ["-bf", "2"] if encoder == "h264_amf" and amf_b_frames() else []
+    return ["-c:v", encoder, *_ENCODER_QUALITY_ARGS.get(encoder, []), *extra]
+
+
+@functools.cache
+def amf_b_frames() -> bool:
+    """Whether h264_amf really writes B-frames with `-bf 2` (probed once: a 10-frame encode
+    whose stream must report a B-frame delay). False on any failure: no AMF, an older GPU
+    that refuses B-frames, or one that silently drops them."""
+    with tempfile.TemporaryDirectory(prefix="hookline-bf-") as tmp:
+        out = Path(tmp) / "bf.mp4"
+        try:
+            _run(
+                [
+                    "ffmpeg", "-hide_banner", "-v", "error", "-y",
+                    "-f", "lavfi", "-i", "testsrc2=size=256x256:rate=25",
+                    "-frames:v", "10", "-c:v", "h264_amf", *_ENCODER_QUALITY_ARGS["h264_amf"],
+                    "-bf", "2", str(out),
+                ]
+            )  # fmt: skip
+            res = _run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                 "stream=has_b_frames", "-of", "csv=p=0", str(out)]
+            )  # fmt: skip
+            return int(res.stdout.strip() or 0) > 0
+        except (FFmpegError, ValueError):
+            return False
 
 
 class FFmpegError(Exception):
@@ -240,3 +269,28 @@ def cut_segments(
         script.unlink(missing_ok=True)
     os.replace(tmp, dst)
     return dst
+
+
+def probe_video_kbps(path: Path) -> float | None:
+    """The first video stream's bitrate in kb/s (the container's total minus its audio when
+    the stream has none recorded, e.g. Matroska); None when it cannot be read."""
+    try:
+        res = _run(
+            ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,bit_rate:format=bit_rate",
+             "-of", "json", str(path)]
+        )  # fmt: skip
+        info = json.loads(res.stdout)
+    except (FFmpegError, ValueError):
+        return None
+    streams = info.get("streams") or []
+    video = next((s for s in streams if s.get("codec_type") == "video"), None)
+    if video is None:
+        return None
+    try:
+        if video.get("bit_rate"):
+            return round(int(video["bit_rate"]) / 1000, 1)
+        total = int(info.get("format", {}).get("bit_rate", 0))
+        audio = sum(int(s.get("bit_rate") or 0) for s in streams if s.get("codec_type") == "audio")
+    except ValueError:
+        return None
+    return round((total - audio) / 1000, 1) if total > audio else None

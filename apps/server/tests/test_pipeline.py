@@ -200,7 +200,7 @@ def test_picks_cache_key_mismatch_reselects(fixture_video, fake_llm, settings_tm
     job = s.workspace_dir / job_id_for(str(fixture_video))
     saved = json.loads((job / "picks.json").read_text(encoding="utf-8"))
     assert saved["key"] == {
-        "schema": 6,
+        "schema": 7,
         "clips": 1,
         "select_model": s.select_model,
         "min_clip_s": s.min_clip_s,
@@ -503,13 +503,14 @@ def test_run_job_passes_loud_seconds_to_render(fixture_video, fake_llm, settings
     assert seen == [set(range(20, 25))]
 
 
-def test_picks_schema_is_6_and_schema_5_picks_are_reselected(settings, tmp_path):
+def test_picks_schema_is_7_and_schema_6_picks_are_reselected(settings, tmp_path):
     from hookline.pipeline.run import PACKAGE_SCHEMA, PICKS_SCHEMA, _load_picks, _picks_key
 
-    assert PICKS_SCHEMA == 6 and _picks_key(settings, {})["schema"] == 6
+    # wave G-select: scare markers and the gameplay cause/payoff rules change the picks
+    assert PICKS_SCHEMA == 7 and _picks_key(settings, {})["schema"] == 7
     assert PACKAGE_SCHEMA == 3  # wave E: context, hook/hashtag/search-title checks
     key = _picks_key(settings, {})
-    old = {**key, "schema": 5}
+    old = {**key, "schema": 6}
     ppath = tmp_path / "picks.json"
     ppath.write_text(json.dumps({"key": old, "picks": []}), encoding="utf-8")
     logs: list[str] = []
@@ -567,3 +568,59 @@ def test_failed_packaging_keeps_selection_copy_and_retries_next_run(
     assert side["hook_text"] == payload["clips"][0]["hook_text"] and side["caption_fixes"] == []
     job = s.workspace_dir / job_id_for(str(fixture_video))
     assert not (job / "package.json").exists()
+
+
+# --- wave G-select ------------------------------------------------------------------------------
+
+
+def test_signals_gain_motion_and_transients_and_old_cache_is_recomputed(
+    fixture_video, fake_llm, settings_tmp
+):
+    from hookline.pipeline.signals import SIGNALS_VERSION
+
+    job = _job_dir(settings_tmp, fixture_video)
+    s = settings_tmp.model_copy(update={"clips": 1, "vertical": False, "captions": False})
+    fake_llm.queue(make_payload_for(150, 1, 21))
+    run_job(str(fixture_video), s, fake_llm, FakeTranscriber(duration=150))
+    sig = json.loads((job / "signals.json").read_text(encoding="utf-8"))
+    assert sig["version"] == SIGNALS_VERSION >= 2
+    assert len(sig["motion"]) >= 149 and sig["transients"] == [] and sig["onsets"] == []
+    # signals cached before wave G-select (no version) are recomputed
+    for k in ("version", "motion", "transients", "onsets"):
+        del sig[k]
+    (job / "signals.json").write_text(json.dumps(sig), encoding="utf-8")
+    fake_llm.queue(make_payload_for(150, 1, 21))
+    logs: list[str] = []
+    run_job(str(fixture_video), s, fake_llm, FakeTranscriber(duration=150), logs.append)
+    sig = json.loads((job / "signals.json").read_text(encoding="utf-8"))
+    assert sig["version"] == SIGNALS_VERSION and "motion" in sig
+    assert "[4/6] signals: started" in logs
+
+
+def test_run_job_trims_idle_ends_before_render_and_records_the_source_bitrate(
+    fixture_video, fake_llm, settings_tmp, monkeypatch
+):
+    from hookline.pipeline import run as run_mod
+
+    seen = []
+    real = run_mod.render_clip
+
+    def spy(src, wav, pick, *a, **k):
+        seen.append(pick)
+        return real(src, wav, pick, *a, **k)
+
+    trims = []
+    monkeypatch.setattr(run_mod, "render_clip", spy)
+    monkeypatch.setattr(
+        run_mod,
+        "fit_to_signals",
+        lambda pick, words, signals: (
+            trims.append(pick) or pick.model_copy(update={"end": pick.end - 3})
+        ),
+    )
+    fake_llm.queue(make_payload_for(150, 1, 21))
+    s = settings_tmp.model_copy(update={"clips": 1, "vertical": False, "captions": False})
+    (clip,) = run_job(str(fixture_video), s, fake_llm, FakeTranscriber(duration=150))
+    assert len(trims) == 1 and seen[0].end == pytest.approx(trims[0].end - 3)
+    side = json.loads(clip.with_suffix(".json").read_text(encoding="utf-8"))
+    assert side["source_video_kbps"] > 0

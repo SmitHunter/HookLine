@@ -1960,3 +1960,35 @@ def test_packaging_rules_have_no_stray_line_break():
 
     first = PACKAGING_RULES.splitlines()[0]
     assert first.endswith("mouth."), first
+
+
+# --- wave G-select: gameplay cause and payoff ---------------------------------------------------
+
+
+def test_system_prompt_covers_wave_g_select():
+    for needle in (
+        "⚡scare",
+        "2–4 seconds of the cause",
+        "within 3 seconds after the payoff",
+        "death, loading or menu screen",
+        "new attempt",
+    ):
+        assert needle in SYSTEM_PROMPT, needle
+
+
+def test_wave_g_select_prompt_uses_no_phrases_from_the_test_stream():
+    low = SYSTEM_PROMPT.lower()
+    for needle in (
+        "poppy",
+        "huggy",
+        "wuggy",
+        "innovation is key",
+        "thank you science",
+        "we got him",
+        "chinese food",
+        "the fuck was that",
+        "i don't want a hug",
+        "run button",
+        "just go",
+    ):
+        assert needle not in low, needle

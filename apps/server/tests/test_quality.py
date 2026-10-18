@@ -482,3 +482,50 @@ def test_q7_counts_guard_shift_steps_and_reads_the_guarded_zoom_steps():
     held = _check_pacing({**side, "layout": [{**lay, "shift_steps": []}]}, 13.0)
     assert not held.ok and held.value == pytest.approx(8.5)  # a guard hold, honestly reported
     assert _check_pacing(side, 13.0).ok  # the shift at 9.0 is a framing change
+
+
+# --- wave G-select: Q8 bitrate bar follows the source ------------------------------------------
+
+
+def _info(v_kbps: float, size=(1080, 1920)) -> dict:
+    return {
+        "streams": [
+            {"codec_type": "video", "codec_name": "h264", "pix_fmt": "yuv420p",
+             "width": size[0], "height": size[1], "bit_rate": str(int(v_kbps * 1000))},
+            {"codec_type": "audio", "codec_name": "aac", "bit_rate": "189000"},
+        ]
+    }  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    ("source_kbps", "bar"),
+    [(None, 5000), (1059, 2647.5), (600, 2000), (2600, 5000), (0, 5000)],
+)
+def test_q8_bitrate_bar_scales_with_the_source(source_kbps, bar):
+    from hookline.quality import _check_encode, min_video_kbps
+
+    assert min_video_kbps(source_kbps) == pytest.approx(bar)
+    assert _check_encode(_info(bar + 1), source_kbps).ok
+    low = _check_encode(_info(bar - 1), source_kbps)
+    assert not low.ok and "video" in low.detail
+    assert f"{bar:.0f}" in low.threshold
+
+
+def test_q8_format_checks_are_unchanged_with_a_soft_source():
+    from hookline.quality import _check_encode
+
+    res = _check_encode(_info(4000, size=(720, 1280)), 1000)
+    assert not res.ok and "720x1280" in res.detail
+
+
+def test_audit_reads_the_source_bitrate_from_the_sidecar(good_mp4, tmp_path, monkeypatch):
+    from hookline import quality as q
+
+    seen = []
+    real = q._check_encode
+    monkeypatch.setattr(
+        q, "_check_encode", lambda info, src=None: seen.append(src) or real(info, src)
+    )
+    audit_clip(good_mp4, _sidecar(source_video_kbps=1059.1), _ass(tmp_path))
+    audit_clip(good_mp4, _sidecar(), _ass(tmp_path))
+    assert seen == [1059.1, None]

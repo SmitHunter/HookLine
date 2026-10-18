@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import wave
 from collections.abc import Callable
 from pathlib import Path
 
@@ -8,21 +9,30 @@ from hookline.assets import AssetError, ensure_yunet
 from hookline.config import Settings
 from hookline.fsutil import atomic_write_text, slugify
 from hookline.llm import LLMBackend
-from hookline.media.audio import rms_per_second
-from hookline.media.ffmpeg import FFmpegError, extract_audio, pick_encoder
+from hookline.media.audio import MOMENTARY_HOP, momentary_db, rms_per_second
+from hookline.media.ffmpeg import FFmpegError, extract_audio, pick_encoder, probe_video_kbps
+from hookline.media.motion import frame_motion
 from hookline.models import ClipPick, Transcript, Word
+from hookline.pipeline.boundaries import fit_to_signals
 from hookline.pipeline.chat import chat_keywords, chat_rate, try_fetch_chat
 from hookline.pipeline.ingest import find_source, ingest, job_id_for
 from hookline.pipeline.package import apply_caption_fixes, package_clips
 from hookline.pipeline.render import render_clip
 from hookline.pipeline.select import NoClipsSelectedError, select_clips
-from hookline.pipeline.signals import Signals, heat_markers, heat_seconds, loud_seconds
+from hookline.pipeline.signals import (
+    SIGNALS_VERSION,
+    Signals,
+    audio_onsets,
+    heat_markers,
+    heat_seconds,
+    loud_seconds,
+)
 from hookline.transcribe import Transcriber
 from hookline.transcribe.base import words_to_transcript
 from hookline.vision.faces import FaceDetector
 
 STAGES = 6
-PICKS_SCHEMA = 6  # bump when picks change shape or meaning, so old picks.json re-select
+PICKS_SCHEMA = 7  # bump when picks change shape or meaning, so old picks.json re-select
 PACKAGE_SCHEMA = 3  # bump when the packaging pass changes, so old package.json re-runs
 
 
@@ -154,14 +164,17 @@ def _package(
 
 
 def _signals(
-    job_dir: Path, wav: Path, transcript: Transcript, log: Callable[[str], None]
+    job_dir: Path, src: Path, wav: Path, transcript: Transcript, log: Callable[[str], None]
 ) -> Signals:
     spath = job_dir / "signals.json"
     cpath = job_dir / "chat.json"
     if spath.exists():
         try:
             cached = Signals.model_validate_json(spath.read_text(encoding="utf-8"))
-            if (cached.chat is not None and cached.chat_kinds is not None) or not cpath.exists():
+            chat_ok = (cached.chat is not None and cached.chat_kinds is not None) or (
+                not cpath.exists()
+            )
+            if chat_ok and cached.version >= SIGNALS_VERSION:
                 log("[4/6] signals: skipped (cached)")
                 return cached
         except ValueError:
@@ -178,7 +191,28 @@ def _signals(
             kinds = {s: dict(c) for s, c in chat_keywords(raw, duration).items()}
         except (ValueError, OSError) as e:
             log(f"warning: chat.json unreadable ({e}); continuing without chat signals")
-    signals = Signals(duration=duration, loudness=rms_per_second(wav), chat=chat, chat_kinds=kinds)
+    speech = [(w.start, w.end) for w in transcript.words()]
+    onsets: list[int] | None = None
+    transients: list[int] | None = None
+    try:
+        onsets, transients = audio_onsets(momentary_db(wav), MOMENTARY_HOP, speech)
+    except (FFmpegError, wave.Error, EOFError) as e:
+        log(f"warning: audio onset analysis failed ({e}); continuing without scare signals")
+    try:
+        motion = frame_motion(src)
+    except FFmpegError as e:
+        log(f"warning: motion analysis failed ({e}); continuing without visual signals")
+        motion = None
+    signals = Signals(
+        duration=duration,
+        loudness=rms_per_second(wav),
+        chat=chat,
+        chat_kinds=kinds,
+        version=SIGNALS_VERSION,
+        motion=motion,
+        onsets=onsets,
+        transients=transients,
+    )
     atomic_write_text(spath, signals.model_dump_json())
     log("[4/6] signals: done")
     return signals
@@ -257,7 +291,7 @@ def run_job(
         )
         log("[3/6] transcribe: done")
 
-    signals = _signals(job_dir, wav, transcript, log)
+    signals = _signals(job_dir, src, wav, transcript, log)
     if not settings.chat:
         signals = signals.model_copy(update={"chat": None, "chat_kinds": None})
 
@@ -309,9 +343,18 @@ def run_job(
     protect = transcript.timing != "segment"
     encoder = pick_encoder()
     loud = _loud_seconds(signals)
+    source_kbps = probe_video_kbps(src)  # the audit's Q8 bitrate bar follows the source
     clips: list[Path] = []
     for i, pick in enumerate(picks, 1):
         dst = out_dir / f"{i:02d}-{slugify(pick.title)}.mp4"
+        # the cause of an opening reaction pulled in; no death-screen / menu tails
+        trimmed = fit_to_signals(pick, words, signals)
+        if trimmed != pick:
+            log(
+                f"clip {i:02d}: fitted to signals {pick.start:.2f}-{pick.end:.2f} -> "
+                f"{trimmed.start:.2f}-{trimmed.end:.2f}"
+            )
+            pick = trimmed
         try:
             extras = render_clip(
                 src,
@@ -333,7 +376,12 @@ def run_job(
             log(f"warning: clip {i:02d} failed: {reason}")
             continue
         post_caption = pick.post_caption or pick.hook_text
-        sidecar = {**pick.model_dump(mode="json"), "post_caption": post_caption, **extras}
+        sidecar = {
+            **pick.model_dump(mode="json"),
+            "post_caption": post_caption,
+            "source_video_kbps": source_kbps,
+            **extras,
+        }
         atomic_write_text(
             dst.with_suffix(".json"), json.dumps(sidecar, indent=2, ensure_ascii=False)
         )

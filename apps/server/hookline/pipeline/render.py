@@ -276,11 +276,7 @@ def render_clip(
     inter = cut_segments(
         src, keep, work_dir / f"{name}.mkv", "libx264", quality=INTERMEDIATE_QUALITY, fps=fps
     )
-    audio = plan_loudness(inter)
     duration = probe_duration(inter)
-    audio_args: list[str] = []
-    if audio is not None:  # the clip has audio
-        audio_args = ["-af", f"{audio.af},{audio_fades(duration)}"]
     letterbox = detect_crop(inter)
     size = probe_size(inter)
     crop, bands = letterbox, None
@@ -291,6 +287,11 @@ def render_clip(
     # audio-refined end that may run far past it
     judge = [protected[i].end for i in heard]
     out_words = caption_words(remap_words(spoken, keep, fps, judge_ends=judge), seam)
+    # loudness is normalised to the speech: the spoken words' spans on the clip's timeline
+    audio = plan_loudness(inter, speech=[(w.start, w.end) for w in out_words])
+    audio_args: list[str] = []
+    if audio is not None:  # the clip has audio
+        audio_args = ["-af", f"{audio.af},{audio_fades(duration)}"]
     cuts = cut_times_for(keep)
     layouts: list[SceneLayout] = []
     steps: list[tuple[float, float]] = []

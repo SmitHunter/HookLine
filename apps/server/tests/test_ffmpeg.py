@@ -40,12 +40,13 @@ def test_cut_segments_raises_ffmpeg_error_on_bad_input(tmp_path):
         cut_segments(tmp_path / "missing.mp4", [(0, 1)], tmp_path / "x.mkv", "libx264")
 
 
-def test_encoder_args_table():
+def test_encoder_args_table(monkeypatch):
+    monkeypatch.setattr(ffmpeg_mod, "amf_b_frames", lambda: False)
     assert encoder_args("libx264") == [
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "17", "-maxrate", "10M", "-bufsize", "20M",
     ]  # fmt: skip
     assert encoder_args("h264_amf") == [
-        "-c:v", "h264_amf", "-rc", "cqp", "-qp_i", "18", "-qp_p", "20", "-qp_b", "22",
+        "-c:v", "h264_amf", "-rc", "cqp", "-qp_i", "16", "-qp_p", "18", "-qp_b", "20",
     ]  # fmt: skip
     assert encoder_args("h264_nvenc") == [
         "-c:v", "h264_nvenc", "-rc", "vbr", "-cq", "18", "-b:v", "0",
@@ -62,6 +63,7 @@ def test_cut_segments_passes_encoder_args(monkeypatch, tmp_path):
 
     monkeypatch.setattr(ffmpeg_mod, "_run", fake_run)
     monkeypatch.setattr(ffmpeg_mod, "has_audio", lambda p: True)
+    monkeypatch.setattr(ffmpeg_mod, "amf_b_frames", lambda: True)
     cut_segments(tmp_path / "in.mp4", [(0.0, 1.0)], tmp_path / "o.mkv", "h264_amf", fps=25)
     cmd = seen[0]
     i = cmd.index("-c:v")
@@ -180,3 +182,51 @@ def test_cut_segments_long_graph_goes_through_script(monkeypatch, tmp_path):
     ((cmd, graph),) = seen
     assert "-filter_complex" not in cmd and "concat=n=200" in graph
     assert not list(tmp_path.glob("*.graph.txt"))  # script removed after the cut
+
+
+# --- wave G-select: AMF QP 16/18/20 with B-frames when the encoder takes them ------------------
+
+
+def test_amf_args_add_b_frames_only_when_supported(monkeypatch):
+    monkeypatch.setattr(ffmpeg_mod, "amf_b_frames", lambda: True)
+    assert encoder_args("h264_amf") == [
+        "-c:v", "h264_amf", "-rc", "cqp", "-qp_i", "16", "-qp_p", "18", "-qp_b", "20", "-bf", "2",
+    ]  # fmt: skip
+    monkeypatch.setattr(ffmpeg_mod, "amf_b_frames", lambda: False)
+    assert encoder_args("h264_amf") == [
+        "-c:v", "h264_amf", "-rc", "cqp", "-qp_i", "16", "-qp_p", "18", "-qp_b", "20",
+    ]  # fmt: skip
+
+
+def test_amf_b_frame_probe_falls_back_cleanly(monkeypatch):
+    def boom(cmd):
+        raise ffmpeg_mod.FFmpegError("h264_amf exited with code 1")
+
+    ffmpeg_mod.amf_b_frames.cache_clear()
+    monkeypatch.setattr(ffmpeg_mod, "_run", boom)
+    try:
+        assert ffmpeg_mod.amf_b_frames() is False
+    finally:
+        ffmpeg_mod.amf_b_frames.cache_clear()
+
+
+def test_amf_b_frame_probe_reads_the_encoded_stream(monkeypatch):
+    class Res:
+        def __init__(self, out=""):
+            self.stdout = out
+
+    def fake(cmd):
+        return Res("2\n") if cmd[0] == "ffprobe" else Res()
+
+    ffmpeg_mod.amf_b_frames.cache_clear()
+    monkeypatch.setattr(ffmpeg_mod, "_run", fake)
+    try:
+        assert ffmpeg_mod.amf_b_frames() is True
+    finally:
+        ffmpeg_mod.amf_b_frames.cache_clear()
+
+
+def test_probe_video_kbps(fixture_video, tmp_path):
+    kbps = ffmpeg_mod.probe_video_kbps(fixture_video)
+    assert kbps is not None and kbps > 0
+    assert ffmpeg_mod.probe_video_kbps(tmp_path / "missing.mp4") is None

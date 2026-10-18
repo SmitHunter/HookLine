@@ -123,9 +123,67 @@ LIMITER = "alimiter=limit={lim:.4f}:attack=1:release=50:level=false:latency=true
 PREGAIN_PASSES = 3  # limiting costs loudness, so the pre-gain is re-aimed by the measured miss
 
 
-def prefilter(gain_db: float) -> str:
-    """COMPRESSOR, then `gain_db` of gain, then a lookahead limiter at LIMIT_DB."""
-    return f"{COMPRESSOR},volume={gain_db:.2f}dB," + LIMITER.format(lim=10 ** (LIMIT_DB / 20))
+# Wave G-select: the clip's loudness range is held to MAX_LRA by a leveler (a slow
+# compressor after the gain, which has put the speech at TARGET_I, so its threshold sits
+# relative to the speech level) before the limiter. LEVELERS is a ladder from gentle to firm,
+# climbed only while the range is over MAX_LRA or the speech sits more than SPEECH_SWAY_DB
+# under the clip: a podcast whose range is already natural gets none (no pumping); game
+# stingers over a quiet voice get squashed. Gain corrections after a rung go AFTER the
+# leveler (its makeup), so they neither move its threshold nor get compressed by it.
+MAX_LRA = 8.0
+# (threshold vs TARGET_I in dB, ratio), gentle to firm
+LEVELERS = (
+    (4.0, 2.0),
+    (0.0, 3.0),
+    (-4.0, 4.0),
+    (-8.0, 6.0),
+    (-12.0, 8.0),
+)
+LEVELER = "acompressor=threshold={thr:g}dB:ratio={ratio:g}:attack=20:release=300:makeup=1"
+# The final loudnorm aims the whole clip so the speech lands on TARGET_I, but never more than
+# this far from TARGET_I (Q1: -14 +/- 1 LUFS for the whole clip).
+SPEECH_SWAY_DB = 0.5
+MIN_SPEECH_S = 3.0  # less speech than this is not gated (too little to measure)
+_SPEECH_JOIN_S = 0.3  # word spans closer than this are measured as one stretch
+# The limiter runs at 192 kHz in the final encode too. loudnorm's measuring (dynamic) pass
+# forces 192 kHz on everything before it, its linear pass does not: the limiter measured at
+# 192 kHz then ran at 48 kHz in the encode, letting through intersample peaks the plan never
+# saw (a limited white-noise stinger: +1.4 LU and +5 dBTP over the measurement).
+LIMIT_RATE = 192000
+
+
+def prefilter(gain_db: float, level: int = 0, makeup_db: float = 0.0) -> str:
+    """COMPRESSOR, then `gain_db` of gain, then leveler rung `level` (0: none; see LEVELERS)
+    followed by `makeup_db` of gain, then a lookahead limiter at LIMIT_DB, at LIMIT_RATE (so
+    it limits intersample peaks)."""
+    leveler = ""
+    if level:
+        off, ratio = LEVELERS[level - 1]
+        thr = TARGET_I + off
+        leveler = LEVELER.format(thr=thr, ratio=ratio) + f",volume={makeup_db:.2f}dB,"
+    lim = LIMITER.format(lim=10 ** (LIMIT_DB / 20))
+    return f"{COMPRESSOR},volume={gain_db:.2f}dB,{leveler}aresample={LIMIT_RATE},{lim}"
+
+
+def _rung_makeup(level: int) -> float:
+    """Roughly what rung `level` takes off speech sitting at its threshold offset's level."""
+    off, ratio = LEVELERS[level - 1]
+    return -off * (1 - 1 / ratio) if off < 0 else 0.0
+
+
+def speech_filter(spans: list[tuple[float, float]] | None) -> str | None:
+    """An `aselect` keeping only the speech `spans` (seconds on the file's timeline; spans
+    closer than 0.3 s merged), for a speech-gated measurement. None under MIN_SPEECH_S."""
+    merged: list[list[float]] = []
+    for a, b in sorted(spans or []):
+        if merged and a - merged[-1][1] < _SPEECH_JOIN_S:
+            merged[-1][1] = max(merged[-1][1], b)
+        elif b > a:
+            merged.append([a, b])
+    if sum(b - a for a, b in merged) < MIN_SPEECH_S:
+        return None
+    terms = "+".join(f"between(t\\,{a:.3f}\\,{b:.3f})" for a, b in merged)
+    return f"aselect='{terms}',asetpts=N/SR/TB"
 
 
 @dataclass(frozen=True)
@@ -134,27 +192,63 @@ class AudioPlan:
     mode: str  # loudnorm_mode: "skip", "linear" or "dynamic"
 
 
-def plan_loudness(path: Path) -> AudioPlan | None:
-    """Measure `path`'s audio and plan its normalisation to `_target_i` (None without audio):
-    the compressed loudness sets a pre-gain to the target; the limited result is re-measured
-    and the pre-gain corrected by the miss (up to PREGAIN_PASSES measurements) until
-    loudnorm's remaining gain fits under the true-peak ceiling, so it can go linear."""
+def _gated(pre: str | None, gate: str | None) -> str | None:
+    return ",".join(f for f in (pre, gate) if f) or None
+
+
+def _aim(target: float, m: Loudness, s: Loudness | None) -> float:
+    """The whole clip's loudnorm target: `target` moved so the speech (`s`, measured through
+    the same chain as `m`) lands on it, by at most SPEECH_SWAY_DB."""
+    if s is None or s.i < SILENCE_FLOOR_LUFS:
+        return target
+    return min(max(target - (s.i - m.i), target - SPEECH_SWAY_DB), target + SPEECH_SWAY_DB)
+
+
+def plan_loudness(path: Path, speech: list[tuple[float, float]] | None = None) -> AudioPlan | None:
+    """Measure `path`'s audio and plan its normalisation (None without audio).
+
+    The pre-gain puts the speech (the `speech` spans, seconds on `path`'s timeline, measured
+    gated; the whole clip without them) at the target `_target_i`; the chain (gain, leveler,
+    limiter) is re-measured and corrected by the miss until loudnorm's remaining gain fits
+    under the true-peak ceiling, so it can go linear. While the clip's loudness range is over
+    MAX_LRA, or its speech sits more than SPEECH_SWAY_DB under the whole clip (voice under
+    game), the leveler climbs one rung of LEVELERS. loudnorm then aims the whole clip so the
+    speech lands on the target, within SPEECH_SWAY_DB of it (`_aim`). Each measurement costs
+    one decode of the clip's audio (at most PREGAIN_PASSES + len(LEVELERS), twice when gated)."""
     c = measure_loudness(path, COMPRESSOR)
     if c is None:
         return None
     if loudnorm_mode(c) == "skip":
         return AudioPlan(af=loudnorm_filter(c), mode="skip")
     target = _target_i(c)
-    gain = target - c.i
-    for _ in range(PREGAIN_PASSES):
-        pre = prefilter(gain)
+    gate = speech_filter(speech)
+    sc = measure_loudness(path, _gated(COMPRESSOR, gate)) if gate else None
+    gain = target - (sc.i if sc and sc.i >= SILENCE_FLOOR_LUFS else c.i)
+    gain = min(gain, target - c.i + MAX_GAIN_DB / 2)  # a near-silent voice: no huge boost
+    level, makeup, passes = 0, 0.0, 0
+    while True:
+        pre = prefilter(gain, level, makeup)
         m = measure_loudness(path, pre)
-        miss = target - m.i
-        log.info("audio: pre-gain %.2f dB -> I=%.2f TP=%.2f", gain, m.i, m.tp)
-        if m.tp + miss <= FINAL_TP:
+        s = measure_loudness(path, _gated(pre, gate)) if gate else None
+        aim = _aim(target, m, s)
+        log.info(
+            "audio: pre-gain %.2f dB, leveler %d (+%.2f dB) -> I=%.2f TP=%.2f LRA=%.1f%s",
+            gain, level, makeup, m.i, m.tp, m.lra, f" speech I={s.i:.2f}" if s else "",
+        )  # fmt: skip
+        buried = s is not None and m.i - s.i > SPEECH_SWAY_DB
+        if (m.lra > MAX_LRA or buried) and level < len(LEVELERS):
+            level += 1
+            makeup = _rung_makeup(level)
+            continue
+        passes += 1
+        miss = aim - m.i
+        if m.tp + miss <= FINAL_TP or passes >= PREGAIN_PASSES:
             break
-        gain += miss
-    return AudioPlan(af=loudnorm_filter(m, pre, target), mode=loudnorm_mode(m, target))
+        if level:
+            makeup += miss
+        else:
+            gain += miss
+    return AudioPlan(af=loudnorm_filter(m, pre, aim), mode=loudnorm_mode(m, aim))
 
 
 TP_TRIM_ABOVE = -1.2

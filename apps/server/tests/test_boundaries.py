@@ -1,7 +1,14 @@
 import pytest
 
 from hookline.models import ClipPick, RubricScores, Word
-from hookline.pipeline.boundaries import FILLER_OPENERS, refine_boundaries
+from hookline.pipeline.boundaries import (
+    FILLER_OPENERS,
+    fit_to_signals,
+    include_cause,
+    refine_boundaries,
+    trim_idle,
+)
+from hookline.pipeline.signals import SIGNALS_VERSION, Signals
 
 
 def pick(start, end, **kw):
@@ -178,3 +185,100 @@ def test_loud_opener_is_kept_and_quiet_one_trimmed():
     loud = refine_boundaries(pick(10.0, 40), ws, [], loud_seconds={10})
     assert loud.start <= 10.0
     assert refine_boundaries(pick(10.0, 40), ws, [], loud_seconds=None).start > 10.2
+
+
+# --- wave G-select: idle (no speech, low motion) stretches at a clip's ends -------------------
+
+
+def _signals(motion, transients=()):
+    return Signals(
+        duration=len(motion),
+        loudness=[-40.0] * len(motion),
+        version=SIGNALS_VERSION,
+        motion=motion,
+        onsets=list(transients),
+        transients=list(transients),
+    )
+
+
+def test_idle_tail_is_trimmed_to_a_second_after_the_last_word(caplog):
+    ws = words_from("we finally got him out", start=10, until=13.0)
+    sig = _signals([20.0] * 13 + [1.0] * 30)  # gameplay, then a still death screen
+    with caplog.at_level("INFO"):
+        p = trim_idle(pick(10, 25), ws, sig)
+    assert p.start == 10 and p.end == pytest.approx(14.0)
+    assert any("idle" in r.getMessage() and "end" in r.getMessage() for r in caplog.records)
+
+
+def test_tail_with_motion_a_scare_or_a_short_gap_is_kept():
+    ws = words_from("we finally got him out", start=10, until=13.0)
+    busy = [20.0] * 40
+    assert trim_idle(pick(10, 25), ws, _signals(busy)).end == 25  # the action plays on
+    still = [1.0] * 40
+    assert trim_idle(pick(10, 25), ws, _signals(still, [20])).end == 25  # a stinger at 20 s
+    assert trim_idle(pick(10, 15.5), ws, _signals(still)).end == 15.5  # 2.5 s: not > 3 s
+
+
+def test_idle_lead_is_trimmed_to_just_before_the_first_word(caplog):
+    ws = words_from("okay here it comes now", start=16, until=19.0)
+    with caplog.at_level("INFO"):
+        p = trim_idle(pick(10, 19.5), ws, _signals([1.0] * 30))
+    assert p.start == pytest.approx(15.7) and p.end == 19.5
+    assert any("idle" in r.getMessage() and "start" in r.getMessage() for r in caplog.records)
+
+
+def test_trim_idle_without_motion_or_words_is_a_no_op():
+    ws = words_from("we finally got him out", start=10, until=13.0)
+    old = Signals(duration=40, loudness=[-40.0] * 40)
+    assert trim_idle(pick(10, 25), ws, old) == pick(10, 25)
+    assert trim_idle(pick(10, 25), [], _signals([1.0] * 40)) == pick(10, 25)
+
+
+def test_words_in_dropped_ranges_do_not_count_as_speech():
+    ws = words_from("we got him", start=10, until=11.5) + words_from("aside", start=17)
+    p = trim_idle(pick(10, 25, drops=[(16.5, 18.0)]), ws, _signals([1.0] * 40))
+    assert p.end == pytest.approx(12.5)
+
+
+def test_a_scare_just_before_the_first_word_pulls_in_the_reaction_to_it(caplog):
+    # "Oh." 4 s before the clip's "What was that?", a stinger at 13 s, another at 15.5 s
+    ws = [
+        *words_from("we head down", start=5, until=6.5),
+        *words_from("Oh.", start=13.9),
+        *words_from("Hey.", start=16.1),
+        *words_from("what was that", start=18.0, until=19.5),
+    ]
+    sig = _signals([20.0] * 40, transients=[13, 15])
+    with caplog.at_level("INFO"):
+        p = include_cause(
+            pick(18.0, 30, first_words="what was that", declared_first_words="what was that"),
+            ws,
+            sig,
+        )
+    assert p.start == pytest.approx(13.9) and p.end == 30
+    # Q6 checks the opening the viewer now hears
+    assert p.first_words == p.declared_first_words == "Oh. Hey. what was that"
+    assert any("scare" in r.getMessage() for r in caplog.records)
+
+
+def test_no_scare_or_no_reaction_words_keeps_the_start():
+    ws = [*words_from("hey", start=16.1), *words_from("what was that", start=18.0)]
+    assert include_cause(pick(18.0, 30), ws, _signals([20.0] * 40)).start == 18.0
+    far = _signals([20.0] * 40, transients=[11])  # 7 s before the first word: not its cause
+    assert include_cause(pick(18.0, 30), ws, far).start == 18.0
+    quiet = [*words_from("what was that", start=18.0)]  # the scare, but nothing said after it
+    assert include_cause(pick(18.0, 30), quiet, _signals([20.0] * 40, [16])).start == 18.0
+
+
+def test_cause_lead_in_is_capped():
+    ws = [*words_from("one two three four five six", start=14.2, step=0.6)]
+    ws += words_from("what was that", start=18.0)
+    p = include_cause(pick(18.0, 30), ws, _signals([20.0] * 40, transients=[14]))
+    assert p.start == pytest.approx(ws[2].start)  # at most 4 earlier words
+
+
+def test_fit_to_signals_pulls_in_the_cause_then_trims_the_idle_tail():
+    ws = [*words_from("Oh.", start=15.0), *words_from("what was that", start=17.0, until=18.5)]
+    motion = [20.0] * 18 + [1.0] * 21
+    p = fit_to_signals(pick(17.0, 30), ws, _signals(motion, transients=[14]))
+    assert p.start == pytest.approx(15.0) and p.end == pytest.approx(19.5)
