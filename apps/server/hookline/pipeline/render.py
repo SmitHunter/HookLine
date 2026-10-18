@@ -2,6 +2,7 @@
 
 import hashlib
 import logging
+import math
 import os
 import re
 import subprocess
@@ -31,6 +32,7 @@ from hookline.media.audio import (
     seam_jump_db,
 )
 from hookline.media.ffmpeg import (
+    SPLICE_FADE_S,
     _run,
     cut_segments,
     encoder_args,
@@ -42,6 +44,7 @@ from hookline.media.ffmpeg import (
 )
 from hookline.media.loudness import ensure_true_peak, plan_loudness
 from hookline.media.reframe import (
+    LIFT_FPS,
     box_hits_bands,
     box_to_crop,
     combine_crop,
@@ -50,6 +53,7 @@ from hookline.media.reframe import (
     face_offset,
     face_track_px,
     guard_zoom,
+    lift_keyframes,
     plan_zoom,
     reframe_graph,
     rendered_zoom_steps,
@@ -66,6 +70,7 @@ from hookline.pipeline.layout import (
     SCARE_PRE_S,
     SceneLayout,
     plan_cam_beats,
+    plan_cam_covers,
     plan_layouts,
     plan_profile_layouts,
 )
@@ -129,6 +134,12 @@ STARTLE_DB = 10.0
 STARTLE_RISE_S = 0.15
 STARTLE_BEFORE_S = 0.5
 STARTLE_NEAR_S = 0.3
+# A splice on loud audio (the short-term level within LOUD_SPLICE_WIN_S either side of the
+# join above LOUD_SPLICE_DB dBFS) fades over LOUD_SPLICE_FADE_S each side instead of the 8 ms
+# (`ffmpeg.SPLICE_FADE_S`): a loud game bed is not chopped
+LOUD_SPLICE_DB = -25.0
+LOUD_SPLICE_WIN_S = 0.05
+LOUD_SPLICE_FADE_S = 0.018
 
 log = logging.getLogger(__name__)
 
@@ -407,6 +418,65 @@ def beat_avoid(
     return sorted(out)
 
 
+def splice_fades(keep: list[tuple[float, float]], env: Envelope) -> list[float]:
+    """Per join of `keep` (source ranges): its splice fade -- LOUD_SPLICE_FADE_S when the
+    envelope's short-term level within LOUD_SPLICE_WIN_S before the cut or after it tops
+    LOUD_SPLICE_DB, else SPLICE_FADE_S."""
+    out = []
+    for (_, a), (b, _) in pairwise(keep):
+        pre = env.db[env.index(a - LOUD_SPLICE_WIN_S) : env.index(a)]
+        post = env.db[env.index(b) : env.index(b + LOUD_SPLICE_WIN_S)]
+        loud = any(len(x) and float(x.max()) > LOUD_SPLICE_DB for x in (pre, post))
+        out.append(LOUD_SPLICE_FADE_S if loud else SPLICE_FADE_S)
+    return out
+
+
+def game_lift(
+    path: Path,
+    layouts: list[SceneLayout],
+    crop: Crop | None,
+    cuts: list[float],
+) -> list[SceneLayout]:
+    """`layouts` with each template STACKED scene's gameplay lift (`game_lift`,
+    `reframe.lift_keyframes`) from the mean luma of its gameplay panel (`game_box`, the
+    blurred `patches` left out) in `path` at LIFT_FPS; unchanged when it cannot be read."""
+    if not any(lay.game_box is not None for lay in layouts):
+        return layouts
+    w, h = 128, 72
+    pre = f"crop={crop[0]}:{crop[1]}:{crop[2]}:{crop[3]}," if crop else ""
+    res = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-v", "error", "-i", str(path), "-an",
+         "-vf", f"{pre}fps={LIFT_FPS},scale={w}:{h}:flags=area,format=gray",
+         "-f", "rawvideo", "-"],
+        check=False, capture_output=True,
+    )  # fmt: skip
+    if res.returncode != 0 or len(res.stdout) < w * h:
+        log.warning("gameplay luma unreadable; no lift")
+        return layouts
+    frames = np.frombuffer(res.stdout[: len(res.stdout) // (w * h) * w * h], np.uint8)
+    frames = frames.reshape(-1, h, w)
+    out = []
+    for lay in layouts:
+        if lay.game_box is None:
+            out.append(lay)
+            continue
+        mask = np.zeros((h, w), bool)
+        x, y, bw, bh = lay.game_box
+        mask[int(y * h) : math.ceil((y + bh) * h), int(x * w) : math.ceil((x + bw) * w)] = True
+        for px, py, pw, ph in lay.patches:
+            mask[int(py * h) : math.ceil((py + ph) * h), int(px * w) : math.ceil((px + pw) * w)] = (
+                False
+            )
+        ks = [k for k in range(len(frames)) if lay.start <= k / LIFT_FPS < lay.end]
+        if not ks or not mask.any():
+            out.append(lay)
+            continue
+        luma = [float(frames[k][mask].mean()) for k in ks]
+        pts = lift_keyframes([k / LIFT_FPS for k in ks], luma, cuts)
+        out.append(lay.model_copy(update={"game_lift": pts}) if pts else lay)
+    return out
+
+
 def mix_format(path: Path) -> str:
     """aformat pinning a room-tone mix input to float planar at MIX_RATE in `path`'s audio
     channel layout: mono stays mono, stereo and wider sources (5.1, 7.1) mix in stereo."""
@@ -604,6 +674,7 @@ def render_clip(
     profile: LayoutProfile | None = None,
     scares: list[float] | None = None,
     spikes: list[tuple[float, float]] | None = None,
+    screens: list[tuple[float, float]] | None = None,
 ) -> dict:
     """Write the finished clip to `dst`; returns sidecar extras (segments, layout, keep_ranges,
     removed_s, cut_times, zoom_steps, zoom_levels, overlay_bands, seam, ass, ass_sha1,
@@ -614,8 +685,8 @@ def render_clip(
     `zoom_anchor`; see `reframe.plan_zoom`).
 
     Word ends and post-pause onsets are refined against the audio envelope first
-    (`pipeline.timing`); the clip ends a beat after its last word (`_with_tail`, up to 0.35 s,
-    so a clip may run that much over max_clip_s) and its audio fades in over 0.02 s and out
+    (`pipeline.timing`); the clip ends a beat after its last word (`_with_tail`, 0.4 s when the silence
+    allows, up to 0.45 s, so a clip may run that much over max_clip_s) and its audio fades in over 0.02 s and out
     over 0.2 s (sparing the last word).
     `overlay_bands` is the [top, bottom] px of burned-in overlay cropped away (vertical only),
     or None. `seam` is the output time where a cold open ends (None without one); it gets a
@@ -641,7 +712,12 @@ def render_clip(
     source spans: `beat_avoid`); the sidecar's `layout_profile` records its cam. The
     sidecar records the same `scares` and `spikes` (`run.beat_spikes`) on the output timeline
     (`scare_times`, `beat_spikes`: the audit's Q-beat) and the source's own rise at the seam
-    (`seam_source_db`: Q-seam)."""
+    (`seam_source_db`: Q-seam).
+
+    `screens` (source spans: `signals.screen_runs`, the static / death screens a reaction is
+    talked over) are covered by the full cam in the template scenes (`cam_covers`); a near-
+    black gameplay panel is lifted (`game_lift`); splices on loud audio fade longer
+    (`splice_fades`)."""
     work_dir.mkdir(parents=True, exist_ok=True)
     dst.parent.mkdir(parents=True, exist_ok=True)
     name = dst.stem.split("-", 1)[0]
@@ -717,6 +793,7 @@ def render_clip(
         quality=INTERMEDIATE_QUALITY,
         fps=fps,
         crossfade_at=join,  # no pop / step at the seam
+        splice_fades=splice_fades(keep, env),  # longer on loud audio: no chop
     )
     duration = probe_duration(inter)
     size = probe_size(inter)
@@ -765,11 +842,14 @@ def render_clip(
         # the edge guard's holds/shifts, once: the graph and the sidecar get the same steps
         steps, layouts = guard_zoom(layouts, in_w, in_h, steps, cuts)
         if any(lay.cam_rect is not None for lay in layouts):
+            # the talked-over static / death screens: the streamer's reaction, full cam
+            layouts = plan_cam_covers(_to_output_spans(screens or [], keep), layouts, duration)
             # full-cam reaction beats, never under the EARLIER tag nor over a scare / spike
             peaks = reaction_peaks(spoken, env, keep, scares)
             startles = startle_times(spoken, env, keep, [t for t, _ in peaks], scares, spikes)
             avoid = [(a, b) for a, b in beat_avoid(seam, scares or [], spikes or [], keep)]
             layouts = plan_cam_beats(peaks, layouts, cuts, duration, avoid, startles)
+            layouts = game_lift(inter, layouts, crop, cuts)  # near-black gameplay lifted
         layouts = [
             lay.model_copy(
                 update={

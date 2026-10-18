@@ -597,7 +597,7 @@ def _check_opening(
 
 def _check_pacing(side: dict, duration: float) -> CheckResult:
     """Q7: longest stretch without a cut, zoom step (as rendered, edge-guard holds applied),
-    edge-guard crop shift, reframe snap, scene (layout) change or full-cam beat edge."""
+    edge-guard crop shift, reframe snap, scene (layout) change or full-cam beat / cover edge."""
     thr = f"framing change every <= {PACE_MAX_GAP:g}s"
     changes = {float(t) for t in side.get("cut_times") or []}
     changes |= {float(st[0]) for st in side.get("zoom_steps") or []}
@@ -606,8 +606,11 @@ def _check_pacing(side: dict, duration: float) -> CheckResult:
         float(st[0]) for lay in side.get("layout") or [] for st in lay.get("shift_steps") or []
     }
     changes |= {float(t) for lay in side.get("layout") or [] for t in lay.get("snaps") or []}
-    changes |= {  # full-cam reaction beats: the cut to the cam and back
-        float(t) for lay in side.get("layout") or [] for b in lay.get("cam_beats") or [] for t in b
+    changes |= {  # full-cam reaction beats and screen covers: the cut to the cam and back
+        float(t)
+        for lay in side.get("layout") or []
+        for b in [*(lay.get("cam_beats") or []), *(lay.get("cam_covers") or [])]
+        for t in b
     }
     pts = sorted({0.0, duration} | {t for t in changes if 0 < t < duration})
     gap, at = max((b - a, a) for a, b in pairwise(pts))
@@ -752,16 +755,21 @@ def _covered_s(words: list[Word], lo: float, hi: float) -> float:
 
 
 def _check_static(
-    flags: list[bool], fps: float, words: list[Word], chroma: list[float] | None = None
+    flags: list[bool],
+    fps: float,
+    words: list[Word],
+    chroma: list[float] | None = None,
+    hidden: list[tuple[float, float]] | None = None,
 ) -> CheckResult:
     """Q-static: seconds of static / death / loading screen frames (`screen_frame_flags`; runs,
     single frames bridged, under words for at most STATIC_VOICED_MAX of their length and,
     with `chroma`, of mean chroma under STATIC_CHROMA_MAX: dark gameplay is coloured) at most
-    STATIC_MAX_S."""
+    STATIC_MAX_S. Frames inside the `hidden` spans (output s: full-cam covers, the screen not
+    shown) are not counted."""
     thr = f"<= {STATIC_MAX_S:g}s of voiceless screen frames"
     runs: list[list[int]] = []
     for i, f in enumerate(flags):
-        if not f:
+        if not f or any(a <= (i + 0.5) / fps < b for a, b in hidden or []):
             continue
         if runs and i - runs[-1][1] <= 2:
             runs[-1][1] = i
@@ -851,13 +859,23 @@ def _clip_pcm(mp4: Path, rate: int = 48000) -> np.ndarray:
     return np.frombuffer(res.stdout, np.int16).astype(np.float64) / 32768.0
 
 
+def _stream_hidden(side: dict) -> list[tuple[float, float]]:
+    """Output spans whose gameplay is not shown: the full-cam covers over static screens (a
+    beat's band still shows the gameplay)."""
+    return [
+        (float(a), float(b))
+        for lay in side.get("layout") or []
+        for a, b in lay.get("cam_covers") or []
+    ]
+
+
 def _stream_checks(mp4: Path, side: dict, words: list[Word], duration: float) -> list[CheckResult]:
     """Q-static, Q-voiceless, Q-seam and Q-beat: the stream editing checks."""
     seam = side.get("seam")
     pcm = _clip_pcm(mp4) if seam is not None else np.zeros(0)
     flags, chroma = screen_frame_flags(mp4)
     return [
-        _check_static(flags, STATIC_FPS, words, chroma),
+        _check_static(flags, STATIC_FPS, words, chroma, hidden=_stream_hidden(side)),
         _check_voiceless(words, duration),
         _check_seam(pcm, 48000, seam, side.get("seam_source_db")),
         _check_beat(side),

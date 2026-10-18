@@ -24,6 +24,8 @@ from hookline.pipeline.boundaries import (
     CAUSE_MAX_S,
     PAYOFF_SAID_MAX_S,
     PAYOFF_SCARE_S,
+    VOICELESS_GAME_S,
+    VOICELESS_MAX_S,
     edit_gaps,
     fit_to_signals,
 )
@@ -43,6 +45,7 @@ from hookline.pipeline.signals import (
     loud_seconds,
     onset_times,
     scare_times,
+    screen_runs,
     seconds_of,
 )
 from hookline.transcribe import Transcriber
@@ -339,12 +342,18 @@ _FIT_AFTER_S = PAYOFF_SCARE_S + PAYOFF_SAID_MAX_S + 1.0
 
 
 def fit_pick(
-    pick: ClipPick, words: list[Word], signals: Signals, wav: Path, settings: Settings
+    pick: ClipPick,
+    words: list[Word],
+    signals: Signals,
+    wav: Path,
+    settings: Settings,
+    gameplay: bool = False,
 ) -> tuple[ClipPick, list[tuple[float, float]], list[Word]]:
     """(the pick fitted to the signals, its interior edit gaps, the words they were judged
     on). The fit and the gaps see the words as the render captions them: held ends clamped to
     the voice (`render.voiced_words`), so the voiceless trimmer and the audit's Q-voiceless
-    measure the same voice."""
+    measure the same voice. `gameplay` (a stream with a facecam) cuts voiceless stretches
+    over VOICELESS_GAME_S instead of VOICELESS_MAX_S."""
     voiced = voiced_words(
         wav, words, pick.start - _FIT_BEFORE_S, pick.end + _FIT_AFTER_S, settings.silence_db
     )
@@ -355,7 +364,9 @@ def fit_pick(
         max_s=settings.max_clip_s + PAYOFF_ALLOWANCE_S,
         quiet_db=settings.silence_db,
     )
-    return fitted, edit_gaps(fitted, voiced, signals, quiet_db=settings.silence_db), voiced
+    limit = VOICELESS_GAME_S if gameplay else VOICELESS_MAX_S
+    gaps = edit_gaps(fitted, voiced, signals, quiet_db=settings.silence_db, voiceless_s=limit)
+    return fitted, gaps, voiced
 
 
 def _layout_profile(
@@ -486,6 +497,9 @@ def run_job(
     # full-cam reaction beats and the audit's Q-beat: every scare (game transients and flash
     # scares) and the gameplay's motion spikes
     scares, spikes = scare_times(signals), beat_spikes(signals)
+    # the talked-over static / death screens: covered by the full cam in the render
+    screens = screen_runs(signals)
+    gameplay = profile is not None and profile.cam is not None  # a stream: 3 s voiceless
     # Segment-interpolated word times are contiguous (no gaps), so protecting them from cuts
     # would remove no dead air at all; only real word timings (DTW / whisper) are protected.
     protect = transcript.timing != "segment"
@@ -500,7 +514,7 @@ def run_job(
             # final hard length clamp (max_clip_s + the payoff allowance, the end tail not
             # counted); still, quiet, wordless stretches, static screens and long voiceless
             # stretches inside the clip are cut like dead air (`gaps`)
-            trimmed, gaps, _ = fit_pick(pick, words, signals, wav, settings)
+            trimmed, gaps, _ = fit_pick(pick, words, signals, wav, settings, gameplay)
             if trimmed != pick:
                 log(
                     f"clip {i:02d}: fitted to signals {pick.start:.2f}-{pick.end:.2f} -> "
@@ -523,6 +537,7 @@ def run_job(
                 profile=profile,
                 scares=scares,
                 spikes=spikes,
+                screens=screens,
             )
         except Exception as e:  # noqa: BLE001 - one bad clip never aborts the job
             reason = (str(e).splitlines() or [type(e).__name__])[0]

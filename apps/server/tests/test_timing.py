@@ -112,17 +112,17 @@ def test_snap_onsets_snaps_an_early_onset_forward_too():
 def test_tail_end_snaps_past_the_last_word_into_silence():
     env = _env([(1.0, 2.12)])  # the word's energy runs 0.12 s past its transcribed end
     end = tail_end(2.0, 1.95, 10.0, env, THR)
-    assert 2.12 <= end <= 2.0 + 0.35 + 1e-9
-    assert end == pytest.approx(2.12 + 0.2, abs=0.011)  # 0.2 s into the silence
+    assert 2.12 <= end <= 2.12 + 0.45 + 1e-9
+    assert end == pytest.approx(2.12 + 0.4, abs=0.011)  # 0.4 s into the silence
 
 
 def test_tail_end_never_reaches_the_next_word_nor_shortens():
     env = _env([(1.0, 2.15), (2.2, 2.6)])  # the next word's onset is audible at 2.2
     end = tail_end(2.0, 2.0, 2.2, env, THR)
     assert end <= 2.2 - 0.05 + 1e-9
-    assert tail_end(2.0, 2.3, 10.0, _env([(1.0, 2.0)]), THR) == 2.3  # already past: kept
+    assert tail_end(2.0, 2.5, 10.0, _env([(1.0, 2.0)]), THR) == 2.5  # already past: kept
     capped = tail_end(2.0, 2.0, 10.0, _env([(1.0, 3.0)]), THR)
-    assert capped <= 2.35 + 1e-9  # no silence in reach: at most 0.35 s past the last word
+    assert capped <= 2.45 + 1e-9  # no silence in reach: at most 0.45 s past the last word
 
 
 # --- noisy sources, bounded extensions, audible next-word onsets ----------------------------------
@@ -153,7 +153,7 @@ def test_noise_bed_between_words_still_ends_words_and_snaps_onsets():
     assert ends[0].end == pytest.approx(1.42, abs=0.011)  # not stretched to the next word
     onsets = snap_onsets(ends, env, thr)
     assert onsets[1].start == pytest.approx(2.0, abs=0.011)
-    assert tail_end(2.6, 2.6, 10.0, env, thr) == pytest.approx(2.80, abs=0.011)  # +0.2
+    assert tail_end(2.6, 2.6, 10.0, env, thr) == pytest.approx(3.0, abs=0.011)  # +0.4
 
 
 def test_refine_word_ends_without_an_energy_fall_extends_at_most_0_6_s():
@@ -176,7 +176,7 @@ def test_protected_words_cap_the_refined_end():
 def test_tail_ignores_a_next_word_start_without_an_audible_onset():
     # clip 01: DTW put "I" at 362.74 inside the sound of "alone." (voiced to ~362.87)
     env = _env([(1.0, 2.25)])
-    assert tail_end(2.0, 2.0, 2.1, env, THR) == pytest.approx(2.45, abs=0.011)  # fall + 0.2
+    assert tail_end(2.0, 2.0, 2.1, env, THR) == pytest.approx(2.65, abs=0.011)  # fall + 0.4
     # ... but an audible onset of the next word still stops it
     heard = _env([(1.0, 2.05), (2.15, 2.6)])
     assert tail_end(2.0, 2.0, 2.15, heard, THR) <= 2.10 + 1e-9
@@ -200,7 +200,7 @@ def test_tail_never_swallows_a_whole_audible_next_word():
     end = tail_end(2.0, 2.0, 2.1, env, THR, next_end=2.2)
     assert end <= 2.1 - 0.05 + 1e-9
     # a next word running past the fall (DTW put its start inside the last word) is ignored
-    assert tail_end(2.0, 2.0, 2.1, env, THR, next_end=2.6) == pytest.approx(2.45, abs=0.011)
+    assert tail_end(2.0, 2.0, 2.1, env, THR, next_end=2.6) == pytest.approx(2.65, abs=0.011)
 
 
 # --- onsets after pauses, final and silent words, splices, tail -----------------------------------
@@ -284,12 +284,12 @@ def test_snap_splices_moves_a_range_start_out_of_a_dropped_word_tail():
     assert abs(tight[1][0] - 2.5) <= 0.15 + 1e-9 and tight[0][1] >= 1.95 - 1e-9
 
 
-def test_tail_end_leaves_0_2_to_0_3_s_after_the_last_word():
+def test_tail_end_leaves_0_4_to_0_45_s_after_the_last_word():
     env = _env([(1.0, 2.02)])  # the word falls silent at once
     end = tail_end(2.0, 2.0, 10.0, env, THR)
-    assert 2.02 + 0.2 - 0.011 <= end <= 2.02 + 0.3 + 1e-9
+    assert 2.02 + 0.4 - 0.011 <= end <= 2.02 + 0.45 + 1e-9
     capped = tail_end(2.0, 2.0, 10.0, _env([(1.0, 3.0)]), THR)
-    assert capped <= 2.3 + 1e-9  # no silence in reach: at most 0.3 s past the last word
+    assert capped <= 2.45 + 1e-9  # no silence in reach: at most 0.45 s past the last word
 
 
 # --- fragments past the window, ramps, shared words -----------------------------------------------
