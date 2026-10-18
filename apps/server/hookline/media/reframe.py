@@ -32,6 +32,8 @@ GUARD_JITTER = 0.02  # a guarded face leaves this much (source width) each side 
 GUARD_PASSES = 5  # guard_zoom iterates to a fixed point in at most this many passes
 BEAT_SLIDE = 1.5  # a beat's crop pulse may start up to this much later where it fits ...
 SAMPLE_STEP = 0.25  # ... tried at this spacing (the face sampling interval)
+MERGE_S = 0.1  # a crop pulse this close to a zoom step moves onto it: one framing change
+FIT_SLACK = 0.98  # plan_zoom's face-fit cap stays this far inside the guard's limit
 FACE_CORE = 0.8  # share of the face box width kept inside the crop for unguarded close-ups
 KEYFRAME_TOL = 0.5  # px: track keyframes this close to the line through their neighbours go
 BLUR = "boxblur=20:2"
@@ -721,9 +723,10 @@ def _inside(t: float, spans: Sequence[tuple[float, float]]) -> bool:
 def _hold_base(
     sched: list[tuple[float, float]], spans: Sequence[tuple[float, float]]
 ) -> list[tuple[float, float]]:
-    """`sched` at base (1.0) from each span's start, its steps inside spans dropped; the
-    level stays base until the next schedule step after the span."""
-    return _dedupe(
+    """`sched` with an explicit base (1.0) step at each span's start and its steps inside
+    spans dropped (not deduplicated: a span start stays a reset even where the level is
+    already base, so nothing placed before it can run through the hold)."""
+    return sorted(
         [*(st for st in sched if not _inside(st[0], spans)), *((a, 1.0) for a, _ in spans)]
     )
 
@@ -753,107 +756,140 @@ def _guard_scene(
         if grown == spans:
             break
         spans = grown
-        held = _hold_base(sched, spans)
+        held = _dedupe(_hold_base(sched, spans))
     else:
         log.warning(
             "edge guard did not settle in the scene at %.2f-%.2f s; holding base from %.2f s",
             lay.start, lay.end, spans[0][0],
         )  # fmt: skip
         spans = [(spans[0][0], lay.end)]
-        held = _hold_base(sched, spans)
-    fit = _SceneFit(lay, in_w, in_h, held)  # the crop path the final schedule renders
-    return _hold_spans(sched, spans, cuts, fit, (lay.start, lay.end))
+
+    def spans_at(steps: list[tuple[float, float]]) -> list[tuple[float, float]]:
+        zoom = zoom_at_fn(steps, lay)
+        found = track_guard_spans(rel, in_w, cw, zoom_top=zoom, **kw)
+        return [(a + lay.start, b + lay.start) for a, b in found]
+
+    return _hold_spans(
+        sched, spans, cuts, lambda steps: _SceneFit(lay, in_w, in_h, steps),
+        (lay.start, lay.end), spans_at,
+    )  # fmt: skip
 
 
 def _hold_spans(
     sched: list[tuple[float, float]],
     spans: list[tuple[float, float]],
     cuts: Sequence[float],
-    fit: "_SceneFit",
+    make_fit: Callable[[list[tuple[float, float]]], "_SceneFit"],
     scene: tuple[float, float],
+    spans_at: Callable[[list[tuple[float, float]]], list[tuple[float, float]]] | None = None,
 ) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
-    """The one placement pass of `guard_zoom` for a scene (output times in `scene`):
-    (steps, shift_steps).
+    """The placement pass of `guard_zoom` for a scene (output times in `scene`):
+    (steps, shift_steps). `make_fit` builds a `_SceneFit` for a schedule.
 
-    Base is held inside `spans`. Every cut or schedule step inside a span (and the span's
-    start, when the hold itself changes nothing) gets a crop pulse: STEP_SHIFT for CUT_QUIET
-    (ZOOM_MIN_STEP when only that is safe) in the span's one direction (`fit.direction`),
-    pulses at least CUT_QUIET apart, checked by `fit` at the zoom that renders; none near the
-    scene end switches off (the camera change ends it). After a span the schedule's level
-    returns once CUT_QUIET has passed since the span's start and its last change, unless the next span, a
-    step, a cut or the scene end comes within CUT_QUIET or the face would reach the margin.
-    Cuts and steps outside spans that lost their change get one: a cut the other level if
-    the face stays inside the margin there, else a pulse at the cut; a beat a pulse, which
-    may slide up to BEAT_SLIDE later (either direction) to find a safe moment."""
+    1. Levels: base from every span's start (an explicit reset) to its end; after a span the
+    schedule's level returns once CUT_QUIET has passed since the span's start and its last
+    cut or step, unless the next span, a step, a cut or the scene end comes within CUT_QUIET;
+    a cut outside the spans that lost its change takes the other level. Each zoom-in placed
+    here holds only until the next level step or span start, and stays only if the guard
+    (`spans_at`, at the zoom the final schedule renders) never fires while it is in effect.
+    2. Pulses, checked against that final schedule: every cut or step inside a span (its
+    start too, when the hold changes nothing) and every cut or step outside the spans still
+    without a change gets a STEP_SHIFT crop pulse (`pulse`)."""
     start, end = scene
-    held = _hold_base(sched, spans)
     times = sorted({*(t for t, _ in sched if start < t < end), *cuts})
-    pulses: list[tuple[float, float]] = []  # (start, end) of each pulse
-    signs: list[float] = []
-    shifts: list[tuple[float, float]] = []
+    starts = [a for a, _ in spans]
+    levels = _hold_base(sched, spans)
 
-    def pulse(t: float, sign: float) -> float | None:
-        """Place a pulse at `t`; its end, or None when spacing or safety forbid one. Pulses
-        start CUT_QUIET apart with ZOOM_MIN_STEP between one's end and the next's start, and
-        one following within CUT_QUIET of another keeps its direction (no flip-flop)."""
-        if any(abs(t - a) < CUT_QUIET or a <= t < b + ZOOM_MIN_STEP for a, b in pulses):
-            return None
-        recent = [(b, v) for (a, b), v in zip(pulses, signs, strict=True) if b <= t < b + CUT_QUIET]
-        sign = recent[-1][1] if recent else sign
-        for dur in (CUT_QUIET, ZOOM_MIN_STEP):
-            off = t + dur if t + dur <= end - ZOOM_EASE else end
-            if any(t < a < off + ZOOM_MIN_STEP for a, _ in pulses):
-                continue
-            if fit.fits(None, t, min(off + ZOOM_EASE, end), shift=sign * STEP_SHIFT):  # + ease
-                pulses.append((t, off))
-                signs.append(sign)
-                shifts.append((t, sign * STEP_SHIFT))
-                if off < end:
-                    shifts.append((round(off, 3), 0.0))
-                return off
-        return None
-        for dur in (CUT_QUIET, ZOOM_MIN_STEP):
-            off = t + dur if t + dur <= end - ZOOM_EASE else end
-            if fit.fits(None, t, min(off + ZOOM_EASE, end), shift=sign * STEP_SHIFT):  # + ease
-                pulses.append((t, off))
-                shifts.append((t, sign * STEP_SHIFT))
-                if off < end:
-                    shifts.append((round(off, 3), 0.0))
-                return off
-        return None
+    def limit(t: float) -> float:
+        """Where a level placed at `t` stops: the next level step or span start."""
+        nxt = [u for u, _ in levels if u > t + 1e-9] + [a for a in starts if a > t + 1e-9]
+        return min([*nxt, end])
 
+    placed: list[tuple[float, float]] = []  # zoom-ins placed here, to verify on the final path
     for k, (a, b) in enumerate(spans):
-        before = _level_at([st for st in sched if st[0] < a - 1e-9], a)
-        sign = fit.direction(a, b)
-        last = a
-        for t in (t for t in times if a <= t < b and (t > a + 1e-9 or before == 1.0)):
-            last = pulse(t, sign) or last
-        r = max(b, a + CUT_QUIET, last + CUT_QUIET if last > a else b)  # no in-out pumping
+        inner = [t for t in times if a <= t < b]
+        r = max(b, a + CUT_QUIET, inner[-1] + CUT_QUIET if inner else b)
         nxt = min(
-            spans[k + 1][0] if k + 1 < len(spans) else math.inf,
-            min((t for t in times if t >= b - 1e-9), default=math.inf),  # steps and cuts
-            min((c for c in cuts if c >= r - 1e-9), default=math.inf),
+            starts[k + 1] if k + 1 < len(starts) else math.inf,
+            min((t for t in times if t >= b - 1e-9), default=math.inf),
             end,
         )
         level = _level_at(sched, r)
-        if nxt >= r + CUT_QUIET and (level == 1.0 or fit.fits(level, r, nxt, path=True)):
-            held = _dedupe([*held, (r, level)])
+        if nxt >= r + CUT_QUIET and level != 1.0:
+            placed.append((r, level))
+    levels = sorted([*levels, *placed])
+    for c in cuts:  # a cut outside the holds keeps a level change
+        if _inside(c, spans):
+            continue
+        prev = _level_at([st for st in levels if st[0] < c - 1e-9], c)
+        if _level_at(levels, c) == prev:
+            levels = sorted(
+                [
+                    *(st for st in levels if abs(st[0] - c) >= 1e-9),
+                    (c, ZOOM_IN if prev == 1.0 else 1.0),
+                ]
+            )
+            if prev == 1.0:
+                placed.append((c, ZOOM_IN))
+    for _ in range(GUARD_PASSES):  # keep only zoom-ins the guard never fires under
+        fresh = spans_at(_dedupe(levels)) if spans_at else []
+        bad = [(t, v) for t, v in placed if any(a < limit(t) and t < b for a, b in fresh)]
+        if not bad:
+            break
+        placed = [st for st in placed if st not in bad]
+        levels = [st for st in levels if st not in bad]
+    held = _dedupe(levels)
+    fit = make_fit(held)
+    pulses: list[tuple[float, float, float]] = []  # (start, end, sign)
+    shifts: list[tuple[float, float]] = []
+
+    def pulse(t: float, sign: float, free: bool) -> bool:
+        """A crop pulse at `t` (moved onto a level step within MERGE_S, one framing change):
+        STEP_SHIFT for CUT_QUIET, else ZOOM_MIN_STEP, ended early by a cut, never shorter than
+        ZOOM_MIN_STEP and never switching off within ZOOM_EASE of the scene end; starts
+        CUT_QUIET apart, ZOOM_MIN_STEP between one's end and the next, and pulses within
+        CUT_QUIET of each other share a direction. `free`: the other direction may be
+        tried when `sign` is not safe. Checked through its ease-out on the final schedule."""
+        t = min((u for u, _ in held if abs(u - t) < MERGE_S), key=lambda u: abs(u - t), default=t)
+        if any(abs(t - a) < CUT_QUIET or a <= t < b + ZOOM_MIN_STEP for a, b, _ in pulses):
+            return False
+        # a pulse ending within CUT_QUIET before, or starting soon after, sets the direction
+        near = [s for a, b, s in pulses if b <= t < b + CUT_QUIET or t < a < t + 2 * CUT_QUIET]
+        if len(set(near)) > 1:
+            return False  # between two opposite pulses: any direction would flip-flop
+        signs = near[:1] if near else ([sign, -sign] if free else [sign])
+        for s in signs:
+            for dur in (CUT_QUIET, ZOOM_MIN_STEP):
+                off = min([t + dur, *(c for c in cuts if t < c < t + dur)])
+                if off > end - ZOOM_EASE:
+                    off = end
+                if off - t < ZOOM_MIN_STEP - 1e-9 or any(
+                    t < a < off + ZOOM_MIN_STEP for a, _, _ in pulses
+                ):
+                    continue
+                if fit.fits(None, t, min(off + ZOOM_EASE, end), shift=s * STEP_SHIFT):
+                    pulses.append((t, off, s))
+                    shifts.append((t, s * STEP_SHIFT))
+                    if off < end:
+                        shifts.append((round(off, 3), 0.0))
+                    return True
+        return False
+
+    for a, b in spans:
+        before = _level_at([st for st in held if st[0] < a - 1e-9], a)
+        sign = fit.direction(a, b)
+        for t in (t for t in times if a <= t < b and (t > a + 1e-9 or before == 1.0)):
+            pulse(t, sign, free=False)
     for t in times:  # outside the holds, every cut and step keeps a framing change
-        if _inside(t, spans) or any(a - 1e-9 <= t < b for a, b in pulses):
+        if _inside(t, spans) or any(a - 1e-9 <= t < b for a, b, _ in pulses):
             continue
-        prev = _level_at([st for st in held if st[0] < t - 1e-9], t)
-        if _level_at(held, t) != prev:
+        if _level_at(held, t) != _level_at([st for st in held if st[0] < t - 1e-9], t):
             continue
-        until = min((u for u, _ in held if u > t + 1e-9), default=end)
-        want = ZOOM_IN if prev == 1.0 else 1.0
-        if t in cuts and (want == 1.0 or fit.fits(want, t, until, path=True)):
-            held = _dedupe([*(st for st in held if abs(st[0] - t) >= 1e-9), (t, want)])
-        else:  # a cut pulses on the cut; a beat may slide up to BEAT_SLIDE later to fit
-            sign = fit.direction(t, t + CUT_QUIET)
-            nxt = min((u for u in times if u > t + 1e-9), default=end)
-            slide = 0.0 if t in cuts else min(BEAT_SLIDE, max(nxt - CUT_QUIET - t, 0.0))
-            tries = [t + k * SAMPLE_STEP for k in range(int(slide / SAMPLE_STEP + 1e-9) + 1)]
-            any(pulse(u, d) for u in tries for d in (sign, -sign))
+        nxt = min((u for u in times if u > t + 1e-9), default=end)
+        slide = 0.0 if t in cuts else min(BEAT_SLIDE, max(nxt - CUT_QUIET - t, 0.0))
+        sign = fit.direction(t, t + CUT_QUIET)
+        tries = [t + k * SAMPLE_STEP for k in range(int(slide / SAMPLE_STEP + 1e-9) + 1)]
+        any(pulse(u, sign, free=True) for u in tries)  # a beat may slide later to fit
     return held, sorted(shifts)
 
 
@@ -1299,9 +1335,12 @@ def plan_zoom(layout: SceneLayout, in_w: int, in_h: int) -> SceneLayout:
         if base > 1.0:
             cap = room
     if _kind(layout) == "FACE_TRACK" and layout.face_w:
-        # the face (with jitter room) must fit the guard margin at the top level
-        fit = _track_w(in_w, in_h) / in_w * (1 - 2 * GUARD_MARGIN)
-        fit /= layout.face_w + 2 * GUARD_JITTER
+        # the face (its wider moments, with jitter room) must fit the guard margin at the top
+        # level, with FIT_SLACK to spare so the guard never flips to the close-up path there
+        widths = sorted(_median3(layout.track_w)) if layout.track_w else []
+        face = max(layout.face_w, widths[int(0.9 * (len(widths) - 1))] if widths else 0.0)
+        fit = _track_w(in_w, in_h) / in_w * (1 - 2 * GUARD_MARGIN) * FIT_SLACK
+        fit /= face + 2 * GUARD_JITTER
         if fit < (cap if cap is not None else ZOOM_TOP * base):
             cap = max(fit, base)
     plan = layout.model_copy(update={"base_zoom": math.floor(base * 1e4) / 1e4, "zoom_cap": cap})
