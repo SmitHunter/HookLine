@@ -17,16 +17,17 @@ _KIND_SHARE = 0.4
 _CLIP_MIN_REQUESTS = 3
 CLIP_MARKER = "\u2702\ufe0fclip"
 SCARE_MARKER = "\u26a1scare"
-# signals.json format; a cached file below this version is recomputed (2: wave G-select added
-# motion, onsets and game-audio transients)
-SIGNALS_VERSION = 2
+# signals.json format; a cached file below this version has its onsets recomputed (2: wave
+# G-select added motion, onsets and game-audio transients; 3: exact onset times, 0.3 s speech
+# pad). The VOD motion decode is kept from any cache that has it.
+SIGNALS_VERSION = 3
 # Audio onsets (short-term loudness every 0.1 s, `media.audio.momentary_db`): a jump of
 # >= 10 dB within 0.5 s, landing >= 12 dB over the VOD's median level and over -35 dBFS.
 ONSET_JUMP_DB = 10.0
 ONSET_WITHIN_S = 0.5
 ONSET_OVER_MEDIAN_DB = 12.0
 ONSET_FLOOR_DB = -35.0
-SPEECH_PAD_S = 0.1  # an onset this close to a transcribed word is speech, not game audio
+SPEECH_PAD_S = 0.3  # an onset this close to a transcribed word is speech, not game audio
 # Visual flashes (`media.motion.frame_motion`, mean abs frame difference, 0-255): >= 40 and
 # >= 4x the median motion of the surrounding +-10 s, so busy gameplay is not a flash.
 FLASH_MIN = 40.0
@@ -49,16 +50,20 @@ class Signals(BaseModel):
     motion: list[float] | None = None
     onsets: list[int] | None = None
     transients: list[int] | None = None
+    # version 3: the same onsets and transients at their exact times (seconds)
+    onset_times: list[float] | None = None
+    transient_times: list[float] | None = None
 
 
-def audio_onsets(
+def onset_times(
     db: np.ndarray | list[float], hop: float, speech: list[tuple[float, float]]
-) -> tuple[list[int], list[int]]:
-    """(seconds with an audio onset, seconds with one away from `speech`) from a short-term
-    loudness envelope `db` sampled every `hop` s (`media.audio.momentary_db`): a frame at least
-    ONSET_JUMP_DB above the quietest frame of the preceding ONSET_WITHIN_S, landing
-    ONSET_OVER_MEDIAN_DB over the envelope's median and over ONSET_FLOOR_DB. An onset within
-    SPEECH_PAD_S of a speech span is the speaker, not the game."""
+) -> tuple[list[float], list[float]]:
+    """(times of every audio onset, times of those away from `speech`) in seconds, from a
+    short-term loudness envelope `db` sampled every `hop` s (`media.audio.momentary_db`): a
+    frame at least ONSET_JUMP_DB above the quietest frame of the preceding ONSET_WITHIN_S,
+    landing ONSET_OVER_MEDIAN_DB over the envelope's median and over ONSET_FLOOR_DB; a run of
+    such frames is one onset, at its first frame. An onset within SPEECH_PAD_S of a speech span
+    is the speaker, not the game."""
     db = np.asarray(db, dtype=np.float64)
     k = max(1, round(ONSET_WITHIN_S / hop))
     if len(db) <= k:
@@ -67,13 +72,27 @@ def audio_onsets(
     level = db[k:]
     floor = max(ONSET_FLOOR_DB, float(np.median(db)) + ONSET_OVER_MEDIAN_DB)
     hits = np.flatnonzero((level - prior >= ONSET_JUMP_DB) & (level >= floor)) + k
+    firsts = [int(i) for j, i in enumerate(hits) if j == 0 or i - hits[j - 1] > 1]
     talking = np.zeros(len(db), dtype=bool)
     for a, b in speech:
         lo, hi = int((a - SPEECH_PAD_S) / hop), int((b + SPEECH_PAD_S) / hop) + 1
         talking[max(lo, 0) : max(hi, 0)] = True
-    every = sorted({int(i * hop + 1e-9) for i in hits})
-    game = sorted({int(i * hop + 1e-9) for i in hits if not talking[i]})
+    every = [round(i * hop, 3) for i in firsts]
+    game = [round(i * hop, 3) for i in firsts if not talking[i]]
     return every, game
+
+
+def audio_onsets(
+    db: np.ndarray | list[float], hop: float, speech: list[tuple[float, float]]
+) -> tuple[list[int], list[int]]:
+    """`onset_times` as whole seconds: (seconds with an audio onset, seconds with one away from
+    `speech`, i.e. game-audio transients)."""
+    every, game = onset_times(db, hop, speech)
+    return seconds_of(every), seconds_of(game)
+
+
+def seconds_of(times: list[float]) -> list[int]:
+    return sorted({int(t + 1e-9) for t in times})
 
 
 def flash_seconds(motion: list[float]) -> set[int]:
@@ -100,6 +119,19 @@ def scare_seconds(signals: Signals) -> set[int]:
             if any(s + d in onsets for d in range(-FLASH_SOUND_S, FLASH_SOUND_S + 1))
         }
     return out
+
+
+def scare_times(signals: Signals) -> list[float]:
+    """`scare_seconds` at their exact times: each transient's onset time, each flash at the
+    time of its sound's onset (within FLASH_SOUND_S). Signals without exact times give each
+    scare's second."""
+    if signals.transient_times is None or signals.onset_times is None:
+        return sorted(float(s) for s in scare_seconds(signals))
+    out = set(signals.transient_times)
+    if signals.motion:
+        for s in flash_seconds(signals.motion):
+            out |= {t for t in signals.onset_times if abs(int(t + 1e-9) - s) <= FLASH_SOUND_S}
+    return sorted(out)
 
 
 def low_motion(motion: list[float] | None, start: float, end: float) -> bool:

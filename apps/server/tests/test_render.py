@@ -592,3 +592,17 @@ def test_render_clip_skips_word_refinement_on_a_noisy_bed(
         )  # fmt: skip
     assert calls == []
     assert any("noise" in r.getMessage() for r in caplog.records)
+
+
+def test_render_cuts_interior_idle_gaps(
+    fixture_video, fixture_wav, fixture_words, sample_pick, settings, tmp_path
+):
+    s = settings.model_copy(update={"vertical": False, "captions": False})
+    dst = tmp_path / "out" / "01-x.mp4"
+    extras = render_clip(
+        fixture_video, fixture_wav, sample_pick, fixture_words, tmp_path / "r", dst, s,
+        NoFaces(), idle_gaps=[(40.4, 44.6)],
+    )  # fmt: skip
+    keep = extras["keep_ranges"]
+    assert not any(a < 44.5 and b > 40.5 for a, b in keep)
+    assert any(abs(b - 40.4) < 0.05 for _, b in keep) and extras["removed_s"] >= 4.1

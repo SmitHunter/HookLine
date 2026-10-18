@@ -230,3 +230,47 @@ def test_probe_video_kbps(fixture_video, tmp_path):
     kbps = ffmpeg_mod.probe_video_kbps(fixture_video)
     assert kbps is not None and kbps > 0
     assert ffmpeg_mod.probe_video_kbps(tmp_path / "missing.mp4") is None
+
+
+def test_amf_b_frame_probe_does_not_cache_a_transient_failure(monkeypatch):
+    class Res:
+        def __init__(self, out=""):
+            self.stdout = out
+
+    calls = []
+
+    def flaky(cmd):
+        calls.append(cmd[0])
+        if len(calls) == 1:
+            raise ffmpeg_mod.FFmpegError("h264_amf exited with code 1 (device busy)")
+        return Res("2\n") if cmd[0] == "ffprobe" else Res()
+
+    ffmpeg_mod.amf_b_frames.cache_clear()
+    monkeypatch.setattr(ffmpeg_mod, "_run", flaky)
+    try:
+        assert ffmpeg_mod.amf_b_frames() is False  # this time
+        assert ffmpeg_mod.amf_b_frames() is True  # re-probed, and the success is kept
+        n = len(calls)
+        assert ffmpeg_mod.amf_b_frames() is True and len(calls) == n
+    finally:
+        ffmpeg_mod.amf_b_frames.cache_clear()
+
+
+def test_amf_b_frame_probe_caches_a_definitive_no(monkeypatch):
+    class Res:
+        def __init__(self, out=""):
+            self.stdout = out
+
+    calls = []
+
+    def no_b(cmd):
+        calls.append(cmd[0])
+        return Res("0\n") if cmd[0] == "ffprobe" else Res()
+
+    ffmpeg_mod.amf_b_frames.cache_clear()
+    monkeypatch.setattr(ffmpeg_mod, "_run", no_b)
+    try:
+        assert ffmpeg_mod.amf_b_frames() is False and ffmpeg_mod.amf_b_frames() is False
+        assert len(calls) == 2  # probed once
+    finally:
+        ffmpeg_mod.amf_b_frames.cache_clear()

@@ -16,11 +16,12 @@ import numpy as np
 
 from hookline.captions.ass import face_rects
 from hookline.fsutil import atomic_write_text
-from hookline.media.ffmpeg import probe_duration
+from hookline.media.ffmpeg import probe_duration, probe_video_kbps
 from hookline.media.loudness import measure_loudness
 from hookline.media.subtitles import fonts_dir, subtitles_filter
 from hookline.models import Word
 from hookline.pipeline.boundaries import FILLER_OPENERS
+from hookline.pipeline.ingest import find_source
 from hookline.pipeline.layout import SceneLayout
 
 OUT_W, OUT_H = 1080, 1920
@@ -641,8 +642,11 @@ def _ass_for(mp4: Path, side: dict, work_dir: Path) -> tuple[Path | None, CheckR
 def audit_job(out_dir: Path, work_dir: Path) -> dict:
     """Audit every `NN-*.mp4` in `out_dir` against its sidecar and the ASS file the sidecar
     records (verified by sha1; `render/NN.ass` for older sidecars), and write the report to
-    `out_dir/audit.json`. A clip whose audit raises is reported as a failed "ERR" check."""
+    `out_dir/audit.json`. A clip whose audit raises is reported as a failed "ERR" check.
+    A sidecar without `source_video_kbps` (rendered before Q8 followed the source) gets the
+    job's workspace source probed for it (the 5000 kb/s bar when there is none)."""
     clips = []
+    source_kbps: list[float | None] = []  # probed once, on the first sidecar that needs it
     for mp4 in sorted(out_dir.glob("*.mp4")):
         if mp4.name.endswith(".tmp.mp4"):
             continue
@@ -650,6 +654,11 @@ def audit_job(out_dir: Path, work_dir: Path) -> dict:
         try:
             side_path = mp4.with_suffix(".json")
             side = json.loads(side_path.read_text(encoding="utf-8")) if side_path.exists() else {}
+            if not side.get("source_video_kbps"):
+                if not source_kbps:
+                    src = find_source(work_dir) if work_dir.is_dir() else None
+                    source_kbps.append(probe_video_kbps(src) if src else None)
+                side = {**side, "source_video_kbps": source_kbps[0]}
             ass, ass_check = _ass_for(mp4, side, work_dir)
             results = ([ass_check] if ass_check else []) + audit_clip(mp4, side, ass)
         except Exception as e:  # noqa: BLE001 - one broken clip must not stop the audit

@@ -605,8 +605,11 @@ def test_run_job_trims_idle_ends_before_render_and_records_the_source_bitrate(
     seen = []
     real = run_mod.render_clip
 
+    seen_kw = []
+
     def spy(src, wav, pick, *a, **k):
         seen.append(pick)
+        seen_kw.append(k)
         return real(src, wav, pick, *a, **k)
 
     trims = []
@@ -614,13 +617,82 @@ def test_run_job_trims_idle_ends_before_render_and_records_the_source_bitrate(
     monkeypatch.setattr(
         run_mod,
         "fit_to_signals",
-        lambda pick, words, signals: (
-            trims.append(pick) or pick.model_copy(update={"end": pick.end - 3})
+        lambda pick, words, signals, **k: (
+            trims.append(pick) or kws.append(k) or pick.model_copy(update={"end": pick.end - 3})
         ),
     )
+    gaps = []
+    monkeypatch.setattr(
+        run_mod, "idle_gaps", lambda pick, words, signals, **k: gaps.append(pick) or [(25.0, 27.0)]
+    )
+    kws = []
     fake_llm.queue(make_payload_for(150, 1, 21))
     s = settings_tmp.model_copy(update={"clips": 1, "vertical": False, "captions": False})
     (clip,) = run_job(str(fixture_video), s, fake_llm, FakeTranscriber(duration=150))
     assert len(trims) == 1 and seen[0].end == pytest.approx(trims[0].end - 3)
+    # round 1: the hard length clamp (payoff allowance) and the quiet level reach the fit;
+    # interior idle gaps of the fitted pick reach the render
+    assert kws[0] == {"max_s": s.max_clip_s + 5.0, "quiet_db": s.silence_db}
+    assert gaps == [seen[0]] and seen_kw[0]["idle_gaps"] == [(25.0, 27.0)]
     side = json.loads(clip.with_suffix(".json").read_text(encoding="utf-8"))
     assert side["source_video_kbps"] > 0
+
+
+# --- wave G-select round 1: signals cache -------------------------------------------------------
+
+
+@pytest.fixture
+def signals_inputs(fixture_video, tmp_path):
+    from hookline.media.ffmpeg import extract_audio
+
+    wav = extract_audio(fixture_video, tmp_path / "audio.wav")
+    transcript = FakeTranscriber(duration=150).transcribe(wav)
+    job = tmp_path / "job"
+    job.mkdir()
+    return job, fixture_video, wav, transcript
+
+
+def test_signals_cache_keeps_motion_and_recomputes_only_the_onsets(signals_inputs, monkeypatch):
+    from hookline.pipeline import run as run_mod
+    from hookline.pipeline.signals import SIGNALS_VERSION
+
+    job, src, wav, transcript = signals_inputs
+    run_mod._signals(job, src, wav, transcript, lambda m: None)
+    sig = json.loads((job / "signals.json").read_text(encoding="utf-8"))
+    assert sig["version"] == SIGNALS_VERSION >= 3 and sig["onset_times"] == []
+    # a version-2 cache (no exact onset times) keeps its VOD motion decode
+    sig.update({"version": 2, "motion": [7.0] * 150})
+    del sig["onset_times"], sig["transient_times"]
+    (job / "signals.json").write_text(json.dumps(sig), encoding="utf-8")
+
+    def no_decode(src):
+        raise AssertionError("motion re-decoded")
+
+    monkeypatch.setattr(run_mod, "frame_motion", no_decode)
+    out = run_mod._signals(job, src, wav, transcript, lambda m: None)
+    assert out.motion == [7.0] * 150 and out.version == SIGNALS_VERSION
+    assert out.onset_times == [] and out.transient_times == []
+    # a chat.json appearing later does not re-decode the motion either
+    chat = {"comments": [{"content_offset_seconds": 5.0, "message": {"body": "lol"}}]}
+    (job / "chat.json").write_text(json.dumps(chat), encoding="utf-8")
+    out = run_mod._signals(job, src, wav, transcript, lambda m: None)
+    assert out.chat is not None and out.motion == [7.0] * 150
+
+
+def test_a_failed_motion_analysis_is_retried_next_run(signals_inputs, monkeypatch):
+    from hookline.media.ffmpeg import FFmpegError
+    from hookline.pipeline import run as run_mod
+
+    job, src, wav, transcript = signals_inputs
+    real = run_mod.frame_motion
+
+    def broken(src):
+        raise FFmpegError("decode failed")
+
+    monkeypatch.setattr(run_mod, "frame_motion", broken)
+    assert run_mod._signals(job, src, wav, transcript, lambda m: None).motion is None
+    monkeypatch.setattr(run_mod, "frame_motion", real)
+    logs: list[str] = []
+    out = run_mod._signals(job, src, wav, transcript, logs.append)
+    assert out.motion and len(out.motion) >= 149
+    assert "[4/6] signals: skipped (cached)" not in logs

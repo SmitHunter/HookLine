@@ -172,3 +172,17 @@ def test_remap_judges_survival_on_the_protected_span_not_an_inflated_refined_end
     assert (out.start, out.end) == pytest.approx((1.0, 1.52))
     # a dropped line's word is still dropped when its protected span is mostly cut
     assert remap_words([w(10.3, 11.2, "up.")], keep, judge_ends=[10.9]) == []
+
+
+def test_cut_gaps_removes_extra_gaps_from_the_keep_ranges():
+    from hookline.pipeline.deadair import cut_gaps
+
+    keep = [(10.0, 20.0), (21.0, 40.0)]
+    assert cut_gaps(keep, [(12.4, 19.6)]) == [(10.0, 12.4), (19.6, 20.0), (21.0, 40.0)]
+    assert cut_gaps(keep, [(19.0, 22.0), (30.0, 31.0)]) == [
+        (10.0, 19.0),
+        (22.0, 30.0),
+        (31.0, 40.0),
+    ]
+    assert cut_gaps(keep, []) == keep
+    assert cut_gaps(keep, [(19.98, 20.5)]) == [(10.0, 19.98), (21.0, 40.0)]

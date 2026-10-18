@@ -13,7 +13,7 @@ from hookline.media.audio import MOMENTARY_HOP, momentary_db, rms_per_second
 from hookline.media.ffmpeg import FFmpegError, extract_audio, pick_encoder, probe_video_kbps
 from hookline.media.motion import frame_motion
 from hookline.models import ClipPick, Transcript, Word
-from hookline.pipeline.boundaries import fit_to_signals
+from hookline.pipeline.boundaries import fit_to_signals, idle_gaps
 from hookline.pipeline.chat import chat_keywords, chat_rate, try_fetch_chat
 from hookline.pipeline.ingest import find_source, ingest, job_id_for
 from hookline.pipeline.package import apply_caption_fixes, package_clips
@@ -22,10 +22,11 @@ from hookline.pipeline.select import NoClipsSelectedError, select_clips
 from hookline.pipeline.signals import (
     SIGNALS_VERSION,
     Signals,
-    audio_onsets,
     heat_markers,
     heat_seconds,
     loud_seconds,
+    onset_times,
+    seconds_of,
 )
 from hookline.transcribe import Transcriber
 from hookline.transcribe.base import words_to_transcript
@@ -34,6 +35,7 @@ from hookline.vision.faces import FaceDetector
 STAGES = 6
 PICKS_SCHEMA = 7  # bump when picks change shape or meaning, so old picks.json re-select
 PACKAGE_SCHEMA = 3  # bump when the packaging pass changes, so old package.json re-runs
+PAYOFF_ALLOWANCE_S = 5.0  # a clip may run this far over max_clip_s (select's payoff extension)
 
 
 def transcript_key(transcriber: Transcriber) -> dict:
@@ -166,53 +168,63 @@ def _package(
 def _signals(
     job_dir: Path, src: Path, wav: Path, transcript: Transcript, log: Callable[[str], None]
 ) -> Signals:
+    """signals.json, recomputing only what is missing or stale: chat when chat.json exists but
+    the cache has no chat (or no reaction kinds), the audio onsets when the cache is below
+    SIGNALS_VERSION, the VOD motion decode (the slow part) only when the cache has none. A
+    failed onset or motion analysis is stored as missing, so the next run retries it."""
     spath = job_dir / "signals.json"
     cpath = job_dir / "chat.json"
+    cached: Signals | None = None
     if spath.exists():
         try:
             cached = Signals.model_validate_json(spath.read_text(encoding="utf-8"))
-            chat_ok = (cached.chat is not None and cached.chat_kinds is not None) or (
-                not cpath.exists()
-            )
-            if chat_ok and cached.version >= SIGNALS_VERSION:
-                log("[4/6] signals: skipped (cached)")
-                return cached
         except ValueError:
             log("warning: signals.json is corrupt; recomputing")
+    chat_stale = cpath.exists() and (
+        cached is None or cached.chat is None or cached.chat_kinds is None
+    )
+    onsets_stale = cached is None or cached.version < SIGNALS_VERSION or cached.onset_times is None
+    motion_stale = cached is None or cached.motion is None
+    if cached is not None and not (chat_stale or onsets_stale or motion_stale):
+        log("[4/6] signals: skipped (cached)")
+        return cached
     log("[4/6] signals: started")
     duration = transcript.duration
-    chat = None
-    kinds = None
-    if cpath.exists():
+    update: dict = {"version": SIGNALS_VERSION}
+    if cached is None:
+        update |= {"chat": None, "chat_kinds": None}
+    if chat_stale:
         try:
             raw = json.loads(cpath.read_text(encoding="utf-8"))
             raw = raw if isinstance(raw, dict) else {}
-            chat = chat_rate(raw, duration)
-            kinds = {s: dict(c) for s, c in chat_keywords(raw, duration).items()}
+            update["chat"] = chat_rate(raw, duration)
+            update["chat_kinds"] = {s: dict(c) for s, c in chat_keywords(raw, duration).items()}
         except (ValueError, OSError) as e:
             log(f"warning: chat.json unreadable ({e}); continuing without chat signals")
-    speech = [(w.start, w.end) for w in transcript.words()]
-    onsets: list[int] | None = None
-    transients: list[int] | None = None
-    try:
-        onsets, transients = audio_onsets(momentary_db(wav), MOMENTARY_HOP, speech)
-    except (FFmpegError, wave.Error, EOFError) as e:
-        log(f"warning: audio onset analysis failed ({e}); continuing without scare signals")
-    try:
-        motion = frame_motion(src)
-    except FFmpegError as e:
-        log(f"warning: motion analysis failed ({e}); continuing without visual signals")
-        motion = None
-    signals = Signals(
-        duration=duration,
-        loudness=rms_per_second(wav),
-        chat=chat,
-        chat_kinds=kinds,
-        version=SIGNALS_VERSION,
-        motion=motion,
-        onsets=onsets,
-        transients=transients,
-    )
+    if onsets_stale:
+        speech = [(w.start, w.end) for w in transcript.words()]
+        try:
+            every, game = onset_times(momentary_db(wav), MOMENTARY_HOP, speech)
+            update |= {
+                "onset_times": every,
+                "transient_times": game,
+                "onsets": seconds_of(every),
+                "transients": seconds_of(game),
+            }
+        except (FFmpegError, wave.Error, EOFError) as e:
+            log(f"warning: audio onset analysis failed ({e}); continuing without scare signals")
+            update |= {"onset_times": None, "transient_times": None}
+            update |= {"onsets": None, "transients": None}
+    if motion_stale:
+        try:
+            update["motion"] = frame_motion(src)
+        except FFmpegError as e:
+            log(f"warning: motion analysis failed ({e}); continuing without visual signals")
+            update["motion"] = None
+    if cached is None:
+        signals = Signals(duration=duration, loudness=rms_per_second(wav), **update)
+    else:
+        signals = cached.model_copy(update=update)
     atomic_write_text(spath, signals.model_dump_json())
     log("[4/6] signals: done")
     return signals
@@ -347,14 +359,23 @@ def run_job(
     clips: list[Path] = []
     for i, pick in enumerate(picks, 1):
         dst = out_dir / f"{i:02d}-{slugify(pick.title)}.mp4"
-        # the cause of an opening reaction pulled in; no death-screen / menu tails
-        trimmed = fit_to_signals(pick, words, signals)
+        # the cause of an opening reaction pulled in; no death-screen / menu tails; the final
+        # hard length clamp (max_clip_s + the payoff allowance, the end tail not counted)
+        trimmed = fit_to_signals(
+            pick,
+            words,
+            signals,
+            max_s=settings.max_clip_s + PAYOFF_ALLOWANCE_S,
+            quiet_db=settings.silence_db,
+        )
         if trimmed != pick:
             log(
                 f"clip {i:02d}: fitted to signals {pick.start:.2f}-{pick.end:.2f} -> "
                 f"{trimmed.start:.2f}-{trimmed.end:.2f}"
             )
             pick = trimmed
+        # still, quiet, wordless stretches inside the clip are cut like dead air
+        gaps = idle_gaps(pick, words, signals, quiet_db=settings.silence_db)
         try:
             extras = render_clip(
                 src,
@@ -368,6 +389,7 @@ def run_job(
                 protect_words=protect,
                 encoder=encoder,
                 loud_seconds=loud,
+                idle_gaps=gaps,
             )
         except (FFmpegError, ValueError, OSError) as e:
             reason = (str(e).splitlines() or [type(e).__name__])[0]

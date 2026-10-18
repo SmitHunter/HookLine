@@ -529,3 +529,23 @@ def test_audit_reads_the_source_bitrate_from_the_sidecar(good_mp4, tmp_path, mon
     audit_clip(good_mp4, _sidecar(source_video_kbps=1059.1), _ass(tmp_path))
     audit_clip(good_mp4, _sidecar(), _ass(tmp_path))
     assert seen == [1059.1, None]
+
+
+def test_audit_job_probes_the_workspace_source_for_old_sidecars(good_mp4, tmp_path, monkeypatch):
+    import shutil
+
+    from hookline import quality as q
+
+    seen = []
+    real = q._check_encode
+    monkeypatch.setattr(
+        q, "_check_encode", lambda info, src=None: seen.append(src) or real(info, src)
+    )
+    out, ws = _job(tmp_path, good_mp4)
+    audit_job(out / "job1", ws / "job1")  # no source in the workspace: the 5000 kb/s bar
+    shutil.copy(good_mp4, ws / "job1" / "source.mp4")
+    audit_job(out / "job1", ws / "job1")
+    side = out / "job1" / "01-good.json"
+    side.write_text(json.dumps(_sidecar(source_video_kbps=1059.1)), encoding="utf-8")
+    audit_job(out / "job1", ws / "job1")
+    assert seen[0] is None and seen[1] > 0 and seen[2] == 1059.1

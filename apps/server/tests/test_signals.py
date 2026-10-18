@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from hookline.pipeline.signals import (
     CLIP_MARKER,
@@ -215,3 +216,46 @@ def test_low_motion_spans():
 def test_signals_without_new_fields_are_an_old_version():
     old = Signals.model_validate_json('{"duration": 5, "loudness": [-30.0]}')
     assert old.version < SIGNALS_VERSION and old.motion is None and old.transients is None
+
+
+# --- wave G-select round 1: speech pad, exact onset times -------------------------------------
+
+
+def test_speech_pad_is_point_three_seconds():
+    from hookline.pipeline.signals import SPEECH_PAD_S
+
+    assert SPEECH_PAD_S == 0.3
+    db = _env(60)
+    db[203:215] = -15.0  # 20.3 s: 0.25 s after a word that ended at 20.05 s
+    every, game = audio_onsets(db, 0.1, [(19.5, 20.05)])
+    assert every == [20] and game == []
+
+
+def test_onset_times_are_exact_and_one_per_jump():
+    from hookline.pipeline.signals import onset_times
+
+    db = _env(60)
+    db[203:215] = -15.0  # 20.3 s, several frames over the jump
+    db[507:515] = -15.0  # 50.7 s, inside speech
+    every, game = onset_times(db, 0.1, [(50.5, 51.0)])
+    assert every == [pytest.approx(20.3), pytest.approx(50.7)]
+    assert game == [pytest.approx(20.3)]
+
+
+def test_scare_times_prefer_exact_onsets():
+    from hookline.pipeline.signals import scare_times
+
+    motion = [2.0] * 100
+    motion[30] = 90.0
+    sig = _sig(
+        motion=motion,
+        onsets=[12, 31],
+        transients=[12],
+        onset_times=[12.4, 31.2],
+        transient_times=[12.4],
+    )
+    # the transient at 12.4; the flash at 30 takes its sound's onset time
+    assert scare_times(sig) == [pytest.approx(12.4), pytest.approx(31.2)]
+    # signals without exact times fall back to the seconds
+    old = _sig(motion=motion, onsets=[12, 31], transients=[12])
+    assert scare_times(old) == [12.0, 30.0]

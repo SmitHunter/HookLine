@@ -43,7 +43,7 @@ from hookline.media.reframe import (
 from hookline.media.subtitles import fonts_dir, subtitles_filter
 from hookline.models import ClipPick, Word
 from hookline.pipeline.boundaries import refine_boundaries
-from hookline.pipeline.deadair import keep_ranges, remap_words, snap_ranges
+from hookline.pipeline.deadair import cut_gaps, keep_ranges, remap_words, snap_ranges
 from hookline.pipeline.layout import SceneLayout, plan_layouts
 from hookline.pipeline.timing import (
     protected_words,
@@ -208,6 +208,7 @@ def render_clip(
     protect_words: bool = True,
     encoder: str | None = None,
     loud_seconds: set[int] | None = None,
+    idle_gaps: list[tuple[float, float]] | None = None,
 ) -> dict:
     """Write the finished clip to `dst`; returns sidecar extras (segments, layout, keep_ranges,
     removed_s, cut_times, zoom_steps, zoom_levels, overlay_bands, seam, ass, ass_sha1,
@@ -234,7 +235,8 @@ def render_clip(
 
     `protect_words` keeps dead-air cuts out of word spans; pass False for
     segment-interpolated word times, which tile the timeline with no gaps. `encoder` is the
-    final video encoder (resolved by `pick_encoder()` when None; pass it to avoid re-probing)."""
+    final video encoder (resolved by `pick_encoder()` when None; pass it to avoid re-probing).
+    `idle_gaps` (source seconds, `boundaries.idle_gaps`) are cut like dead air."""
     work_dir.mkdir(parents=True, exist_ok=True)
     dst.parent.mkdir(parents=True, exist_ok=True)
     name = dst.stem.split("-", 1)[0]
@@ -267,8 +269,9 @@ def render_clip(
         settings.dead_air_pad_s,
         words=protected if protect_words else None,
     )
+    untailed = cut_gaps(untailed, idle_gaps or [])
     tailed = untailed if voice_db is None else _with_tail(untailed, near, env, voice_db)
-    keep = snap_ranges(tailed, fps, keep_gaps=refined.drops)
+    keep = snap_ranges(tailed, fps, keep_gaps=[*refined.drops, *(idle_gaps or [])])
     # words starting in the tail (no audible onset: see `tail_end`) are not captioned
     heard = [i for i, w in enumerate(near) if not untailed or w.start < untailed[-1][1] - 1e-6]
     spoken = [near[i] for i in heard]

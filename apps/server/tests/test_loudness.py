@@ -145,7 +145,9 @@ def test_high_crest_clip_lands_on_target(
     m = measure_loudness(dst)
     print(f"high crest -> I={m.i} TP={m.tp}")
     # wave G-select: the whole clip may sit up to SPEECH_SWAY_DB off -14 so its speech lands
-    # on -14 (its "words" are the loud bursts here)
+    # on -14 (its "words" are the loud bursts here). Round 1: the firm rungs' 1.2 s release
+    # cannot level under full-scale clicks every 0.43 s, so this clip ends on the dynamic path
+    # (no sway, but dynamic loudnorm's own range control lands ~0.5 dB under): +-1 kept
     assert m.i == pytest.approx(-14.0, abs=0.5 + SPEECH_SWAY_DB)
     assert m.tp <= -1.0
 
@@ -374,3 +376,98 @@ def test_render_passes_the_spoken_spans_to_the_loudness_plan(
     _render(quiet_speech_video, tmp_path, sample_pick, settings, final_argvs)
     (spans,) = seen
     assert spans and all(b > a for a, b in spans) and spans[0][0] < 1.0
+
+
+# --- wave G-select round 1: leveler release/knee, ladder bookkeeping --------------------------
+
+
+def test_firm_leveler_rungs_release_slowly_with_a_soft_knee():
+    import re
+
+    from hookline.media.loudness import prefilter
+
+    def opts(level):
+        leveler = prefilter(0.0, level).split("volume=", 1)[1]  # after the base compressor
+        m = re.search(r"acompressor=threshold=[^,]*", leveler)
+        return dict(kv.split("=") for kv in m.group(0).split(":")[1:])
+
+    for level in (3, 4, 5):
+        assert float(opts(level)["release"]) >= 1000 and float(opts(level)["knee"]) >= 6
+    assert float(opts(1)["release"]) == 300  # gentle rungs: unchanged
+
+
+def _ladder_fake(loud_mod, calls, lra_for, i_miss=1.0, s_i=None):
+    """A measure_loudness stand-in: the chain always lands `i_miss` dB under -14 with a hot
+    peak (so the pre-gain keeps being corrected); `lra_for(level, nth)` the range."""
+    import re
+
+    seen: dict[int, int] = {}
+
+    def fake(path, pre=None):
+        calls.append(pre)
+        if pre == loud_mod.COMPRESSOR:
+            return _m(-30.0, tp=-20.0, lra=12.0)
+        if "aselect" in (pre or ""):
+            return _m(s_i if s_i is not None else -14.0 - i_miss, tp=-3.0)
+        m = re.search(r"threshold=(-?[\d.]+)dB:ratio=([\d.]+)", pre.split("volume=", 1)[1])
+        level = 0
+        if m:
+            level = 1 + [round(-14 + o, 3) for o, _ in loud_mod.LEVELERS].index(float(m[1]))
+        seen[level] = seen.get(level, 0) + 1
+        return _m(-14.0 - i_miss, tp=-2.5, lra=lra_for(level, seen[level]))
+
+    return fake
+
+
+def test_ladder_resets_passes_on_a_climb_and_keeps_makeup_corrections(monkeypatch, tmp_path):
+    from hookline.media import loudness as loud_mod
+
+    calls = []
+    # level 0: natural first, then over the range once the gain moved; level 1: over after
+    # its first correction; level 2: fine
+    lra = {0: [7.0, 9.0], 1: [7.0, 9.0]}
+    fake = _ladder_fake(loud_mod, calls, lambda lv, n: lra.get(lv, [7.0, 7.0])[min(n, 2) - 1])
+    monkeypatch.setattr(loud_mod, "measure_loudness", fake)
+    loud_mod.plan_loudness(tmp_path / "x.mkv")
+    lv1 = [c for c in calls if c and "threshold=-10dB" in c]
+    lv2 = [c for c in calls if c and "threshold=-14dB" in c]
+    # a full set of passes after the climb (then the hot peak sends loudnorm dynamic, whose
+    # chain gets its own gain corrections)
+    assert len(lv1) == 2 and len(lv2) == loud_mod.PREGAIN_PASSES + loud_mod.DYNAMIC_PASSES
+    # level 1's +1 dB correction is kept on level 2 (its rung makeup is 0)
+    assert "volume=1.00dB,aresample" in lv2[0]
+
+
+def test_ladder_decodes_are_capped(monkeypatch, tmp_path):
+    from hookline.media import loudness as loud_mod
+
+    calls = []
+    # every rung looks fine once, then over the range: the worst case for the ladder
+    fake = _ladder_fake(loud_mod, calls, lambda lv, n: 7.0 if n == 1 else 9.0)
+    monkeypatch.setattr(loud_mod, "measure_loudness", fake)
+    speech = [(k * 2.0, k * 2.0 + 1.5) for k in range(10)]
+    loud_mod.plan_loudness(tmp_path / "x.mkv", speech=speech)
+    assert len(calls) <= loud_mod.MAX_DECODES <= 24
+
+
+def test_silent_gated_speech_does_not_climb_the_ladder(monkeypatch, tmp_path):
+    from hookline.media import loudness as loud_mod
+
+    calls = []
+    fake = _ladder_fake(loud_mod, calls, lambda lv, n: 6.0, i_miss=0.0, s_i=-60.0)
+    monkeypatch.setattr(loud_mod, "measure_loudness", fake)
+    speech = [(k * 2.0, k * 2.0 + 1.5) for k in range(10)]
+    loud_mod.plan_loudness(tmp_path / "x.mkv", speech=speech)
+    assert not any("threshold=-10dB" in (c or "") for c in calls)  # not "buried"
+
+
+def test_dynamic_loudnorm_aims_the_whole_clip_at_the_target(monkeypatch, tmp_path):
+    from hookline.media import loudness as loud_mod
+
+    calls = []
+    # the range never fits loudnorm's linear mode; the speech sits 2 dB under the clip
+    fake = _ladder_fake(loud_mod, calls, lambda lv, n: 12.0, i_miss=0.0, s_i=-16.0)
+    monkeypatch.setattr(loud_mod, "measure_loudness", fake)
+    speech = [(k * 2.0, k * 2.0 + 1.5) for k in range(10)]
+    plan = loud_mod.plan_loudness(tmp_path / "x.mkv", speech=speech)
+    assert plan.mode == "dynamic" and "loudnorm=I=-14:" in plan.af  # no speech sway

@@ -139,10 +139,25 @@ LEVELERS = (
     (-8.0, 6.0),
     (-12.0, 8.0),
 )
-LEVELER = "acompressor=threshold={thr:g}dB:ratio={ratio:g}:attack=20:release=300:makeup=1"
+LEVELER = (
+    "acompressor=threshold={thr:g}dB:ratio={ratio:g}:attack=20:release={rel:g}:knee={knee:g}"
+    ":makeup=1"
+)
+# Rungs from FIRM_RUNG on (up to +10 dB of makeup) release slowly over a soft knee, so the game
+# bed and noise floor do not swell back up in the gaps between words (pumping).
+FIRM_RUNG = 3
+GENTLE_RELEASE_MS, FIRM_RELEASE_MS = 300, 1200
+GENTLE_KNEE_DB, FIRM_KNEE_DB = 2.83, 6.0
 # The final loudnorm aims the whole clip so the speech lands on TARGET_I, but never more than
 # this far from TARGET_I (Q1: -14 +/- 1 LUFS for the whole clip).
 SPEECH_SWAY_DB = 0.5
+# Measurement decodes one plan may spend (the initial one or two included); typical clips
+# take 3-8, a pathological ladder stops here with the best chain so far.
+MAX_DECODES = 24
+# A chain within this of its aim is at its final level: its loudness range can be judged.
+SETTLED_DB = 1.0
+DYNAMIC_PASSES = 2  # gain corrections bringing a dynamic plan's chain onto the target ...
+DYNAMIC_TOL_DB = 0.3  # ... until it is this close
 MIN_SPEECH_S = 3.0  # less speech than this is not gated (too little to measure)
 _SPEECH_JOIN_S = 0.3  # word spans closer than this are measured as one stretch
 # The limiter runs at 192 kHz in the final encode too. loudnorm's measuring (dynamic) pass
@@ -160,7 +175,11 @@ def prefilter(gain_db: float, level: int = 0, makeup_db: float = 0.0) -> str:
     if level:
         off, ratio = LEVELERS[level - 1]
         thr = TARGET_I + off
-        leveler = LEVELER.format(thr=thr, ratio=ratio) + f",volume={makeup_db:.2f}dB,"
+        firm = level >= FIRM_RUNG
+        rel = FIRM_RELEASE_MS if firm else GENTLE_RELEASE_MS
+        knee = FIRM_KNEE_DB if firm else GENTLE_KNEE_DB
+        leveler = LEVELER.format(thr=thr, ratio=ratio, rel=rel, knee=knee)
+        leveler += f",volume={makeup_db:.2f}dB,"
     lim = LIMITER.format(lim=10 ** (LIMIT_DB / 20))
     return f"{COMPRESSOR},volume={gain_db:.2f}dB,{leveler}aresample={LIMIT_RATE},{lim}"
 
@@ -214,7 +233,12 @@ def plan_loudness(path: Path, speech: list[tuple[float, float]] | None = None) -
     MAX_LRA, or its speech sits more than SPEECH_SWAY_DB under the whole clip (voice under
     game), the leveler climbs one rung of LEVELERS. loudnorm then aims the whole clip so the
     speech lands on the target, within SPEECH_SWAY_DB of it (`_aim`). Each measurement costs
-    one decode of the clip's audio (at most PREGAIN_PASSES + len(LEVELERS), twice when gated)."""
+    one decode of the clip's audio (twice when gated), at most MAX_DECODES in all.
+
+    Each rung climbed gets a fresh set of PREGAIN_PASSES; makeup corrections made on a rung
+    carry over to the next (on top of its own rung makeup). When loudnorm will still run in
+    dynamic mode, it aims at the target itself (no speech sway): dynamic mode lands the
+    whole clip on its target, and the sway would only eat Q1's margin."""
     c = measure_loudness(path, COMPRESSOR)
     if c is None:
         return None
@@ -223,31 +247,63 @@ def plan_loudness(path: Path, speech: list[tuple[float, float]] | None = None) -
     target = _target_i(c)
     gate = speech_filter(speech)
     sc = measure_loudness(path, _gated(COMPRESSOR, gate)) if gate else None
+    decodes = 2 if gate else 1
+    per_pass = 2 if gate else 1
     gain = target - (sc.i if sc and sc.i >= SILENCE_FLOOR_LUFS else c.i)
     gain = min(gain, target - c.i + MAX_GAIN_DB / 2)  # a near-silent voice: no huge boost
-    level, makeup, passes = 0, 0.0, 0
+    level, correction, passes = 0, 0.0, 0
     while True:
+        makeup = _rung_makeup(level) + correction if level else 0.0
         pre = prefilter(gain, level, makeup)
         m = measure_loudness(path, pre)
         s = measure_loudness(path, _gated(pre, gate)) if gate else None
+        decodes += per_pass
         aim = _aim(target, m, s)
         log.info(
             "audio: pre-gain %.2f dB, leveler %d (+%.2f dB) -> I=%.2f TP=%.2f LRA=%.1f%s",
             gain, level, makeup, m.i, m.tp, m.lra, f" speech I={s.i:.2f}" if s else "",
         )  # fmt: skip
-        buried = s is not None and m.i - s.i > SPEECH_SWAY_DB
-        if (m.lra > MAX_LRA or buried) and level < len(LEVELERS):
-            level += 1
-            makeup = _rung_makeup(level)
-            continue
+        budget = decodes + per_pass <= MAX_DECODES
+        audible = s is not None and s.i >= SILENCE_FLOOR_LUFS
+        buried = audible and m.i - s.i > SPEECH_SWAY_DB
         passes += 1
         miss = aim - m.i
-        if m.tp + miss <= FINAL_TP or passes >= PREGAIN_PASSES:
+        # the range is only judged near the final level: the noise floor's share of it
+        # moves with the gain (LRA's absolute gate)
+        settled = abs(miss) <= SETTLED_DB or passes >= PREGAIN_PASSES
+        climb = (m.lra > MAX_LRA or buried) and level < len(LEVELERS) and budget
+        if climb and settled:
+            level += 1
+            passes = 0
+            continue
+        if not climb and (m.tp + miss <= FINAL_TP or passes >= PREGAIN_PASSES or not budget):
             break
         if level:
-            makeup += miss
+            correction += miss
         else:
             gain += miss
+    if loudnorm_mode(m, aim) == "dynamic":
+        # dynamic loudnorm lands the whole clip on its target (no speech sway, which would
+        # only eat Q1's margin), but undershoots when it must also add gain into its limiter:
+        # the chain itself is brought to the target first
+        aim = target
+        for _ in range(DYNAMIC_PASSES):
+            miss = aim - m.i
+            if abs(miss) <= DYNAMIC_TOL_DB or decodes + 1 > MAX_DECODES:
+                break
+            if level:
+                correction += miss
+            else:
+                gain += miss
+            makeup = _rung_makeup(level) + correction if level else 0.0
+            pre = prefilter(gain, level, makeup)
+            m = measure_loudness(path, pre)
+            decodes += 1
+            log.info(
+                "audio: dynamic: pre-gain %.2f dB, leveler %d (+%.2f dB) -> I=%.2f TP=%.2f",
+                gain, level, makeup, m.i, m.tp,
+            )  # fmt: skip
+    log.info("audio: loudness plan took %d decodes", decodes)
     return AudioPlan(af=loudnorm_filter(m, pre, aim), mode=loudnorm_mode(m, aim))
 
 

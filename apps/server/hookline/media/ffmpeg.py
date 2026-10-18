@@ -43,11 +43,16 @@ def encoder_args(encoder: str) -> list[str]:
     return ["-c:v", encoder, *_ENCODER_QUALITY_ARGS.get(encoder, []), *extra]
 
 
-@functools.cache
+_AMF_BF: list[bool] = []  # the probe's definitive answer, once known
+
+
 def amf_b_frames() -> bool:
-    """Whether h264_amf really writes B-frames with `-bf 2` (probed once: a 10-frame encode
-    whose stream must report a B-frame delay). False on any failure: no AMF, an older GPU
-    that refuses B-frames, or one that silently drops them."""
+    """Whether h264_amf really writes B-frames with `-bf 2` (a 10-frame encode whose stream
+    must report a B-frame delay). False when the encode fails (no AMF, an older GPU that
+    refuses B-frames, a busy device) or drops them. Only a definitive answer is kept for the
+    process (the encode worked, with or without B-frames); a failed encode is re-probed."""
+    if _AMF_BF:
+        return _AMF_BF[0]
     with tempfile.TemporaryDirectory(prefix="hookline-bf-") as tmp:
         out = Path(tmp) / "bf.mp4"
         try:
@@ -63,9 +68,14 @@ def amf_b_frames() -> bool:
                 ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
                  "stream=has_b_frames", "-of", "csv=p=0", str(out)]
             )  # fmt: skip
-            return int(res.stdout.strip() or 0) > 0
+            found = int(res.stdout.strip() or 0) > 0
         except (FFmpegError, ValueError):
             return False
+    _AMF_BF.append(found)
+    return found
+
+
+amf_b_frames.cache_clear = _AMF_BF.clear  # type: ignore[attr-defined]
 
 
 class FFmpegError(Exception):

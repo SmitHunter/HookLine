@@ -81,6 +81,23 @@ def _drop_short_pieces(
     return cuts
 
 
+def cut_gaps(
+    keep: list[tuple[float, float]], gaps: list[tuple[float, float]]
+) -> list[tuple[float, float]]:
+    """`keep` with every `gaps` range (source seconds) cut out of it, e.g. the interior idle
+    stretches of `boundaries.idle_gaps`; pieces shorter than MIN_RANGE are dropped."""
+    out = list(keep)
+    for ga, gb in sorted(gaps):
+        nxt: list[tuple[float, float]] = []
+        for a, b in out:
+            if gb <= a or ga >= b:
+                nxt.append((a, b))
+                continue
+            nxt += [(x, y) for x, y in ((a, ga), (gb, b)) if y - x >= MIN_RANGE]
+        out = nxt
+    return out
+
+
 MERGE_GAP_S = 0.15
 
 
