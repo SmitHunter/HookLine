@@ -320,6 +320,49 @@ def test_q_static_skips_screen_frames_under_a_cover():
     assert _stream_hidden(side) == [(1.9, 8.1)]  # a beat's band still shows the gameplay
 
 
+def test_q_static_uses_the_cuts_colour_gate(monkeypatch, tmp_path):
+    """Dark, low-texture gameplay (a vent crawl) shown in a STACKED panel reads near uniform
+    and desaturated in the render; the cut judged it on the source's masked chroma (over the
+    gate: gameplay). The audit follows the cut; a real (grey) death screen still fails."""
+    import hookline.quality as q
+    from hookline.pipeline.signals import STATIC_CHROMA_MAX, Signals
+    from hookline.quality import _check_static, source_screen_frames
+
+    screen, chroma = [0] * 120, [None] * 120
+    for s in range(100, 104):  # dark gameplay: screen frames, coloured
+        screen[s], chroma[s] = 0b1111, STATIC_CHROMA_MAX + 0.8
+    for s in range(110, 114):  # a death screen: grey
+        screen[s], chroma[s] = 0b1111, 0.05
+    sig = Signals(duration=120.0, loudness=[-20.0] * 120, version=5, screen=screen,
+                  screen_chroma=chroma)  # fmt: skip
+    flags, out_chroma = [True] * 16, [0.3] * 16  # the render: uniform, desaturated
+    assert not _check_static(flags, 4, [], out_chroma).ok  # the false positive
+    dark = source_screen_frames({"keep_ranges": [[100.0, 104.0]]}, sig, 16, 4)
+    assert dark == [False] * 16
+    assert _check_static(flags, 4, [], out_chroma, source=dark).ok
+    death = source_screen_frames({"keep_ranges": [[110.0, 114.0]]}, sig, 16, 4)
+    assert not _check_static(flags, 4, [], out_chroma, source=death).ok
+    # output time follows the keep ranges in order: 2 s of gameplay, then 2 s of the screen
+    both = source_screen_frames({"keep_ranges": [[102.0, 104.0], [110.0, 112.0]]}, sig, 16, 4)
+    assert both == [False] * 8 + [True] * 8
+    # source gameplay that is no screen frame at all (the cam in the frame) is not either
+    assert source_screen_frames({"keep_ranges": [[50.0, 54.0]]}, sig, 16, 4) == [False] * 16
+    # no keep ranges or no screen data: the render's own measure
+    assert source_screen_frames({}, sig, 16, 4) is None
+    bare = Signals(duration=120.0, loudness=[-20.0] * 120)
+    assert source_screen_frames({"keep_ranges": [[100.0, 104.0]]}, bare, 16, 4) is None
+    # the stream checks take the job's signals
+    monkeypatch.setattr(q, "screen_frame_flags", lambda mp4: (flags, out_chroma))
+    side = {"keep_ranges": [[100.0, 104.0]], "scare_times": []}
+
+    def static(signals):
+        res = q._stream_checks(tmp_path / "x.mp4", side, [], 4.0, signals=signals)
+        return next(r for r in res if r.id == "Q-static")
+
+    assert not static(None).ok
+    assert static(sig).ok
+
+
 # --- covers: cuts, the hook and tag, punches on the cam ------------------------------------------
 
 

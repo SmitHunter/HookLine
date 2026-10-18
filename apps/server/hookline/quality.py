@@ -19,6 +19,7 @@ from hookline.fsutil import atomic_write_text
 from hookline.media.audio import SEAM_FRAME_S, seam_jump_db
 from hookline.media.ffmpeg import probe_duration, probe_video_kbps
 from hookline.media.loudness import measure_loudness
+from hookline.media.motion import MOTION_FPS
 from hookline.media.subtitles import fonts_dir, subtitles_filter
 from hookline.models import Word
 from hookline.pipeline.boundaries import (
@@ -31,7 +32,12 @@ from hookline.pipeline.boundaries import (
 from hookline.pipeline.ingest import find_source
 from hookline.pipeline.layout import SCARE_POST_S, SCARE_PRE_S, SceneLayout
 from hookline.pipeline.select import _OPENER_FILLERS, _START_FILLERS
-from hookline.pipeline.signals import STATIC_CHROMA_MAX, STATIC_VOICED_MAX
+from hookline.pipeline.signals import (
+    STATIC_CHROMA_MAX,
+    STATIC_VOICED_MAX,
+    Signals,
+    screen_runs,
+)
 from hookline.pipeline.timing import UNCAPTIONED_S  # Q3b: what the render reports
 
 OUT_W, OUT_H = 1080, 1920
@@ -720,10 +726,15 @@ def _hook_black(frame: np.ndarray) -> list[int]:
 
 
 def audit_clip(
-    mp4: Path, sidecar: dict, ass_path: Path | None, words: list[Word] | None = None
+    mp4: Path,
+    sidecar: dict,
+    ass_path: Path | None,
+    words: list[Word] | None = None,
+    signals: Signals | None = None,
 ) -> list[CheckResult]:
     """Q1-Q8 plus Q4b (caption, hook and tag off the face) for one rendered clip. `words` are
-    the clip's output-time spoken words; by default the sidecar's `caption_words`.
+    the clip's output-time spoken words; by default the sidecar's `caption_words`. `signals`
+    (the job's) give Q-static the cut's own screen decision.
     Caption and hook events are rendered separately over plain canvases (black for text
     measurement, grey for boxes), so neither hides or inflates the other."""
     if words is None and sidecar.get("caption_words") is not None:
@@ -785,7 +796,7 @@ def audit_clip(
         ),
         _check_pacing(sidecar, duration),
         _check_encode(_probe(mp4), sidecar.get("source_video_kbps")),
-        *_stream_checks(mp4, sidecar, words or [], duration),
+        *_stream_checks(mp4, sidecar, words or [], duration, signals),
     ]
 
 
@@ -827,6 +838,31 @@ def screen_frame_flags(mp4: Path, fps: int = STATIC_FPS) -> tuple[list[bool], li
     return [bool(f) for f in screen_frames(grey)], [float(c) for c in chroma]
 
 
+def source_screen_frames(
+    side: dict, signals: Signals | None, n: int, fps: float
+) -> list[bool | None] | None:
+    """Per output frame (`n` at `fps`): whether its source frame (output time mapped through
+    the sidecar's `keep_ranges`, in order) lies in a source screen run (`signals.screen_runs`:
+    the cut's own decision, the stream cam masked and colour gated by STATIC_CHROMA_MAX);
+    None for a frame past the keep ranges. None without keep ranges or screen data: the
+    render's own measure stands. The render shows dark gameplay smaller, darker and
+    desaturated, so its own chroma can read a death screen where the cut saw gameplay."""
+    keep = side.get("keep_ranges")
+    if not keep or signals is None or not signals.screen:
+        return None
+    runs = screen_runs(signals, MOTION_FPS, min_s=0.0)
+    out: list[bool | None] = []
+    for i in range(n):
+        t, src = (i + 0.5) / fps, None
+        for a, b in keep:
+            if t < b - a:
+                src = a + t
+                break
+            t -= b - a
+        out.append(None if src is None else any(lo <= src < hi for lo, hi in runs))
+    return out
+
+
 def _covered_s(words: list[Word], lo: float, hi: float) -> float:
     """Seconds of [lo, hi] under at least one word (overlapping words counted once)."""
     total, cur = 0.0, lo
@@ -844,16 +880,20 @@ def _check_static(
     words: list[Word],
     chroma: list[float] | None = None,
     hidden: list[tuple[float, float]] | None = None,
+    source: list[bool | None] | None = None,
 ) -> CheckResult:
     """Q-static: seconds of static / death / loading screen frames (`screen_frame_flags`; runs,
     single frames bridged, under words for at most STATIC_VOICED_MAX of their length and,
     with `chroma`, of mean chroma under STATIC_CHROMA_MAX: dark gameplay is coloured) at most
     STATIC_MAX_S. Frames inside the `hidden` spans (output s: full-cam covers, the screen not
-    shown) are not counted."""
+    shown) are not counted, nor, with `source` (`source_screen_frames`), frames whose source
+    frame the cut did not judge a screen (the same colour gate as the cut)."""
     thr = f"<= {STATIC_MAX_S:g}s of voiceless screen frames"
     runs: list[list[int]] = []
     for i, f in enumerate(flags):
-        if not f or any(a <= (i + 0.5) / fps < b for a, b in hidden or []):
+        if not f or (source is not None and i < len(source) and source[i] is False):
+            continue
+        if any(a <= (i + 0.5) / fps < b for a, b in hidden or []):
             continue
         if runs and i - runs[-1][1] <= 2:
             runs[-1][1] = i
@@ -970,13 +1010,21 @@ def _stream_hidden(side: dict) -> list[tuple[float, float]]:
     ]
 
 
-def _stream_checks(mp4: Path, side: dict, words: list[Word], duration: float) -> list[CheckResult]:
-    """Q-static, Q-voiceless, Q-seam and Q-beat: the stream editing checks."""
+def _stream_checks(
+    mp4: Path,
+    side: dict,
+    words: list[Word],
+    duration: float,
+    signals: Signals | None = None,
+) -> list[CheckResult]:
+    """Q-static, Q-voiceless, Q-seam and Q-beat: the stream editing checks. With the job's
+    `signals`, Q-static counts only frames the cut judged a screen (`source_screen_frames`)."""
     seam = side.get("seam")
     pcm = _clip_pcm(mp4) if seam is not None else np.zeros(0)
     flags, chroma = screen_frame_flags(mp4)
+    source = source_screen_frames(side, signals, len(flags), STATIC_FPS)
     return [
-        _check_static(flags, STATIC_FPS, words, chroma, hidden=_stream_hidden(side)),
+        _check_static(flags, STATIC_FPS, words, chroma, hidden=_stream_hidden(side), source=source),
         _check_voiceless(
             words,
             duration,
@@ -1003,13 +1051,24 @@ def _ass_for(mp4: Path, side: dict, work_dir: Path) -> tuple[Path | None, CheckR
     return ass, None
 
 
+def _job_signals(work_dir: Path) -> Signals | None:
+    """The job's signals.json (None when missing or unreadable)."""
+    path = work_dir / "signals.json"
+    try:
+        return Signals.model_validate_json(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
 def audit_job(out_dir: Path, work_dir: Path) -> dict:
     """Audit every `NN-*.mp4` in `out_dir` against its sidecar and the ASS file the sidecar
     records (verified by sha1; `render/NN.ass` for older sidecars), and write the report to
     `out_dir/audit.json`. A clip whose audit raises is reported as a failed "ERR" check.
     A sidecar without `source_video_kbps` (rendered before Q8 followed the source) gets the
-    job's workspace source probed for it (the 5000 kb/s bar when there is none)."""
+    job's workspace source probed for it (the 5000 kb/s bar when there is none). The
+    workspace's signals.json, when readable, gives Q-static the cut's screen decision."""
     clips = []
+    signals = _job_signals(work_dir)
     source_kbps: list[float | None] = []  # probed once, on the first sidecar that needs it
     for mp4 in sorted(out_dir.glob("*.mp4")):
         if mp4.name.endswith(".tmp.mp4"):
@@ -1024,7 +1083,9 @@ def audit_job(out_dir: Path, work_dir: Path) -> dict:
                     source_kbps.append(probe_video_kbps(src) if src else None)
                 side = {**side, "source_video_kbps": source_kbps[0]}
             ass, ass_check = _ass_for(mp4, side, work_dir)
-            results = ([ass_check] if ass_check else []) + audit_clip(mp4, side, ass)
+            results = ([ass_check] if ass_check else []) + audit_clip(
+                mp4, side, ass, signals=signals
+            )
         except Exception as e:  # noqa: BLE001 - one broken clip must not stop the audit
             msg = (str(e).splitlines() or [""])[0][:300]
             results = [
