@@ -220,6 +220,7 @@ def probe_fps(path: Path) -> float:
 
 _SEEK_PREROLL_S = 1.0
 SPLICE_FADE_S = 0.008  # audio fade out / in at every splice between segments
+SEAM_XFADE_S = 0.04  # the cold-open seam's audio crossfade (`cut_segments(crossfade_at=)`)
 
 
 def cut_segments(
@@ -229,6 +230,7 @@ def cut_segments(
     encoder: str,
     quality: list[str] | None = None,
     fps: float | None = None,
+    crossfade_at: int | None = None,
 ) -> Path:
     """Concatenate `segments` of `src` into `dst` (an intermediate: use `.mkv`, audio is
     uncompressed `pcm_s16le` so the final encode is the only lossy audio step). `quality`, when given, replaces the
@@ -238,7 +240,12 @@ def cut_segments(
     timeline is exactly the sum of the segments when their bounds lie on the source frame
     grid: video takes the frames whose timestamps fall in [start, end) (bounds shifted half a
     frame to absorb rounding), audio is sample-trimmed to the same span and fades out / in over
-    SPLICE_FADE_S at every join (lengths unchanged: the video stays frame-exact)."""
+    SPLICE_FADE_S at every join (lengths unchanged: the video stays frame-exact).
+
+    `crossfade_at` (wave H: the cold-open seam) is the index of the segment whose join with
+    the next one is an SEAM_XFADE_S audio crossfade instead: that segment's audio runs on
+    SEAM_XFADE_S past its end, fading out under the next one's fade-in (no dip, no step;
+    lengths still unchanged)."""
     if fps is None:
         fps = probe_fps(src)
     half = 0.5 / fps
@@ -246,30 +253,45 @@ def cut_segments(
     video = encoder_args(encoder) if quality is None else ["-c:v", encoder, *quality]
     cmd = ["ffmpeg", "-hide_banner", "-y"]
     parts = []
+    n = len(segments)
+    xf = crossfade_at if crossfade_at is not None and 0 <= crossfade_at < n - 1 else None
     for i, (start, end) in enumerate(segments):
         seek = max(0.0, round((start - _SEEK_PREROLL_S) * fps) / fps)
         a, b = start - seek, end - seek
         cmd += ["-ss", f"{seek:.6f}", "-t", f"{b + 1:.6f}", "-i", str(src)]
-        # an 8 ms fade on each side of every splice: no click where the waveform jumps
-        fades = ""
-        if i > 0:
+        # an 8 ms fade on each side of every splice: no click where the waveform jumps (the
+        # crossfaded join: none, acrossfade ramps both sides)
+        fades, a_end = "", b
+        if i > 0 and i - 1 != xf:
             fades += f",afade=t=in:st=0:d={SPLICE_FADE_S:g}"
-        if i + 1 < len(segments):
+        if i == xf:
+            a_end = b + SEAM_XFADE_S
+        elif i + 1 < n:
             fades += f",afade=t=out:st={max(b - a - SPLICE_FADE_S, 0.0):.6f}:d={SPLICE_FADE_S:g}"
         parts.append(
             f"[{i}:v]trim=start={max(a - half, 0):.6f}:end={b - half:.6f},"
             f"setpts=PTS-STARTPTS[v{i}]"
             + (
-                f";[{i}:a]atrim=start={a:.6f}:end={b:.6f},asetpts=PTS-STARTPTS{fades}[a{i}]"
+                f";[{i}:a]atrim=start={a:.6f}:end={a_end:.6f},asetpts=PTS-STARTPTS{fades}[a{i}]"
                 if with_audio
                 else ""
             )
         )
-    n = len(segments)
-    inputs = "".join(f"[v{i}][a{i}]" if with_audio else f"[v{i}]" for i in range(n))
     outs = "[v][a]" if with_audio else "[v]"
     script = dst.with_suffix(".graph.txt")
-    graph = ";".join(parts) + f";{inputs}concat=n={n}:v=1:a={int(with_audio)}{outs}"
+    if with_audio and xf is not None:
+        # video and audio concatenated apart: the crossfaded pair is one audio piece
+        auds = [f"[a{i}]" for i in range(n)]
+        parts.append(f"[a{xf}][a{xf + 1}]acrossfade=d={SEAM_XFADE_S:g}:c1=tri:c2=tri[ax{xf}]")
+        auds[xf : xf + 2] = [f"[ax{xf}]"]
+        vids = "".join(f"[v{i}]" for i in range(n))
+        graph = (
+            ";".join(parts)
+            + f";{vids}concat=n={n}:v=1:a=0[v];{''.join(auds)}concat=n={len(auds)}:v=0:a=1[a]"
+        )
+    else:
+        inputs = "".join(f"[v{i}][a{i}]" if with_audio else f"[v{i}]" for i in range(n))
+        graph = ";".join(parts) + f";{inputs}concat=n={n}:v=1:a={int(with_audio)}{outs}"
     cmd += [
         *filter_graph_args(graph, script),
         "-map",

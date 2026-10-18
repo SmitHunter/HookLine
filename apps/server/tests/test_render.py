@@ -393,13 +393,14 @@ def test_render_clip_cold_open_seam_flash_and_tag(
         fixture_video, fixture_wav, pick, fixture_words, tmp_path / "r", dst, settings, NoFaces()
     )
     seam = extras["seam"]
-    assert seam == pytest.approx(3.0, abs=0.05)
+    assert seam == pytest.approx(3.14, abs=0.03)  # wave H: speech on frame 0 -> 3-frame pre-roll
     assert seam in extras["cut_times"]
     graph = _graph(final_argvs[0])
     assert graph.count("drawbox=") == 3 and "color=white" in graph
     ass = (tmp_path / "r" / "02.ass").read_text(encoding="utf-8")
     (tag,) = [ln for ln in ass.splitlines() if "EARLIER" in ln]
-    assert ",Hook," in tag and tag.startswith("Dialogue: 1,0:00:03.00,0:00:04.20,")
+    t0, t1 = f"0:00:{seam:05.2f}", f"0:00:{seam + 1.2:05.2f}"
+    assert ",Hook," in tag and tag.startswith(f"Dialogue: 1,{t0},{t1},")
     fps = 25
     corner = (slice(0, 60), slice(0, 60))
     n = round(seam * fps)

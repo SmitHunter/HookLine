@@ -367,8 +367,11 @@ def _hold_ends(
 
 def _windows(has_hook: bool, duration: float, seam: float | None) -> tuple[float, float, float]:
     """(hook end, EARLIER tag start, tag end); both tag times equal the hook end when there
-    is no tag (no seam, or a seam at or past the end)."""
+    is no tag (no seam, or a seam at or past the end). Wave H: the tag shows at the seam; a
+    hook that would still be up then ends there."""
     hook_end = min(HOOK_S, duration) if has_hook else 0.0
+    if seam is not None and 0 < seam < hook_end:
+        hook_end = seam
     if seam is not None and max(seam, hook_end) < duration:
         start = max(seam, hook_end)
         return hook_end, start, min(start + SEAM_TAG_S, duration)

@@ -11,9 +11,9 @@ from hookline.fsutil import atomic_write_text, slugify
 from hookline.llm import LLMBackend
 from hookline.media.audio import MOMENTARY_HOP, momentary_db, rms_per_second
 from hookline.media.ffmpeg import FFmpegError, extract_audio, pick_encoder, probe_video_kbps
-from hookline.media.motion import frame_motion
+from hookline.media.motion import frame_stats
 from hookline.models import ClipPick, Transcript, Word
-from hookline.pipeline.boundaries import fit_to_signals, idle_gaps
+from hookline.pipeline.boundaries import edit_gaps, fit_to_signals
 from hookline.pipeline.chat import chat_keywords, chat_rate, try_fetch_chat
 from hookline.pipeline.ingest import find_source, ingest, job_id_for
 from hookline.pipeline.package import apply_caption_fixes, package_clips
@@ -171,8 +171,9 @@ def _signals(
 ) -> Signals:
     """signals.json, recomputing only what is missing or stale: chat when chat.json exists but
     the cache has no chat (or no reaction kinds), the audio onsets when the cache is below
-    SIGNALS_VERSION, the VOD motion decode (the slow part) only when the cache has none. A
-    failed onset or motion analysis is stored as missing, so the next run retries it."""
+    SIGNALS_VERSION, the VOD motion decode (the slow part; motion and screen frames) only when
+    the cache lacks either. A failed onset or motion analysis is stored as missing, so the next
+    run retries it."""
     spath = job_dir / "signals.json"
     cpath = job_dir / "chat.json"
     cached: Signals | None = None
@@ -185,7 +186,7 @@ def _signals(
         cached is None or cached.chat is None or cached.chat_kinds is None
     )
     onsets_stale = cached is None or cached.version < SIGNALS_VERSION or cached.onset_times is None
-    motion_stale = cached is None or cached.motion is None
+    motion_stale = cached is None or cached.motion is None or cached.screen is None
     if cached is not None and not (chat_stale or onsets_stale or motion_stale):
         log("[4/6] signals: skipped (cached)")
         return cached
@@ -218,10 +219,10 @@ def _signals(
             update |= {"onsets": None, "transients": None}
     if motion_stale:
         try:
-            update["motion"] = frame_motion(src)
+            update["motion"], update["screen"] = frame_stats(src)
         except FFmpegError as e:
             log(f"warning: motion analysis failed ({e}); continuing without visual signals")
-            update["motion"] = None
+            update["motion"] = update["screen"] = None
     if cached is None:
         signals = Signals(duration=duration, loudness=rms_per_second(wav), **update)
     else:
@@ -392,8 +393,9 @@ def run_job(
                 f"{trimmed.start:.2f}-{trimmed.end:.2f}"
             )
             pick = trimmed
-        # still, quiet, wordless stretches inside the clip are cut like dead air
-        gaps = idle_gaps(pick, words, signals, quiet_db=settings.silence_db)
+        # still, quiet, wordless stretches, static screens and long voiceless stretches inside
+        # the clip are cut like dead air
+        gaps = edit_gaps(pick, words, signals, quiet_db=settings.silence_db)
         try:
             extras = render_clip(
                 src,

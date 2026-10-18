@@ -588,3 +588,80 @@ def snap_splices(
                 out[k + 1][0] = new
     ranges = [(a, b) for a, b in out]
     return (ranges, words) if adjust else ranges
+
+
+# --- wave H: the cause sound before a segment, held word ends, frame-0 pre-roll ---------------
+
+CAUSE_LOOKBACK_S = 0.6  # a sharp onset this close before a segment start is its cause ...
+CAUSE_JUMP_DB = 15.0  # ... a rise of this much over the quietest of the preceding ...
+CAUSE_PRIOR_S = 0.1  # ... this long, landing over ...
+CAUSE_FLOOR_DB = -35.0  # ... this level; the segment then starts ...
+CAUSE_LEAD_S = 0.02  # ... this long before it
+HELD_WORD_S = 0.8  # a word longer than this ends with its voice (+ HELD_TAIL_S) ...
+HELD_TAIL_S = 0.1
+HELD_BRIDGE_S = 0.15  # ... its voiced runs bridged over dips this short
+HELD_MIN_S = 0.2
+HELD_DROP_DB = 15.0  # ... voiced = within this of its loudest frame (and over the threshold)
+PRE_ROLL_FRAMES = 3  # speech at a clip's first frame gets this many frames before it
+PRE_ROLL_NEAR_S = 0.05  # (speech this close to the start counts as frame 0)
+PRE_ROLL_SEARCH_S = 0.15  # after another word: the quietest frame this far back
+
+
+def cause_onset(env: Envelope, start: float, words: Sequence[Word]) -> float | None:
+    """Where a segment starting at `start` should start to include the cause of what follows:
+    CAUSE_LEAD_S before the earliest sharp onset (CAUSE_JUMP_DB over the quietest of the
+    CAUSE_PRIOR_S before it, over CAUSE_FLOOR_DB) within CAUSE_LOOKBACK_S before `start`
+    (a game bang the cut would split: a pop at the seam). None without one, or when a word
+    starting before the onset is still sounding there (the cut would show its fragment)."""
+    if not len(env.db) or not _covers(env, start - CAUSE_LOOKBACK_S):
+        return None
+    prior = max(1, _frames(env, CAUSE_PRIOR_S))
+    lo, hi = env.index(start - CAUSE_LOOKBACK_S), env.index(start - PRE_ROLL_NEAR_S)
+    for k in range(max(lo, prior), hi + 1):
+        before = env.db[k - prior : k].min()
+        if env.db[k] - before >= CAUSE_JUMP_DB and env.db[k] >= CAUSE_FLOOR_DB:
+            t = env.time(k)
+            if any(w.start < t and w.end > t - PRE_ROLL_NEAR_S for w in words):
+                return None
+            return round(max(t - CAUSE_LEAD_S, env.t0), 3)
+    return None
+
+
+def clamp_word_ends(words: list[Word], env: Envelope, threshold_db: float) -> list[Word]:
+    """`words` with a held end (longer than HELD_WORD_S: a word DTW / refinement stretched over
+    a pause or a game bed) ending HELD_TAIL_S after its voice (its first voiced runs, dips
+    under HELD_BRIDGE_S bridged), at most HELD_WORD_S long when no voice is found: a caption
+    never holds a word the speaker finished long ago. Ends only move earlier."""
+    out = []
+    for w in words:
+        if w.end - w.start <= HELD_WORD_S or not _covers(env, w.start):
+            out.append(w)
+            continue
+        i, j = env.index(w.start), env.index(w.start + HELD_WORD_S)
+        peak = float(env.db[i : max(j, i + 1)].max())
+        thr = max(threshold_db, peak - HELD_DROP_DB)  # a game bed under the voice is not it
+        runs = _voiced_runs(env, w.start, w.end, thr, bridge_s=HELD_BRIDGE_S)
+        runs = [r for r in runs if r[0] <= w.start + HELD_WORD_S]
+        end = w.start + HELD_WORD_S if not runs else runs[0][1] + HELD_TAIL_S
+        end = min(w.end, max(end, w.start + HELD_MIN_S))
+        out.append(w if end >= w.end else w.model_copy(update={"end": round(end, 3)}))
+    return out
+
+
+def pre_roll(env: Envelope, start: float, words: Sequence[Word], fps: float) -> float:
+    """A clip start whose speech begins on its first frame moved PRE_ROLL_FRAMES frames
+    earlier, so the voice does not start on frame 0 -- or, when another word sounds there,
+    into the quietest envelope frame within PRE_ROLL_SEARCH_S before `start` (never a
+    fragment of it). `start` unchanged when speech already starts later."""
+    first = min((w.start for w in words if w.start >= start - 0.01), default=None)
+    if first is None or first - start >= PRE_ROLL_NEAR_S:
+        return start
+    cand = start - PRE_ROLL_FRAMES / fps
+    prev = max((w.end for w in words if w.start < first - 1e-6), default=None)
+    if prev is None or prev <= cand:
+        return round(max(cand, 0.0), 3)
+    if not len(env.db) or not _covers(env, start - PRE_ROLL_SEARCH_S):
+        return start
+    lo, hi = env.index(start - PRE_ROLL_SEARCH_S), env.index(start - 0.02)
+    k = lo + int(np.argmin(env.db[lo : hi + 1]))
+    return round(min(env.time(k), start), 3)

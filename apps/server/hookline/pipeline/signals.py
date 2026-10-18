@@ -6,6 +6,8 @@ from statistics import median
 import numpy as np
 from pydantic import BaseModel
 
+from hookline.media.motion import MOTION_FPS
+
 _CHAT_WINDOW_S = 10
 _CHAT_BASELINE_S = 300
 _CHAT_RATIO = 2.5
@@ -19,8 +21,9 @@ CLIP_MARKER = "\u2702\ufe0fclip"
 SCARE_MARKER = "\u26a1scare"
 # signals.json format; a cached file below this version has its onsets recomputed (2: wave
 # G-select added motion, onsets and game-audio transients; 3: exact onset times, 0.3 s speech
-# pad). The VOD motion decode is kept from any cache that has it.
-SIGNALS_VERSION = 3
+# pad; 4: wave H per-frame screen flags). The VOD motion decode is kept from any cache that has
+# it and the screen flags.
+SIGNALS_VERSION = 4
 # Audio onsets (short-term loudness every 0.1 s, `media.audio.momentary_db`): a jump of
 # >= 10 dB within 0.5 s, landing >= 12 dB over the VOD's median level and over -35 dBFS.
 ONSET_JUMP_DB = 10.0
@@ -36,6 +39,15 @@ FLASH_LOCAL_S = 10
 FLASH_SOUND_S = 1  # a flash is a scare only with an audio onset within +-1 s
 SCARE_MERGE_S = 3  # scare seconds this close together are one marker
 LOW_MOTION = 3.0  # per-second motion below this is a still frame (death screen, menu, pause)
+# Wave H: a static screen (death / loading / menu screen, a fade) is a run of screen frames
+# (`media.motion.screen_frames`: near uniform or near white), single busy frames bridged,
+# lasting at least STATIC_MIN_S, with words over at most STATIC_VOICED_MAX of it (the
+# streamer's line over a death screen goes with it; dark gameplay he talks over stays). 3 s: a
+# horror stream's death / respawn sequences ran 16 s, its pitch-black corridors (with a
+# reaction "Oh," and a scare in them) ~2 s.
+STATIC_MIN_S = 3.0
+STATIC_VOICED_MAX = 0.4
+STATIC_BRIDGE_FRAMES = 1
 
 
 class Signals(BaseModel):
@@ -53,6 +65,9 @@ class Signals(BaseModel):
     # version 3: the same onsets and transients at their exact times (seconds)
     onset_times: list[float] | None = None
     transient_times: list[float] | None = None
+    # version 4 (wave H): per second, a bitmask of its MOTION_FPS frames that are screen frames
+    # (`media.motion.frame_stats`)
+    screen: list[int] | None = None
 
 
 def onset_times(
@@ -132,6 +147,50 @@ def scare_times(signals: Signals) -> list[float]:
         for s in flash_seconds(signals.motion):
             out |= {t for t in signals.onset_times if abs(int(t + 1e-9) - s) <= FLASH_SOUND_S}
     return sorted(out)
+
+
+def screen_flags(signals: Signals, fps: int = MOTION_FPS) -> np.ndarray:
+    """Per frame (`fps` per second) of the VOD: a screen frame. Empty without screen data."""
+    if not signals.screen:
+        return np.zeros(0, bool)
+    return np.array([bool(m >> k & 1) for m in signals.screen for k in range(fps)], dtype=bool)
+
+
+def _voiced_s(words: list, lo: float, hi: float) -> float:
+    spans = sorted((max(w.start, lo), min(w.end, hi)) for w in words if w.end > lo and w.start < hi)
+    total, cur = 0.0, lo
+    for a, b in spans:
+        a = max(a, cur)
+        if b > a:
+            total += b - a
+            cur = b
+    return total
+
+
+def static_runs(signals: Signals, words: list, fps: int = MOTION_FPS) -> list[tuple[float, float]]:
+    """Static screens (source s, frame-precise): runs of screen frames (`screen_flags`; gaps of
+    up to STATIC_BRIDGE_FRAMES busy frames bridged) lasting at least STATIC_MIN_S, with
+    `words` (the transcript) covering at most STATIC_VOICED_MAX of the run. Empty without
+    screen data."""
+    flags = screen_flags(signals, fps)
+    idx = np.flatnonzero(flags)
+    if not len(idx):
+        return []
+    runs: list[list[int]] = [[int(idx[0]), int(idx[0])]]
+    for k in idx[1:]:
+        if k - runs[-1][1] <= STATIC_BRIDGE_FRAMES + 1:
+            runs[-1][1] = int(k)
+        else:
+            runs.append([int(k), int(k)])
+    out = []
+    for a, b in runs:
+        lo, hi = a / fps, (b + 1) / fps
+        if hi - lo < STATIC_MIN_S - 1e-6:
+            continue
+        if _voiced_s(words, lo, hi) > STATIC_VOICED_MAX * (hi - lo):
+            continue
+        out.append((round(lo, 3), round(hi, 3)))
+    return out
 
 
 def low_motion(motion: list[float] | None, start: float, end: float) -> bool:

@@ -350,7 +350,7 @@ def test_clamp_drops_the_cause_words_first():
     from hookline.pipeline.boundaries import clamp_length
 
     ws = [*words_from("Oh. No.", start=14.0), *words_from("what was that.", start=17.0)]
-    ws += words_from("more talk here.", start=40.0, until=71.0)
+    ws += words_from("more talk here.", start=19.0, until=71.0)  # no voiceless stretch
     orig = pick(17.0, 71.0, first_words="what was that.")
     caused = include_cause(orig, ws, _signals([20.0] * 80, transients=[14]))
     assert caused.start == pytest.approx(14.0)
@@ -365,7 +365,7 @@ def test_clamp_front_trims_to_a_sentence_start_and_updates_the_opening(caplog):
         *words_from("So we went in.", start=10.0),
         *words_from("It was dark.", start=14.0),
         *words_from("Then the thing jumped out.", start=20.0),
-        *words_from("and that was it.", start=60.0, until=66.0),
+        *words_from("and that was it.", start=24.0, until=66.0),  # no voiceless stretch
     ]
     p = pick(10.0, 66.0, first_words="So we went in.", declared_first_words="So we went in.")
     sig = _signals([20.0] * 80)

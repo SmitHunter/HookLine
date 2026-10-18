@@ -623,7 +623,7 @@ def test_run_job_trims_idle_ends_before_render_and_records_the_source_bitrate(
     )
     gaps = []
     monkeypatch.setattr(
-        run_mod, "idle_gaps", lambda pick, words, signals, **k: gaps.append(pick) or [(25.0, 27.0)]
+        run_mod, "edit_gaps", lambda pick, words, signals, **k: gaps.append(pick) or [(25.0, 27.0)]
     )
     kws = []
     fake_llm.queue(make_payload_for(150, 1, 21))
@@ -661,14 +661,14 @@ def test_signals_cache_keeps_motion_and_recomputes_only_the_onsets(signals_input
     sig = json.loads((job / "signals.json").read_text(encoding="utf-8"))
     assert sig["version"] == SIGNALS_VERSION >= 3 and sig["onset_times"] == []
     # a version-2 cache (no exact onset times) keeps its VOD motion decode
-    sig.update({"version": 2, "motion": [7.0] * 150})
+    sig.update({"version": 2, "motion": [7.0] * 150, "screen": [0] * 150})
     del sig["onset_times"], sig["transient_times"]
     (job / "signals.json").write_text(json.dumps(sig), encoding="utf-8")
 
     def no_decode(src):
         raise AssertionError("motion re-decoded")
 
-    monkeypatch.setattr(run_mod, "frame_motion", no_decode)
+    monkeypatch.setattr(run_mod, "frame_stats", no_decode)
     out = run_mod._signals(job, src, wav, transcript, lambda m: None)
     assert out.motion == [7.0] * 150 and out.version == SIGNALS_VERSION
     assert out.onset_times == [] and out.transient_times == []
@@ -684,14 +684,14 @@ def test_a_failed_motion_analysis_is_retried_next_run(signals_inputs, monkeypatc
     from hookline.pipeline import run as run_mod
 
     job, src, wav, transcript = signals_inputs
-    real = run_mod.frame_motion
+    real = run_mod.frame_stats
 
     def broken(src):
         raise FFmpegError("decode failed")
 
-    monkeypatch.setattr(run_mod, "frame_motion", broken)
+    monkeypatch.setattr(run_mod, "frame_stats", broken)
     assert run_mod._signals(job, src, wav, transcript, lambda m: None).motion is None
-    monkeypatch.setattr(run_mod, "frame_motion", real)
+    monkeypatch.setattr(run_mod, "frame_stats", real)
     logs: list[str] = []
     out = run_mod._signals(job, src, wav, transcript, logs.append)
     assert out.motion and len(out.motion) >= 149

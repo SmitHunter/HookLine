@@ -32,7 +32,8 @@ SENTENCES = [
     "Nobody saw it coming.",
     "And that was the end.",
 ]
-CHECK_IDS = ["Q1", "Q2", "Q3", "Q3b", "Q4", "Q4b", "Q5", "Q6", "Q7", "Q8"]
+CHECK_IDS = ["Q1", "Q2", "Q3", "Q3b", "Q4", "Q4b", "Q5", "Q6", "Q7", "Q8",
+             "Q-static", "Q-voiceless", "Q-seam", "Q-beat"]  # fmt: skip
 
 
 def _words(t0: float = 0.2) -> list[Word]:
