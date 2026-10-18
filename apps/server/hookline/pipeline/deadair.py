@@ -1,8 +1,7 @@
-from hookline.models import Word
+from hookline.models import MIN_WORD_S, Word
 
 MIN_RANGE = 0.05
 MIN_PIECE_S = 1.5  # a cut may not leave a kept piece shorter than this (choppy jump cuts)
-MIN_WORD_S = 0.05  # captions drop shorter words; edge-clipped survivors are stretched to this
 DEFAULT_FPS = 30.0  # for the one-frame sliver threshold when the clip's fps is unknown
 MIN_SURVIVING = 0.5  # an edge-clipped word keeping less than this share of itself is dropped
 

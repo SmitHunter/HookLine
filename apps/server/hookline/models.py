@@ -2,6 +2,10 @@ from typing import Literal
 
 from pydantic import BaseModel, computed_field
 
+# The shortest word a caption shows: captions drop shorter slivers, so cuts stretch an
+# edge-clipped survivor to this and onset snapping never leaves a word shorter.
+MIN_WORD_S = 0.05
+
 
 class Word(BaseModel):
     start: float

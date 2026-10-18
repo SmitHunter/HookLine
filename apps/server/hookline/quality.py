@@ -25,6 +25,7 @@ from hookline.pipeline.boundaries import FILLER_OPENERS
 from hookline.pipeline.ingest import find_source
 from hookline.pipeline.layout import SCARE_POST_S, SCARE_PRE_S, SceneLayout
 from hookline.pipeline.signals import STATIC_CHROMA_MAX, STATIC_VOICED_MAX
+from hookline.pipeline.timing import UNCAPTIONED_S  # Q3b: what the render reports
 
 OUT_W, OUT_H = 1080, 1920
 GREY = "0x808080"  # canvas on which black outlines, shadows and hook boxes are visible
@@ -98,7 +99,6 @@ HOOK_MAX_LINES, HOOK_MAX_WORDS, HOOK_UNTIL = 2, 7, 3.0
 COVERAGE_MIN = 0.95
 SAFE_X, SAFE_Y = (60, 888), (290, 1250)
 FACE_OVERLAP_MAX = 0.10
-UNCAPTIONED_S = 0.3  # Q3b: the render reports voiced stretches longer than this (timing.py)
 PAGE_TOUCH_S = 0.05  # a caption group's events touch (word highlights); a gap starts another
 FACE_SAMPLE_HALF_S = 0.125  # a per-sample face (4 fps) stands for this long either side
 SPEECH_START_MAX = 0.5

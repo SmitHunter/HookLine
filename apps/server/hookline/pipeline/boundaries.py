@@ -5,6 +5,7 @@ import logging
 import math
 from itertools import pairwise
 
+from hookline.config import Settings
 from hookline.models import ClipPick, Word
 from hookline.pipeline.signals import (
     LOW_MOTION,
@@ -144,7 +145,7 @@ IDLE_TAIL_S = 1.0  # an idle tail is cut to this long after the last word
 IDLE_LEAD_S = 0.3  # an idle lead is cut to this long before the first word (Q6: speech by 0.5 s)
 # Per-second loudness (`Signals.loudness`, RMS dBFS) under this is quiet: the default
 # silence level (`Settings.silence_db`); callers pass the configured one.
-QUIET_DB = -32.0
+QUIET_DB: float = Settings.model_fields["silence_db"].default
 INTERIOR_IDLE_MIN_S = 2.0  # an idle stretch inside a clip longer than this is cut ...
 INTERIOR_IDLE_KEEP_S = 0.8  # ... down to this much (half kept on each side)
 _CLOSERS = "\"'”’)"

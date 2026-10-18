@@ -11,7 +11,7 @@ from collections.abc import Sequence
 import numpy as np
 
 from hookline.media.audio import Envelope
-from hookline.models import Word
+from hookline.models import MIN_WORD_S, Word
 
 __all__ = [
     "Envelope",
@@ -40,7 +40,6 @@ MIN_QUIET_S = 0.05  # a dip must last this long to count as silence (stops bridg
 MIN_VOICED_S = 0.03  # ... and a rise must stay voiced this long to count as an onset
 PAUSE_S = 0.2  # a word this long after the previous one's end follows a pause
 ONSET_WINDOW_S = 0.25  # a post-pause onset snaps to an energy rise within this of it
-MIN_WORD_S = 0.05  # a snapped onset leaves the word at least this long
 SNAP_EPS_S = 0.005
 REANCHOR_GAP_S = 0.25  # after a gap this long, an onset is searched for ...
 REANCHOR_S = 0.7  # ... this far before the transcribed start (DTW runs late after pauses)

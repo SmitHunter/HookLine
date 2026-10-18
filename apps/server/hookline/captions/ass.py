@@ -2,10 +2,9 @@ import math
 import re
 from collections.abc import Sequence
 
-from hookline.models import Word
+from hookline.models import MIN_WORD_S, Word
 from hookline.pipeline.layout import STACK_CAM_H, STACK_GAME_H, SceneLayout
 
-MIN_WORD_S = 0.05
 MERGE_GAP_S = 0.05
 HOOK_S = 3.0
 HOOK_FADE_MS = 250
