@@ -11,14 +11,21 @@ from hookline.fsutil import atomic_write_text, slugify
 from hookline.llm import LLMBackend
 from hookline.media.audio import MOMENTARY_HOP, momentary_db, rms_per_second
 from hookline.media.ffmpeg import FFmpegError, extract_audio, pick_encoder, probe_video_kbps
-from hookline.media.motion import frame_motion
+from hookline.media.motion import Rect, frame_stats
 from hookline.models import ClipPick, Transcript, Word
-from hookline.pipeline.boundaries import fit_to_signals, idle_gaps
+from hookline.pipeline.boundaries import (
+    CAUSE_MAX_S,
+    PAYOFF_SAID_MAX_S,
+    PAYOFF_SCARE_S,
+    edit_gaps,
+    fit_to_signals,
+)
 from hookline.pipeline.chat import chat_keywords, chat_rate, try_fetch_chat
 from hookline.pipeline.ingest import find_source, ingest, job_id_for
+from hookline.pipeline.layout import SCARE_POST_S, SCARE_PRE_S
 from hookline.pipeline.package import apply_caption_fixes, package_clips
 from hookline.pipeline.profile import LayoutProfile, layout_profile
-from hookline.pipeline.render import SCARE_POST_S, SCARE_PRE_S, render_clip
+from hookline.pipeline.render import render_clip, voiced_words
 from hookline.pipeline.select import NoClipsSelectedError, select_clips
 from hookline.pipeline.signals import (
     SIGNALS_VERSION,
@@ -169,12 +176,19 @@ def _package(
 
 
 def _signals(
-    job_dir: Path, src: Path, wav: Path, transcript: Transcript, log: Callable[[str], None]
+    job_dir: Path,
+    src: Path,
+    wav: Path,
+    transcript: Transcript,
+    log: Callable[[str], None],
+    mask: list[Rect] | None = None,
 ) -> Signals:
     """signals.json, recomputing only what is missing or stale: chat when chat.json exists but
     the cache has no chat (or no reaction kinds), the audio onsets when the cache is below
-    SIGNALS_VERSION, the VOD motion decode (the slow part) only when the cache has none. A
-    failed onset or motion analysis is stored as missing, so the next run retries it."""
+    SIGNALS_VERSION, the VOD motion decode (the slow part; motion, screen frames and their
+    chroma) only when the cache lacks any of them or measured the chroma with another cam
+    `mask` (`screen_mask`: the stream profile's cam and labels, `screen_mask_for`). A failed
+    onset or motion analysis is stored as missing, so the next run retries it."""
     spath = job_dir / "signals.json"
     cpath = job_dir / "chat.json"
     cached: Signals | None = None
@@ -187,7 +201,14 @@ def _signals(
         cached is None or cached.chat is None or cached.chat_kinds is None
     )
     onsets_stale = cached is None or cached.version < SIGNALS_VERSION or cached.onset_times is None
-    motion_stale = cached is None or cached.motion is None
+    want_mask = [list(b) for b in mask] if mask else None
+    motion_stale = (
+        cached is None
+        or cached.motion is None
+        or cached.screen is None
+        or cached.screen_chroma is None
+        or cached.screen_mask != want_mask
+    )
     if cached is not None and not (chat_stale or onsets_stale or motion_stale):
         log("[4/6] signals: skipped (cached)")
         return cached
@@ -220,10 +241,12 @@ def _signals(
             update |= {"onsets": None, "transients": None}
     if motion_stale:
         try:
-            update["motion"] = frame_motion(src)
+            motion, screen, chroma = frame_stats(src, mask=mask)
+            update |= {"motion": motion, "screen": screen, "screen_chroma": chroma}
+            update["screen_mask"] = want_mask
         except FFmpegError as e:
             log(f"warning: motion analysis failed ({e}); continuing without visual signals")
-            update["motion"] = None
+            update |= {"motion": None, "screen": None, "screen_chroma": None}
     if cached is None:
         signals = Signals(duration=duration, loudness=rms_per_second(wav), **update)
     else:
@@ -262,6 +285,44 @@ def beat_spikes(signals: Signals) -> list[tuple[float, float]]:
     ]
 
 
+def screen_mask_for(profile: LayoutProfile | None) -> list[Rect] | None:
+    """The stream profile's cam and its labels (`LayoutProfile.keep_out`) as normalized x0, y0,
+    x1, y1 boxes: masked out of the static-screen chroma (wave H round 1). None without a cam."""
+    if profile is None or profile.cam is None:
+        return None
+    w, h = profile.size
+    return [
+        (round(x0 / w, 4), round(y0 / h, 4), round(x1 / w, 4), round(y1 / h, 4))
+        for x0, y0, x1, y1 in profile.keep_out()
+    ]
+
+
+# a fitted clip may start this much before its pick (the scare's cause) and end this much after
+# it (the payoff scare's reaction): the voice-clamped words cover that
+_FIT_BEFORE_S = CAUSE_MAX_S + 1.0
+_FIT_AFTER_S = PAYOFF_SCARE_S + PAYOFF_SAID_MAX_S + 1.0
+
+
+def fit_pick(
+    pick: ClipPick, words: list[Word], signals: Signals, wav: Path, settings: Settings
+) -> tuple[ClipPick, list[tuple[float, float]], list[Word]]:
+    """(the pick fitted to the signals, its interior edit gaps, the words they were judged
+    on). The fit and the gaps see the words as the render captions them: held ends clamped to
+    the voice (`render.voiced_words`), so the voiceless trimmer and the audit's Q-voiceless
+    measure the same voice."""
+    voiced = voiced_words(
+        wav, words, pick.start - _FIT_BEFORE_S, pick.end + _FIT_AFTER_S, settings.silence_db
+    )
+    fitted = fit_to_signals(
+        pick,
+        voiced,
+        signals,
+        max_s=settings.max_clip_s + PAYOFF_ALLOWANCE_S,
+        quiet_db=settings.silence_db,
+    )
+    return fitted, edit_gaps(fitted, voiced, signals, quiet_db=settings.silence_db), voiced
+
+
 def _layout_profile(
     job_dir: Path, src: Path, detector: FaceDetector | None, log: Callable[[str], None]
 ) -> LayoutProfile | None:
@@ -275,7 +336,7 @@ def _layout_profile(
         )
         return None
     if prof.cam is not None:
-        log(f"[6/6] render: stream facecam at {prof.cam} px (fixed STACKED template)")
+        log(f"layout: stream facecam at {prof.cam} px (fixed STACKED template)")
     return prof
 
 
@@ -332,7 +393,10 @@ def run_job(
         )
         log("[3/6] transcribe: done")
 
-    signals = _signals(job_dir, src, wav, transcript, log)
+    # the stream profile first: its cam is masked out of the static-screen chroma
+    detector = _face_detector(settings, log)
+    profile = _layout_profile(job_dir, src, detector, log)
+    signals = _signals(job_dir, src, wav, transcript, log, mask=screen_mask_for(profile))
     if not settings.chat:
         signals = signals.model_copy(update={"chat": None, "chat_kinds": None})
 
@@ -378,9 +442,8 @@ def run_job(
     log(f"[6/6] render: started ({len(picks)} clips)")
     out_dir = settings.output_dir / job_id
     work_dir = job_dir / "render"
-    detector = _face_detector(settings, log)
-    profile = _layout_profile(job_dir, src, detector, log)
-    # full-cam reaction beats stay clear of the scares and the gameplay's motion spikes
+    # full-cam reaction beats and the audit's Q-beat: every scare (game transients and flash
+    # scares) and the gameplay's motion spikes
     scares, spikes = scare_times(signals), beat_spikes(signals)
     # Segment-interpolated word times are contiguous (no gaps), so protecting them from cuts
     # would remove no dead air at all; only real word timings (DTW / whisper) are protected.
@@ -393,21 +456,15 @@ def run_job(
         dst = out_dir / f"{i:02d}-{slugify(pick.title)}.mp4"
         # the cause of an opening reaction pulled in; no death-screen / menu tails; the final
         # hard length clamp (max_clip_s + the payoff allowance, the end tail not counted)
-        trimmed = fit_to_signals(
-            pick,
-            words,
-            signals,
-            max_s=settings.max_clip_s + PAYOFF_ALLOWANCE_S,
-            quiet_db=settings.silence_db,
-        )
+        # still, quiet, wordless stretches, static screens and long voiceless stretches inside
+        # the clip are cut like dead air (`gaps`)
+        trimmed, gaps, _ = fit_pick(pick, words, signals, wav, settings)
         if trimmed != pick:
             log(
                 f"clip {i:02d}: fitted to signals {pick.start:.2f}-{pick.end:.2f} -> "
                 f"{trimmed.start:.2f}-{trimmed.end:.2f}"
             )
             pick = trimmed
-        # still, quiet, wordless stretches inside the clip are cut like dead air
-        gaps = idle_gaps(pick, words, signals, quiet_db=settings.silence_db)
         try:
             extras = render_clip(
                 src,

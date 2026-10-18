@@ -4,8 +4,11 @@ import hashlib
 import logging
 import os
 import re
+import subprocess
 from itertools import pairwise
 from pathlib import Path
+
+import numpy as np
 
 from hookline.captions.ass import (
     SEAM_TAG_S,
@@ -18,7 +21,15 @@ from hookline.captions.ass import (
 )
 from hookline.config import Settings
 from hookline.fsutil import atomic_write_text
-from hookline.media.audio import Envelope, detect_silences, digital_zero_runs, energy_envelope
+from hookline.media.audio import (
+    ENVELOPE_RATE,
+    Envelope,
+    detect_silences,
+    digital_zero_runs,
+    energy_envelope,
+    pcm_span,
+    seam_jump_db,
+)
 from hookline.media.ffmpeg import (
     _run,
     cut_segments,
@@ -61,7 +72,10 @@ from hookline.pipeline.layout import (
 from hookline.pipeline.profile import LayoutProfile
 from hookline.pipeline.timing import (
     anchor_words,
+    cause_onset,
+    clamp_word_ends,
     last_voiced,
+    pre_roll,
     protected_words,
     refine_word_ends,
     snap_onsets,
@@ -146,13 +160,112 @@ def seam_time(
     return round(t, 3) if 0 < n < len(keep) else None
 
 
-def seam_flash(seam: float, fps: float) -> str:
-    """3-frame white flash centred on the frame at `seam`: fade in, 60% white, fade out."""
+def seam_join(keep: list[tuple[float, float]], cold_open: tuple[float, float] | None) -> int | None:
+    """Index of the keep range ending at the cold-open seam (`seam_time`), or None."""
+    if seam_time(keep, cold_open) is None:
+        return None
+    assert cold_open is not None
+    lo, hi = cold_open[0] - SEAM_SLACK_S, cold_open[1] + SEAM_SLACK_S
+    n = 0
+    while n < len(keep) and lo <= keep[n][0] and keep[n][1] <= hi:
+        n += 1
+    return n - 1
+
+
+SEAM_BRIGHT = 180.0  # frames around the seam this bright (mean grey) get a dark flash
+
+
+_LUMA_W, _LUMA_H = 64, 36
+
+
+def seam_luma(
+    path: Path,
+    seam: float,
+    fps: float,
+    regions: list[tuple[float, float, float, float]] | None = None,
+    crop: Crop | None = None,
+) -> float | None:
+    """Mean grey level (0-255) of the frames 2 either side of `seam` in `path`, over what the
+    flash is drawn on: the `crop` (w, h, x, y px) of the picture and, inside it, the
+    `regions` (normalized x, y, w, h: a STACKED clip's cam and gameplay panels) -- the whole
+    cropped picture without regions. None when the frames cannot be read."""
+    pre = f"crop={crop[0]}:{crop[1]}:{crop[2]}:{crop[3]}," if crop else ""
+    res = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-v", "error", "-ss", f"{max(seam - 2 / fps, 0):.3f}",
+         "-t", f"{4 / fps:.3f}", "-i", str(path), "-an",
+         "-vf", f"{pre}scale={_LUMA_W}:{_LUMA_H}:flags=area,format=gray",
+         "-f", "rawvideo", "-"],
+        check=False, capture_output=True,
+    )  # fmt: skip
+    size = _LUMA_W * _LUMA_H
+    if res.returncode != 0 or len(res.stdout) < size:
+        return None
+    frames = np.frombuffer(res.stdout[: len(res.stdout) // size * size], np.uint8)
+    frames = frames.reshape(-1, _LUMA_H, _LUMA_W)
+    if not regions:
+        return float(frames.mean())
+    shown = np.zeros((_LUMA_H, _LUMA_W), bool)
+    for x, y, w, h in regions:
+        c0, c1 = int(x * _LUMA_W), int(np.ceil((x + w) * _LUMA_W))
+        r0, r1 = int(y * _LUMA_H), int(np.ceil((y + h) * _LUMA_H))
+        shown[max(r0, 0) : min(r1, _LUMA_H), max(c0, 0) : min(c1, _LUMA_W)] = True
+    if not shown.any():
+        return float(frames.mean())
+    return float(frames[:, shown].mean())
+
+
+def _seam_regions(
+    layouts: list[SceneLayout], seam: float
+) -> list[tuple[float, float, float, float]] | None:
+    """What the vertical output shows of the picture at `seam`: a STACKED scene's cam window
+    and gameplay panel; None (the whole picture) otherwise."""
+    lay = next((x for x in layouts if x.start <= seam < x.end), None)
+    if lay is None or lay.kind != "STACKED":
+        return None
+    out = [b for b in (lay.facecam, lay.game_box) if b is not None]
+    return out or None
+
+
+def seam_source_db(wav: Path, t: float) -> float | None:
+    """The source's own rise at source time `t` (`seam_jump_db` of `wav` around it): what the
+    audit's Q-seam allows the output's rise at the seam that starts there."""
+    lo = max(t - 0.1, 0.0)
+    pcm = pcm_span(wav, lo, t + 0.1, ENVELOPE_RATE)
+    if not len(pcm):
+        return None
+    return round(seam_jump_db(pcm, ENVELOPE_RATE, t - lo), 2)
+
+
+def voiced_words(
+    wav: Path, words: list[Word], lo: float, hi: float, silence_db: float
+) -> list[Word]:
+    """`words` with those starting in [lo, hi) clamped to their voice as the render's captions
+    are (`timing.clamp_word_ends`, the same threshold from the local noise floor): a word DTW
+    held over a pause ends with its voice. The rest, and every word when the bed is too loud
+    to tell the voice (`timing.voice_threshold` None), as given. Order kept."""
+    inside = [i for i, w in enumerate(words) if lo <= w.start < hi]
+    if not inside:
+        return words
+    env = energy_envelope(wav, max(lo, 0.0), hi + 1)
+    thr = voice_threshold(env, silence_db)
+    if thr is None:
+        return words
+    clamped = clamp_word_ends([words[i] for i in inside], env, thr)
+    out = list(words)
+    for i, w in zip(inside, clamped, strict=True):
+        out[i] = w
+    return out
+
+
+def seam_flash(seam: float, fps: float, dark: bool = False) -> str:
+    """3-frame white flash centred on the frame at `seam`: fade in, 60% white, fade out; a
+    black one when `dark` (bright frames around the seam, SEAM_BRIGHT: white would not show)."""
+    color = "black" if dark else "white"
     boxes = []
     for k, alpha in zip((-1, 0, 1), SEAM_FLASH, strict=True):
         a, b = seam + (k - 0.5) / fps, seam + (k + 0.5) / fps
         boxes.append(
-            f"drawbox=x=0:y=0:w=iw:h=ih:color=white@{alpha:g}:t=fill"
+            f"drawbox=x=0:y=0:w=iw:h=ih:color={color}@{alpha:g}:t=fill"
             f":enable='between(t\\,{a:.4f}\\,{b:.4f})'"
         )
     return ",".join(boxes)
@@ -376,6 +489,46 @@ def _with_tail(
     return [*keep[:-1], (start, round(new_end, 3))]
 
 
+def drop_lead_fragments(words: list[Word], lead: float) -> list[Word]:
+    """`words` (output time) without those ending inside a `lead` s pre-roll: the tail of the
+    previous sentence the pre-roll exposed, not a word of the clip."""
+    if lead <= 0:
+        return words
+    return [w for w in words if w.end > lead + 0.01]
+
+
+def _first_start(pick: ClipPick) -> float:
+    return pick.cold_open[0] if pick.cold_open else pick.start
+
+
+def _lead_ins(pick: ClipPick, env: Envelope, words: list[Word], fps: float) -> ClipPick:
+    """Wave H: after a cold open, the main span's start (the seam) moved back onto the cause
+    of what follows (`timing.cause_onset`: a bang the cut would split -- a pop at the seam);
+    the clip's first start `timing.pre_roll`ed when its speech begins on frame 0. Logs."""
+    update: dict = {}
+    first = pick.cold_open
+    if first is not None:
+        if (c := cause_onset(env, pick.start, words)) is not None and c < pick.start:
+            update["start"] = c
+        lead = pre_roll(env, first[0], words, fps)
+        if lead < first[0]:
+            update["cold_open"] = (lead, first[1])
+    elif (lead := pre_roll(env, pick.start, words, fps)) < pick.start:
+        update["start"] = lead
+    if not update:
+        return pick
+
+    def grid(t: float) -> float:  # earlier onto the frame grid (keep bounds are snapped to it)
+        return round(int(t * fps + 1e-6) / fps, 6)
+
+    if "start" in update:
+        update["start"] = grid(update["start"])
+    if "cold_open" in update:
+        update["cold_open"] = (grid(update["cold_open"][0]), update["cold_open"][1])
+    log.info("lead-ins %s (was start %.3f, cold open %s)", update, pick.start, pick.cold_open)
+    return pick.model_copy(update=update)
+
+
 def _horizontal_graph(crop: tuple[int, int, int, int] | None) -> str:
     pre = f"crop={crop[0]}:{crop[1]}:{crop[2]}:{crop[3]}," if crop else ""
     return f"[0:v]{pre}scale='trunc(min({MAX_HORIZONTAL_W},iw)/2)*2':-2,setsar=1[vout]"
@@ -480,7 +633,10 @@ def render_clip(
     overlay (unless `settings.facecam` overrides), the fixed STACKED template for every scene,
     with up to two full-cam reaction beats at the streamer's reaction peaks (`scares`: the
     VOD's scare times, source s; beats stay clear of them and of the gameplay `spikes`,
-    source spans: `beat_avoid`); the sidecar's `layout_profile` records its cam."""
+    source spans: `beat_avoid`); the sidecar's `layout_profile` records its cam. Wave H: the
+    sidecar records the same `scares` and `spikes` (`run.beat_spikes`) on the output timeline
+    (`scare_times`, `beat_spikes`: the audit's Q-beat) and the source's own rise at the seam
+    (`seam_source_db`: Q-seam)."""
     work_dir.mkdir(parents=True, exist_ok=True)
     dst.parent.mkdir(parents=True, exist_ok=True)
     name = dst.stem.split("-", 1)[0]
@@ -503,6 +659,9 @@ def render_clip(
         near = snap_onsets(refine_word_ends(raw, env, voice_db), env, voice_db)
     refined = refine_boundaries(pick, near, silences, loud_seconds=loud_seconds)
     fps = probe_fps(src)
+    unrolled = _first_start(refined)
+    refined = _lead_ins(refined, env, near, fps)  # wave H: cause sound, frame-0 pre-roll
+    lead = unrolled - _first_start(refined)
     # Frame-grid bounds make the cut timeline exact, so remapped caption times stay in sync.
     # dead air trusts a refined word end only so far past the transcript's
     protected = protected_words(raw, near)
@@ -522,6 +681,7 @@ def render_clip(
         tailed = _with_tail(untailed, timed, env, voice_db)
         bounds = list(refined.cold_open) if refined.cold_open else []
         tailed, timed = snap_splices(tailed, timed, env, voice_db, fps, fixed=bounds, adjust=True)  # type: ignore[misc]
+        timed = clamp_word_ends(timed, env, voice_db)  # wave H: no caption held past the voice
     elif untailed:
         tailed = min_tail(untailed, near)  # no tail on a noisy bed: still room for the fade
     keep = snap_ranges(tailed, fps, keep_gaps=[*refined.drops, *(idle_gaps or [])])
@@ -541,8 +701,16 @@ def render_clip(
                 "there)", name, ", ".join(f"{a:.2f}-{b:.2f}" for a, b in uncaptioned),
             )  # fmt: skip
 
+    join = seam_join(keep, refined.cold_open)
+    seam_db = seam_source_db(wav, keep[join + 1][0]) if join is not None else None
     inter = cut_segments(
-        src, keep, work_dir / f"{name}.mkv", "libx264", quality=INTERMEDIATE_QUALITY, fps=fps
+        src,
+        keep,
+        work_dir / f"{name}.mkv",
+        "libx264",
+        quality=INTERMEDIATE_QUALITY,
+        fps=fps,
+        crossfade_at=join,  # wave H: no pop / step at the seam
     )
     duration = probe_duration(inter)
     size = probe_size(inter)
@@ -560,6 +728,7 @@ def render_clip(
     # drop_cut_slivers); the first word (and the first after the seam) capitalised once the
     # remnants are gone
     out_words = remap_words(spoken, keep, fps, judge_ends=judge)
+    out_words = drop_lead_fragments(out_words, lead)  # wave H: no pre-roll fragment caption
     out_words = caption_words(drop_cut_slivers(caption_words(out_words), cuts), seam)
     # loudness is normalised to the speech: the captioned words' spans on the clip's timeline
     audio = plan_loudness(inter, speech=[(w.start, w.end) for w in out_words])
@@ -614,7 +783,11 @@ def render_clip(
 
     out_label = "[vout]"
     if seam is not None:
-        graph += f";[vout]{seam_flash(seam, fps)}[vseam]"
+        # wave H: a dark flash on bright frames -- measured on what the flash covers
+        regions = _seam_regions(layouts, seam) if settings.vertical else None
+        lum = seam_luma(inter, seam, fps, regions=regions, crop=crop)
+        dark = lum is not None and lum > SEAM_BRIGHT
+        graph += f";[vout]{seam_flash(seam, fps, dark=dark)}[vseam]"
         out_label = "[vseam]"
     ass_ref: dict = {"ass": None, "ass_sha1": None}
     if settings.captions:
@@ -712,6 +885,10 @@ def render_clip(
         "caption_words": [[w.start, w.end, w.text] for w in out_words],
         "uncaptioned_speech": uncaptioned,
         "room_tone": bed,
+        # wave H: the scares on the output timeline (the audit's Q-beat)
+        "scare_times": [t for x in scares or [] if (t := _to_output_time(x, keep)) is not None],
+        "beat_spikes": _to_output_spans(spikes or [], keep),
+        "seam_source_db": seam_db,
         "layout_profile": _profile_summary(profile, layouts),
     }
 

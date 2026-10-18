@@ -31,7 +31,7 @@ def test_frame_motion_is_per_second_and_spikes_on_a_flash(flash_video):
 
 _FLOOD = (
     "import sys; sys.stderr.buffer.write(b'concealing errors in P frame ' * 20000); "
-    "sys.stderr.flush(); sys.stdout.buffer.write(bytes(64 * 36 * 8)); sys.stdout.flush()"
+    "sys.stderr.flush(); sys.stdout.buffer.write(bytes(3 * 64 * 36 * 8)); sys.stdout.flush()"  # yuv444p
 )
 
 

@@ -16,13 +16,15 @@ import numpy as np
 
 from hookline.captions.ass import face_rects, face_top, held_face_px
 from hookline.fsutil import atomic_write_text
+from hookline.media.audio import SEAM_FRAME_S, seam_jump_db
 from hookline.media.ffmpeg import probe_duration, probe_video_kbps
 from hookline.media.loudness import measure_loudness
 from hookline.media.subtitles import fonts_dir, subtitles_filter
 from hookline.models import Word
 from hookline.pipeline.boundaries import FILLER_OPENERS
 from hookline.pipeline.ingest import find_source
-from hookline.pipeline.layout import SceneLayout
+from hookline.pipeline.layout import SCARE_POST_S, SCARE_PRE_S, SceneLayout
+from hookline.pipeline.signals import STATIC_CHROMA_MAX, STATIC_VOICED_MAX
 
 OUT_W, OUT_H = 1080, 1920
 GREY = "0x808080"  # canvas on which black outlines, shadows and hook boxes are visible
@@ -510,8 +512,11 @@ def _check_face(
     return CheckResult("Q4b", worst <= FACE_OVERLAP_MAX, round(worst, 3), thr, detail)
 
 
-def _check_hook(hooks: list[_Event], per_frame: list[list[int]], duration: float) -> CheckResult:
-    """Q5 from the hook event at 0 s and its line heights rendered over black at 0.1/2.7 s."""
+def _check_hook(
+    hooks: list[_Event], per_frame: list[list[int]], duration: float, seam: float | None = None
+) -> CheckResult:
+    """Q5 from the hook event at 0 s and its line heights rendered over black at 0.1/2.7 s (wave
+    H: the hook ends at an earlier cold-open `seam`, where the EARLIER tag takes over)."""
     thr = (
         f"<= {HOOK_MAX_LINES} lines, <= {HOOK_MAX_WORDS} words, cap >= {HOOK_MIN_PX}px, "
         f"0-{HOOK_UNTIL:g}s"
@@ -530,7 +535,10 @@ def _check_hook(hooks: list[_Event], per_frame: list[list[int]], duration: float
         problems.append(f"{n_words} words")
     if cap < HOOK_MIN_PX:
         problems.append(f"cap {cap}px")
-    if hook.end < min(HOOK_UNTIL, duration) - 0.01 or not all(per_frame):
+    until = min(HOOK_UNTIL, duration)
+    if seam is not None and 0 < seam < until:
+        until = seam
+    if hook.end < until - 0.01 or not all(per_frame):
         problems.append("not visible for the first 3 s")
     detail = f"{len(lines)} line(s), {n_words} words, cap {cap}px, {hook.start:.1f}-{hook.end:.1f}s"
     if problems:
@@ -650,7 +658,9 @@ def audit_clip(
         caps = [e for _, e in events if e.style == "Cap"]
         hooks = [e for _, e in events if e.style == "Hook"]
         cap_times = caption_samples(caps, layouts)
-        title_times = [0.1, min(2.7, max(duration - 0.2, 0.1))]
+        seam = sidecar.get("seam")
+        until = min(2.7, seam - 0.2) if seam is not None and 0.3 < seam < 3.0 else 2.7
+        title_times = [0.1, min(until, max(duration - 0.2, 0.1))]
         hook_times = [*title_times, *(e.mid for e in hooks if EARLIER_TAG in e.text)]
         with tempfile.TemporaryDirectory(prefix="hookline-audit-") as tmp:
             cap_ass, hook_ass = Path(tmp) / "cap.ass", Path(tmp) / "hook.ass"
@@ -677,7 +687,7 @@ def audit_clip(
         _check_uncaptioned(sidecar),
         _check_safe_zone([*cap_grey, *hook_grey]),
         _check_face(face_samples, layouts, steps),
-        _check_hook(hooks, hook_heights, duration),
+        _check_hook(hooks, hook_heights, duration, sidecar.get("seam")),
         _check_opening(
             words,
             sidecar.get("declared_first_words") or sidecar.get("first_words") or "",
@@ -688,6 +698,168 @@ def audit_clip(
         ),
         _check_pacing(sidecar, duration),
         _check_encode(_probe(mp4), sidecar.get("source_video_kbps")),
+        *_wave_h_checks(mp4, sidecar, words or [], duration),
+    ]
+
+
+# --- wave H: stream editing checks --------------------------------------------------------------
+
+STATIC_MAX_S = 0.5  # Q-static: voiceless static / death / loading screen frames allowed
+STATIC_FPS = 4
+STATIC_ROWS = 0.45  # the frame from this far down (a STACKED clip's gameplay panel)
+VOICELESS_WARN_S = 6.0  # Q-voiceless: a wordless span longer than this
+# Q-seam: the output's rise at the seam (`media.audio.seam_jump_db`) over the source's own
+# rise at the same source point (the sidecar's `seam_source_db`) more than this: a step / pop
+SEAM_JUMP_DB = 12.0
+# Q-beat: no full-cam beat over [scare - SCARE_PRE_S, scare + SCARE_POST_S] (layout's beat
+# avoidance spans) nor over a recorded gameplay spike (the sidecar's `beat_spikes`)
+BEAT_BEFORE_S, BEAT_AFTER_S = SCARE_PRE_S, SCARE_POST_S
+
+
+def screen_frame_flags(mp4: Path, fps: int = STATIC_FPS) -> tuple[list[bool], list[float]]:
+    """Per frame of `mp4` at `fps`, in the frame's lower part (from STATIC_ROWS down: a
+    STACKED clip's gameplay): (a screen frame -- `motion.screen_frames`: near uniform or near
+    white --, its mean chroma `motion.frame_chroma`)."""
+    from hookline.media.motion import frame_chroma, screen_frames
+
+    w, h = 36, 64
+    res = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-v", "error", "-i", str(mp4), "-an",
+         "-vf", f"fps={fps},scale={w}:{h}:flags=area,format=yuv444p", "-f", "rawvideo", "-"],
+        check=False, capture_output=True,
+    )  # fmt: skip
+    if res.returncode != 0:
+        return [], []
+    size = 3 * w * h
+    raw = np.frombuffer(res.stdout[: len(res.stdout) // size * size], np.uint8)
+    top = round(STATIC_ROWS * h)
+    planes = raw.reshape(-1, 3, h, w)[:, :, top:, :].reshape(-1, 3, (h - top) * w)
+    grey = planes[:, 0].astype(np.int16)
+    chroma = frame_chroma(planes[:, 1], planes[:, 2])
+    return [bool(f) for f in screen_frames(grey)], [float(c) for c in chroma]
+
+
+def _covered_s(words: list[Word], lo: float, hi: float) -> float:
+    """Seconds of [lo, hi] under at least one word (overlapping words counted once)."""
+    total, cur = 0.0, lo
+    for a, b in sorted((max(w.start, lo), min(w.end, hi)) for w in words if w.end > lo):
+        a = max(a, cur)
+        if b > a:
+            total += b - a
+            cur = b
+    return total
+
+
+def _check_static(
+    flags: list[bool], fps: float, words: list[Word], chroma: list[float] | None = None
+) -> CheckResult:
+    """Q-static: seconds of static / death / loading screen frames (`screen_frame_flags`; runs,
+    single frames bridged, under words for at most STATIC_VOICED_MAX of their length and,
+    with `chroma`, of mean chroma under STATIC_CHROMA_MAX: dark gameplay is coloured) at most
+    STATIC_MAX_S."""
+    thr = f"<= {STATIC_MAX_S:g}s of voiceless screen frames"
+    runs: list[list[int]] = []
+    for i, f in enumerate(flags):
+        if not f:
+            continue
+        if runs and i - runs[-1][1] <= 2:
+            runs[-1][1] = i
+        else:
+            runs.append([i, i])
+    total, where = 0.0, []
+    for a, b in runs:
+        lo, hi = a / fps, (b + 1) / fps
+        if _covered_s(words, lo, hi) > STATIC_VOICED_MAX * (hi - lo):
+            continue
+        if chroma and float(np.mean(chroma[a : b + 1])) >= STATIC_CHROMA_MAX:
+            continue
+        total += hi - lo
+        where.append(f"{lo:.2f}-{hi:.2f}")
+    detail = f"screens at {', '.join(where)}" if where else "none"
+    return CheckResult("Q-static", total <= STATIC_MAX_S + 1e-6, round(total, 3), thr, detail)
+
+
+def _check_voiceless(words: list[Word], duration: float) -> CheckResult:
+    """Q-voiceless (a warning): the longest span without a caption word (clip start and end
+    included) is at most VOICELESS_WARN_S."""
+    thr = f"<= {VOICELESS_WARN_S:g}s without speech"
+    if not words:
+        return CheckResult("Q-voiceless", True, None, thr, "no speech")
+    spans, cur = [], 0.0
+    for w in sorted(words, key=lambda w: w.start):
+        if w.start > cur:
+            spans.append((cur, w.start))
+        cur = max(cur, w.end)
+    if duration > cur:
+        spans.append((cur, duration))
+    a, b = max(spans, key=lambda g: g[1] - g[0], default=(0.0, 0.0))
+    detail = f"longest {b - a:.1f}s at {a:.2f}-{b:.2f}"
+    warn = b - a > VOICELESS_WARN_S
+    return CheckResult("Q-voiceless", True, round(b - a, 3), thr, detail, warn=warn)
+
+
+def _check_seam(
+    pcm: np.ndarray, rate: int, seam: float | None, source_db: float | None = None
+) -> CheckResult:
+    """Q-seam: no audio step or pop at the cold-open seam: the output's rise there
+    (`seam_jump_db`) over `source_db`, the source's own rise at the same source point (a bang
+    starting just after the cut, a bass bed's ripple), at most SEAM_JUMP_DB. Without
+    `source_db` (a render before it was recorded), the output's rise alone."""
+    thr = f"<= {SEAM_JUMP_DB:g} dB rise per {SEAM_FRAME_S * 1000:g} ms over the source's"
+    if seam is None:
+        return CheckResult("Q-seam", True, None, thr, "no cold open")
+    jump = seam_jump_db(pcm, rate, seam)
+    excess = max(jump - (source_db or 0.0), 0.0)
+    src = "" if source_db is None else f" (source {source_db:.1f} dB)"
+    detail = f"{jump:.1f} dB at {seam:.3f}s{src}"
+    return CheckResult("Q-seam", excess <= SEAM_JUMP_DB, round(excess, 2), thr, detail)
+
+
+def _check_beat(side: dict) -> CheckResult:
+    """Q-beat: no full-cam beat (`layout[].cam_beats`, output s) over a scare's window
+    [scare - BEAT_BEFORE_S, scare + BEAT_AFTER_S] (`scare_times`: game transients and flash
+    scares, output s) or a gameplay spike (`beat_spikes`, output spans, already padded)."""
+    thr = f"no cam beat within -{BEAT_BEFORE_S:g}/+{BEAT_AFTER_S:g}s of a scare or on a spike"
+    scares = side.get("scare_times")
+    if scares is None:
+        return CheckResult("Q-beat", True, None, thr, "scares not recorded (render before wave H)")
+    spikes = side.get("beat_spikes") or []
+    beats = [b for lay in side.get("layout") or [] for b in lay.get("cam_beats") or []]
+    hits = [
+        f"{a:.2f}-{b:.2f} over scare {s:.2f}"
+        for a, b in beats
+        for s in scares
+        if a < s + BEAT_AFTER_S and b > s - BEAT_BEFORE_S
+    ]
+    hits += [
+        f"{a:.2f}-{b:.2f} over spike {x:.2f}-{y:.2f}"
+        for a, b in beats
+        for x, y in spikes
+        if a < y and b > x
+    ]
+    summary = f"{len(beats)} beats, {len(scares)} scares, {len(spikes)} spikes"
+    return CheckResult("Q-beat", not hits, len(hits), thr, "; ".join(hits) or summary)
+
+
+def _clip_pcm(mp4: Path, rate: int = 48000) -> np.ndarray:
+    res = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-v", "error", "-i", str(mp4), "-vn", "-ac", "1",
+         "-ar", str(rate), "-f", "s16le", "-"],
+        check=False, capture_output=True,
+    )  # fmt: skip
+    return np.frombuffer(res.stdout, np.int16).astype(np.float64) / 32768.0
+
+
+def _wave_h_checks(mp4: Path, side: dict, words: list[Word], duration: float) -> list[CheckResult]:
+    """Q-static, Q-voiceless, Q-seam and Q-beat (wave H)."""
+    seam = side.get("seam")
+    pcm = _clip_pcm(mp4) if seam is not None else np.zeros(0)
+    flags, chroma = screen_frame_flags(mp4)
+    return [
+        _check_static(flags, STATIC_FPS, words, chroma),
+        _check_voiceless(words, duration),
+        _check_seam(pcm, 48000, seam, side.get("seam_source_db")),
+        _check_beat(side),
     ]
 
 
