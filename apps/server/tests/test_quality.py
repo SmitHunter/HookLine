@@ -283,6 +283,9 @@ def test_wrong_first_words_fail_q6(good_mp4, tmp_path):
         ("the reason we did that was money", "the reason we did that was money and", True),
         ("the reason we did that was money", "um the reason we did that was the money", True),
         ("Nobody saw it coming.", "coming it saw nobody", False),
+        # a one-word declaration compares against at most twice its length of speech
+        ("Go!", "Go! Oh, oh, oh!", True),
+        ("Go!", "Run now go", False),
     ],
 )
 def test_first_words_match_is_order_aware(want, got, ok):

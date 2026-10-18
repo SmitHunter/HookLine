@@ -548,11 +548,12 @@ def _check_hook(
 
 def first_words_match(first_words: str, spoken: str) -> float:
     """Order-aware similarity (SequenceMatcher ratio) of the declared first words and the
-    first len(want) + 2 spoken tokens, leading filler openers stripped from both."""
+    first len(want) + min(2, len(want)) spoken tokens (a one-word declaration, "Go!", is not
+    diluted by the reaction after it), leading filler openers stripped from both."""
     want = _strip_fillers(_tokens(first_words))
     if not want:
         return 0.0
-    got = _strip_fillers(_tokens(spoken))[: len(want) + 2]
+    got = _strip_fillers(_tokens(spoken))[: len(want) + min(2, len(want))]
     return SequenceMatcher(None, want, got, autojunk=False).ratio()
 
 
