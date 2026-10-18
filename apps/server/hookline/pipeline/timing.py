@@ -54,6 +54,7 @@ UNCAPTIONED_S = 0.3  # a voiced stretch this long with no word is uncaptioned sp
 SPLICE_S = 0.15  # a splice edge moves at most this far to a silent point ...
 ONSET_PAD_S = 0.02  # ... and starts at least this far before the first kept word's onset
 SPLICE_TIE_DB = 3.0  # points within this of the quietest are as good: the nearest wins
+OWN_ONSET_S = 0.3  # a kept word DTW put in a dropped burst may own an onset this far on
 SPLICE_MAX_S = 0.4  # a burst of the dropped side's sound around an edge is skipped within this ...
 MAX_FRAGMENT_S = 0.35  # ... when at most this much of it lies on the kept side ...
 SPLICE_LEAD_S = 0.12  # ... the range then starts this long before the next onset
@@ -416,11 +417,15 @@ def _dropped_burst(
     theirs: list[int],
     end: float,
     start: float,
+    onset: float = np.inf,
 ) -> bool:
     """Whether a voiced burst around a range start (`start`; the previous range ends at
     `end`) is the tail of the dropped side's sound: at most MAX_FRAGMENT_S of it past the
     start, overlapping a dropped word (one between the ranges), and no kept word of the range
-    (`theirs`) with most of its transcript span inside it -- that word is the burst."""
+    (`theirs`) with most of its transcript span inside it -- that word is the burst -- unless
+    that word has its own voiced onset after the burst (`onset`: the next one) within
+    OWN_ONSET_S of its transcript end and before the next kept word starts (DTW put it in the
+    dropped word's sound; it is moved there)."""
     a, b = burst
     if b - start > MAX_FRAGMENT_S:
         return False
@@ -432,11 +437,13 @@ def _dropped_burst(
     ]
     if not any(min(w.end, b) > max(w.start, a) for w in dropped):
         return False
-    for i in theirs:
+    for n, i in enumerate(theirs):
         w = words[i]
         inside = max(0.0, min(w.end, b) - max(w.start, a))
         if inside > (w.end - w.start) / 2:
-            return False
+            nxt = words[theirs[n + 1]].start if n + 1 < len(theirs) else np.inf
+            if not (onset <= w.end + OWN_ONSET_S and onset < nxt - ONSET_PAD_S):
+                return False
     return True
 
 
@@ -519,7 +526,8 @@ def snap_splices(
         if not held(s):
             tail = burst(s)
             new = None
-            if tail and _dropped_burst(tail, words, mine, theirs, e, s):
+            after = _rise_from(env, tail[1], threshold_db) if tail else np.inf
+            if tail and _dropped_burst(tail, words, mine, theirs, e, s, after):
                 # a dropped word's tail runs on past the range start: start after it
                 onset = _rise_from(env, tail[1], threshold_db)
                 hi = min(onset - ONSET_PAD_S, tail[1] + SPLICE_MAX_S)

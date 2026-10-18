@@ -395,3 +395,25 @@ def test_snap_onsets_chains_back_over_a_short_gap_inside_the_word():
     env = _env([(2.5, 3.05), (3.34, 3.85), (3.90, 4.02)])
     out = snap_onsets([_w(2.5, 3.05, "really"), _w(3.98, 4.5, "reveal.")], env, THR)
     assert out[1].start == pytest.approx(3.34, abs=0.011)
+
+
+# --- fix wave F review round 2: burst-skip tie-break ---------------------------------------
+
+
+def test_snap_splices_skips_a_burst_whose_kept_word_has_its_own_onset_after_it():
+    from hookline.pipeline.timing import snap_splices
+
+    # clip 01 28.57: DTW put the kept "I" (2.62-2.92) 80% inside the dropped "alone."'s sound
+    # (2.56-2.86); the real "I" sounds from 3.14, within its span end + 0.3 s: the burst is
+    # skipped and "I" moves to its onset
+    env = _env([(1.0, 1.9), (2.0, 2.42), (2.56, 2.86), (3.14, 3.25), (3.4, 3.7)])
+    words = [_w(1.0, 1.9, "kept."), _w(2.28, 2.6, "alone."), _w(2.62, 2.92, "I"),
+             _w(3.4, 3.7, "put")]  # fmt: skip
+    keep, out = snap_splices([(0.5, 2.0), (2.67, 4.0)], words, env, THR, fps=30, adjust=True)
+    assert 2.86 <= keep[1][0] < 3.14  # no "...lone" fragment
+    i_word = next(w for w in out if w.text == "I")
+    assert i_word.start == pytest.approx(3.14, abs=0.011) and i_word.start >= keep[1][0]
+    # its only onset after the burst is the next kept word's: the burst is that word (kept)
+    late = [*words[:3], _w(3.14, 3.5, "put")]
+    keep2, out2 = snap_splices([(0.5, 2.0), (2.67, 4.0)], late, env, THR, fps=30, adjust=True)
+    assert keep2[1][0] <= 2.67 + 1e-9 and out2[2] == late[2]
