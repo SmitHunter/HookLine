@@ -44,6 +44,7 @@ MIN_WORD_S = 0.05  # a snapped onset leaves the word at least this long
 SNAP_EPS_S = 0.005
 REANCHOR_GAP_S = 0.25  # after a gap this long, an onset is searched for ...
 REANCHOR_S = 0.7  # ... this far before the transcribed start (DTW runs late after pauses)
+ONSET_CHAIN_S = 0.1  # ... through stops this short between the voiced runs of one word
 MAX_TAIL_S = 0.3  # the clip ends at most this long after its last word falls silent ...
 MIN_TAIL_S = 0.2  # ... and at least this long after (when the next word allows) ...
 TAIL_GUARD_S = 0.05  # ... and never closer than this to the next word
@@ -56,7 +57,6 @@ SPLICE_TIE_DB = 3.0  # points within this of the quietest are as good: the neare
 SPLICE_MAX_S = 0.4  # a burst of the dropped side's sound around an edge is skipped within this ...
 MAX_FRAGMENT_S = 0.35  # ... when at most this much of it lies on the kept side ...
 SPLICE_LEAD_S = 0.12  # ... the range then starts this long before the next onset
-SHARE_VOICED = 0.5  # a neighbour this voiced can share its span with a word over silence
 UNCAPTIONED_BRIDGE_S = 0.25  # syllable gaps up to this long inside one uncaptioned stretch
 
 
@@ -149,10 +149,12 @@ def snap_onsets(
 ) -> list[Word]:
     """Start of each word that follows a pause (>= `min_gap` after the previous word's end,
     or the first word) moved to where its sound starts. After a gap over REANCHOR_GAP_S, to
-    the first audible onset (a frame at or above `threshold_db` after MIN_QUIET_S below it,
-    staying up for MIN_VOICED_S) within REANCHOR_S before the transcribed start (DTW runs
-    late after pauses); otherwise, or without one there, to the nearest such onset within
-    `window` of it. Never before the previous word's end, nor leaving the word shorter than
+    the start of the voiced run leading into the transcribed start (at least MIN_VOICED_S at
+    or above `threshold_db`, dips under MIN_QUIET_S bridged, reaching that start; chained back
+    over stops up to ONSET_CHAIN_S, so an earlier click or breath is never it) when it begins
+    within REANCHOR_S before it (DTW runs late after pauses); otherwise, or without
+    one, to the nearest audible onset (a frame at or above `threshold_db` after MIN_QUIET_S
+    below it, staying up for MIN_VOICED_S) within `window` of it. Never before the previous word's end, nor leaving the word shorter than
     MIN_WORD_S."""
     quiet, voiced = _frames(env, MIN_QUIET_S), _frames(env, MIN_VOICED_S)
     db = env.db
@@ -175,9 +177,21 @@ def snap_onsets(
             # ramped onset, bridged); one already sounding at its start is earlier speech
             lo = max(prev_end, word.start - REANCHOR_S)
             runs = _voiced_runs(env, lo, word.start + MIN_VOICED_S + env.hop, threshold_db)
-            onset = next(
-                (a for a, _ in runs if lo + env.hop / 2 < a <= word.start + env.hop / 2), None
+            # the run leading into the word: it reaches the transcribed start (gaps under
+            # MIN_QUIET_S bridged), so an earlier click or breath in the window is not it
+            k = next(
+                (
+                    k
+                    for k in range(len(runs) - 1, -1, -1)
+                    if runs[k][0] <= word.start + env.hop / 2
+                    and runs[k][1] >= word.start - MIN_QUIET_S
+                ),
+                None,
             )
+            # ... chained back over the short stops inside the word (ONSET_CHAIN_S at most)
+            while k is not None and k > 0 and runs[k][0] - runs[k - 1][1] <= ONSET_CHAIN_S:
+                k -= 1
+            onset = runs[k][0] if k is not None and runs[k][0] > lo + env.hop / 2 else None
             if onset is not None and not prev_end <= onset <= word.end - MIN_WORD_S:
                 onset = None
         if onset is None:
@@ -276,32 +290,57 @@ def _voiced_share(env: Envelope, start: float, end: float, threshold_db: float) 
 
 
 def anchor_words(
-    words: list[Word], env: Envelope, threshold_db: float, clip_end: float
+    words: list[Word],
+    env: Envelope,
+    threshold_db: float,
+    clip_end: float,
+    ranges: Sequence[tuple[float, float]] | None = None,
 ) -> list[Word]:
     """Words whose transcript times sit over silence moved onto the speech:
 
-    - the final words: the clip's last voiced frame before `clip_end` bounds them; words
-      starting after it (no sound of their own) share the last spoken word's span up to it
-      with that word, by text length, and no word ends past it;
+    - the final words: the last voiced frame of the last kept range with words (before
+      `clip_end`) bounds them; words starting after it, and words over silence right before
+      the last spoken word (no voice of their own), share that word's span up to it, by text
+      length, and no word ends past it;
     - any other word with under QUIET_WORD_SHARE of its frames voiced moves (keeping its
       length where it fits) onto the nearest voiced run between its neighbours (left alone
       when there is none).
-    Words outside the envelope are untouched."""
+    With `ranges` (the kept source ranges) a word only ever moves within its own range's
+    sound. Words outside the envelope are untouched."""
     out = list(words)
     inside = [i for i, w in enumerate(out) if _covers(env, w.start) and w.start < clip_end]
     if not inside:
         return out
-    runs = _voiced_runs(env, out[inside[0]].start - REANCHOR_S, clip_end, threshold_db)
+
+    def home(t: float) -> tuple[float, float]:
+        """The kept range holding time `t` (the nearest one), or everything."""
+        if not ranges:
+            return -np.inf, np.inf
+        return min(ranges, key=lambda r: max(r[0] - t, t - r[1], 0.0))
+
+    a0, b0 = home(out[inside[-1]].start)
+    first = [i for i in inside if home(out[i].start) == (a0, b0)]
+    lo0 = max(out[first[0]].start - REANCHOR_S, a0)
+    runs = _voiced_runs(env, lo0, min(clip_end, b0), threshold_db)
     fixed: set[int] = set()
     if runs:
         last = runs[-1][1]
-        trail = [i for i in inside if out[i].start >= last - MIN_WORD_S]
-        lead = [i for i in inside if out[i].start < last - MIN_WORD_S]
+        trail = [i for i in first if out[i].start >= last - MIN_WORD_S]
+        lead = [i for i in first if out[i].start < last - MIN_WORD_S]
         if lead:
             p = lead[-1]
-            group = [p, *trail]
+            # words over silence right before it (no voice of their own, none between them
+            # and it: DTW gave "direct action." to "action." alone) share its span too
+            before: list[int] = []
+            for q in reversed(lead[:-1]):
+                if _voiced_share(env, out[q].start, out[q].end, threshold_db) >= QUIET_WORD_SHARE:
+                    break
+                if _voiced_runs(env, out[q].end, out[p].start, threshold_db):
+                    break
+                before.insert(0, q)
+            group = [*before, p, *trail]
             t0 = out[p].start
-            if trail:
+            if len(group) > 1:
                 sizes = [max(len(out[i].text.strip()), 1) for i in group]
                 span, t = last - t0, t0
                 for i, size in zip(group, sizes, strict=True):
@@ -316,16 +355,16 @@ def anchor_words(
         w = out[i]
         if i in fixed or _voiced_share(env, w.start, w.end, threshold_db) >= QUIET_WORD_SHARE:
             continue
-        lo = out[i - 1].end if i else -np.inf
-        hi = out[i + 1].start if i + 1 < len(out) else clip_end
+        ra, rb = home(w.start)
+        lo = max(out[i - 1].end if i else -np.inf, ra)
+        hi = min(out[i + 1].start if i + 1 < len(out) else clip_end, rb)
         near = [
             (a, b)
             for a, b in _voiced_runs(env, max(lo, env.t0), hi, threshold_db)
             if b - a >= MIN_WORD_S
         ]
         if not near:
-            _share(out, i, env, threshold_db)
-            continue
+            continue  # nothing voiced between its neighbours: left alone
         a, b = min(near, key=lambda r: max(r[0] - w.end, w.start - r[1], 0.0))
         dur = w.end - w.start
         if b <= w.start:
@@ -370,27 +409,35 @@ def _uncovered(
     return pieces
 
 
-def _share(out: list[Word], i: int, env: Envelope, threshold_db: float) -> None:
-    """A word over silence with no voiced run between its neighbours shares a voiced
-    neighbour's span (the next word's first, else the previous one's), split by text length:
-    DTW gave one burst ("direct action.") to one of the words. In place; nothing to share
-    leaves it alone."""
-    w = out[i]
-    for j in (i + 1, i - 1):
-        if not 0 <= j < len(out):
-            continue
-        other = out[j]
-        if _voiced_share(env, other.start, other.end, threshold_db) < SHARE_VOICED:
-            continue
-        a, b = other.start, other.end
-        mine, theirs = max(len(w.text.strip()), 1), max(len(other.text.strip()), 1)
-        cut = round(a + (b - a) * (mine if j > i else theirs) / (mine + theirs), 3)
-        if cut - a < MIN_WORD_S or b - cut < MIN_WORD_S:
-            continue
-        first, second = (w, other) if j > i else (other, w)
-        out[min(i, j)] = first.model_copy(update={"start": round(a, 3), "end": cut})
-        out[max(i, j)] = second.model_copy(update={"start": cut, "end": round(b, 3)})
-        return
+def _dropped_burst(
+    burst: tuple[float, float],
+    words: list[Word],
+    mine: list[int],
+    theirs: list[int],
+    end: float,
+    start: float,
+) -> bool:
+    """Whether a voiced burst around a range start (`start`; the previous range ends at
+    `end`) is the tail of the dropped side's sound: at most MAX_FRAGMENT_S of it past the
+    start, overlapping a dropped word (one between the ranges), and no kept word of the range
+    (`theirs`) with most of its transcript span inside it -- that word is the burst."""
+    a, b = burst
+    if b - start > MAX_FRAGMENT_S:
+        return False
+    keep = set(mine) | set(theirs)
+    dropped = [
+        w
+        for i, w in enumerate(words)
+        if i not in keep and end - 1e-9 <= (w.start + w.end) / 2 < start + 1e-9
+    ]
+    if not any(min(w.end, b) > max(w.start, a) for w in dropped):
+        return False
+    for i in theirs:
+        w = words[i]
+        inside = max(0.0, min(w.end, b) - max(w.start, a))
+        if inside > (w.end - w.start) / 2:
+            return False
+    return True
 
 
 def snap_splices(
@@ -472,7 +519,7 @@ def snap_splices(
         if not held(s):
             tail = burst(s)
             new = None
-            if tail and tail[1] - s <= MAX_FRAGMENT_S:
+            if tail and _dropped_burst(tail, words, mine, theirs, e, s):
                 # a dropped word's tail runs on past the range start: start after it
                 onset = _rise_from(env, tail[1], threshold_db)
                 hi = min(onset - ONSET_PAD_S, tail[1] + SPLICE_MAX_S)

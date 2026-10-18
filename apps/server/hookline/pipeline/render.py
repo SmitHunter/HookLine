@@ -69,14 +69,14 @@ CAM_EDGE_LO, CAM_EDGE_HI = 0.02, 0.98  # a cam box this close to a cropped edge 
 SEAM_FLASH = (0.35, 0.6, 0.35)  # white opacity of the 3 frames around the cold-open seam
 SEAM_SLACK_S = 0.1  # frame snapping may move a cold-open range bound by up to a frame
 FADE_IN_S, FADE_OUT_S = 0.02, 0.2  # audio fades at the clip's start and end (no clicks)
+MIN_FADE_OUT_S = 0.08  # ... the end fade shortens to this at least to spare the last word
 # Room tone: a pink-noise bed this loud (dBFS RMS) under clips whose cut exposes digital
 # silence (a source noise gate's exact zeros) at least ZERO_RUN_S long; too quiet to move
 # the loudness. PINK_RMS_DB: anoisesrc pink noise at amplitude 1 (measured).
 ROOM_TONE_DB = -62.0
 PINK_RMS_DB = -14.3
 ZERO_RUN_S = 0.2
-CUT_SLIVER_S = 0.08  # a caption word this short at a cut is a splice remnant: not shown
-CUT_TOUCH_S = 0.05  # ... "at a cut": starting or ending this close to it
+CUT_SLIVER_S = 0.08  # a caption word this short next to a cut is a splice remnant: not shown
 
 log = logging.getLogger(__name__)
 
@@ -141,11 +141,16 @@ def emphasis_times(beats: list[str], keep: list[tuple[float, float]]) -> list[fl
     return out
 
 
-def audio_fades(duration: float) -> str:
-    """FADE_IN_S fade-in at the start and FADE_OUT_S fade-out ending at `duration`."""
+def audio_fades(duration: float, last_word_end: float | None = None) -> str:
+    """FADE_IN_S fade-in at the start and a FADE_OUT_S fade-out ending at `duration`, starting
+    no earlier than `last_word_end` (output s; the fade shortens, to MIN_FADE_OUT_S at least,
+    rather than dim the last word)."""
+    start = max(duration - FADE_OUT_S, 0.0)
+    if last_word_end is not None:
+        start = min(max(start, last_word_end), max(duration - MIN_FADE_OUT_S, 0.0))
     return (
         f"afade=t=in:st=0:d={FADE_IN_S:g},"
-        f"afade=t=out:st={max(duration - FADE_OUT_S, 0.0):.3f}:d={FADE_OUT_S:g}"
+        f"afade=t=out:st={start:.3f}:d={round(duration - start, 3):g}"
     )
 
 
@@ -161,14 +166,17 @@ def room_tone(duration: float) -> str:
 def drop_cut_slivers(
     words: list[Word], cuts: list[float], min_s: float = CUT_SLIVER_S
 ) -> list[Word]:
-    """`words` (output time) without those shorter than `min_s` that start or end at a cut
-    (within CUT_TOUCH_S): the remnant of a word the splice cut through, a caption flash."""
-    return [
-        w
-        for w in words
-        if w.end - w.start >= min_s
-        or not any(abs(w.start - c) <= CUT_TOUCH_S or abs(w.end - c) <= CUT_TOUCH_S for c in cuts)
-    ]
+    """`words` (output time) without those shorter than `min_s` next to a cut: the last word
+    before it or the first after it (by their mid-points), the remnant of a word the splice
+    cut through -- a caption flash."""
+    drop: set[int] = set()
+    for c in cuts:
+        before = [i for i, w in enumerate(words) if (w.start + w.end) / 2 < c]
+        after = [i for i, w in enumerate(words) if (w.start + w.end) / 2 >= c]
+        for i in [*before[-1:], *after[:1]]:
+            if words[i].end - words[i].start < min_s:
+                drop.add(i)
+    return [w for i, w in enumerate(words) if i not in drop]
 
 
 def _word_gaps(words: list[Word]) -> list[tuple[float, float]]:
@@ -331,7 +339,7 @@ def render_clip(
     if voice_db is not None and untailed:
         # final words onto the last voiced frame, words over silence onto the speech; the
         # tail follows the speech, every drop / dead-air splice lands in silence
-        timed = anchor_words(near, env, voice_db, clip_end=untailed[-1][1])
+        timed = anchor_words(near, env, voice_db, clip_end=untailed[-1][1], ranges=untailed)
         tailed = _with_tail(untailed, timed, env, voice_db)
         bounds = list(refined.cold_open) if refined.cold_open else []
         tailed, timed = snap_splices(tailed, timed, env, voice_db, fps, fixed=bounds, adjust=True)  # type: ignore[misc]
@@ -424,6 +432,7 @@ def render_clip(
         out_label = "[vfinal]"
 
     audio_args: list[str] = []
+    last_end = max((w.end for w in out_words), default=None)  # the end fade spares it
     audio_map = ["-map", "0:a?"]
     if audio is not None and bed:
         # digital silence in the cut: a room-tone bed under everything, after the loudness
@@ -431,12 +440,12 @@ def render_clip(
         graph += (
             f";[0:a]{audio.af}[amain];{room_tone(duration)}[abed];"
             f"[amain][abed]amix=inputs=2:duration=first:normalize=0,"
-            f"{audio_fades(duration)}[aout]"
+            f"{audio_fades(duration, last_end)}[aout]"
         )
         audio_map = ["-map", "[aout]"]
         log.info("%s: digital silence in the cut; room tone at %g dBFS", name, ROOM_TONE_DB)
     elif audio is not None:  # the clip has audio
-        audio_args = ["-af", f"{audio.af},{audio_fades(duration)}"]
+        audio_args = ["-af", f"{audio.af},{audio_fades(duration, last_end)}"]
 
     tmp = dst.with_suffix(".tmp.mp4")
     _run(

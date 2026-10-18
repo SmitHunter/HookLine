@@ -82,7 +82,7 @@ STACKED_CAPTION_Y = 700  # just below the cam/game seam (640), inside the safe b
 STACKED_HOOK_Y = STACKED_CAPTION_Y + CAPTION_BELOW + TEXT_SEPARATION + HOOK_HALF
 HOOK_Y = 360  # requested centre; clamped so the box stays in Q4 (1 line: 378, 2 lines: 446)
 # A rendered face sample (`SceneLayout.face_px`): output s, core x0, top, x1, bottom, eye y px
-FaceSample = tuple[float, float, float, float, float, float]
+FaceSample = tuple[float, float, float, float, float, float | None]
 SAMPLE_HALF_S = 0.125  # a face sample stands for this long either side (4 fps)
 
 HEADER = f"""[Script Info]
@@ -457,12 +457,44 @@ def _face_px(layout: SceneLayout) -> tuple[float, float] | None:
 Faces = list[tuple[float, float, float]]  # (weight s, top px, bottom px)
 
 
+def face_top(sample: Sequence[float | None]) -> float:
+    """Where a face sample's core starts (px): its eye line when the landmarks gave one (text
+    above the eyes sits on forehead/hair: accepted), else the box minus its top
+    FACE_CORE_TOP."""
+    eye = sample[5]
+    return float(eye) if eye is not None else float(sample[2])  # type: ignore[arg-type]
+
+
+def held_face_px(
+    rows: Sequence[Sequence[float | None]], start: float, end: float
+) -> list[list[float | None]]:
+    """A scene's face samples with the first held back to its start and the last held on to
+    its end (copies every 2 * SAMPLE_HALF_S): before the first sample and after the last the
+    face is where it was nearest."""
+    rows = sorted((list(r) for r in rows), key=lambda r: r[0])  # type: ignore[arg-type, return-value]
+    if not rows:
+        return []
+    step = 2 * SAMPLE_HALF_S
+    out: list[list[float | None]] = []
+    t = rows[0][0] - step  # type: ignore[operator]
+    while t > start - SAMPLE_HALF_S:
+        out.insert(0, [max(t, start), *rows[0][1:]])
+        t -= step
+    out += rows
+    t = rows[-1][0] + step  # type: ignore[operator]
+    while t < end + SAMPLE_HALF_S:
+        out.append([min(t, end), *rows[-1][1:]])
+        t += step
+    return out
+
+
 def face_samples(layouts: Sequence[SceneLayout]) -> list[FaceSample]:
-    """Every scene's rendered per-sample face cores (`face_px`), in time order."""
+    """Every scene's rendered per-sample face cores (`face_px`, held to the scene's bounds:
+    `held_face_px`), in time order; the last field the eye line, or None without landmarks."""
     return sorted(
-        (float(s[0]), float(s[1]), float(s[2]), float(s[3]), float(s[4]), float(s[5]))
+        (float(s[0]), float(s[1]), float(s[2]), float(s[3]), float(s[4]), s[5])  # type: ignore[arg-type,misc]
         for lay in layouts
-        for s in lay.face_px
+        for s in held_face_px(lay.face_px, lay.start, lay.end)
     )
 
 
@@ -477,8 +509,8 @@ def _faces(layouts: list[SceneLayout], until: float | None = None) -> Faces:
             continue
         if lay.face_px:
             out += [
-                (2 * SAMPLE_HALF_S, min(s[2], s[5]), s[4])
-                for s in lay.face_px
+                (2 * SAMPLE_HALF_S, face_top(s), s[4])
+                for s in held_face_px(lay.face_px, lay.start, lay.end)
                 if until is None or s[0] < until
             ]
             continue
@@ -508,7 +540,7 @@ def _page_y(
 
     def overlap(y: int, gap: float) -> float:
         top, bottom = y - CAPTION_ABOVE - gap, y + CAPTION_BELOW + gap
-        return sum(max(0.0, min(bottom, f[4]) - max(top, min(f[2], f[5]))) for f in near)
+        return sum(max(0.0, min(bottom, f[4]) - max(top, face_top(f))) for f in near)
 
     if not near or overlap(default, 0) == 0:
         return default

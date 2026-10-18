@@ -64,8 +64,9 @@ class SceneLayout(BaseModel):
     # placement and Q4b); word gaps (output s) a snap prefers -- render-time only, not saved.
     track_face: list[tuple[float, float, float | None]] = []
     snaps: list[float] = []
-    face_px: list[list[float]] = []
+    face_px: list[list[float | None]] = []
     gaps: list[tuple[float, float]] = Field(default=[], exclude=True)
+    cuts: list[float] = Field(default=[], exclude=True)  # output s: changes there are instant
     split_x: tuple[float, float] | None = None
     face_box: tuple[float, float] | None = None  # median face (y, h), normalized; captions
     face_w: float | None = None  # median face width (FACE_TRACK), normalized to source width

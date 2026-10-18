@@ -14,7 +14,7 @@ from typing import Literal
 
 import numpy as np
 
-from hookline.captions.ass import face_rects
+from hookline.captions.ass import face_rects, face_top, held_face_px
 from hookline.fsutil import atomic_write_text
 from hookline.media.ffmpeg import probe_duration
 from hookline.media.loudness import measure_loudness
@@ -437,10 +437,10 @@ def _face_share(
     alone), else the median face of the scene at `t` scaled by the zoom step in effect."""
     a, b = window or (t, t)
     rects = [
-        (s[1], min(s[2], s[5]), s[3], s[4])
+        (s[1], face_top(s), s[3], s[4])
         for lay in layouts
         if lay["start"] - 1e-6 <= b and a < lay["end"]
-        for s in lay.get("face_px") or []
+        for s in held_face_px(lay.get("face_px") or [], lay["start"], lay["end"])
         if a - FACE_SAMPLE_HALF_S <= s[0] <= b + FACE_SAMPLE_HALF_S
     ]
     if not rects:

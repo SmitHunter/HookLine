@@ -526,3 +526,29 @@ def test_q3b_warns_on_uncaptioned_speech(good_mp4, tmp_path):
     assert _by_id(audit_clip(good_mp4, _sidecar(uncaptioned_speech=[]), ass))["Q3b"].status == (
         "pass"
     )
+
+
+# --- fix wave F review round 1: eye line as the core top, samples held to the scene bounds ---
+
+
+def _px_layout(eye, samples=None):
+    rows = samples or [[k * 0.25 + 0.125, 300, 980, 780, 1400, eye] for k in range(32)]
+    return [{"start": 0.0, "end": DUR, "kind": "FACE_TRACK", "face_box": [0.5, 0.2],
+             "face_px": rows}]  # fmt: skip
+
+
+def test_q4b_face_core_starts_at_the_eye_line_when_landmarks_exist():
+    from hookline.quality import _face_share
+
+    box = (300, 1000, 780, 1060)  # text on the forehead: under the 20% line, above the eyes
+    assert _face_share(box, _px_layout(1080), [], 2.0, (1.5, 2.5)) == 0.0
+    assert _face_share(box, _px_layout(None), [], 2.0, (1.5, 2.5)) > 0.10  # no landmarks
+
+
+def test_q4b_holds_the_nearest_face_sample_to_the_scene_bounds():
+    from hookline.quality import _face_share
+
+    rows = [[t, 300, 1100, 780, 1400, 1180] for t in (2.125, 2.375, 2.625)]
+    box = (300, 1150, 780, 1220)
+    assert _face_share(box, _px_layout(None, rows), [], 6.5, (6.0, 7.0)) > 0.10
+    assert _face_share(box, _px_layout(None, rows), [], 0.5, (0.2, 0.8)) > 0.10

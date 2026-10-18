@@ -456,7 +456,10 @@ def test_render_clip_fades_audio_in_and_out(
     af = final_argvs[0][final_argvs[0].index("-af") + 1]
     kept = sum(e - st for st, e in extras["keep_ranges"])
     assert "afade=t=in:st=0:d=0.02" in af
-    assert f"afade=t=out:st={kept - 0.2:.3f}:d=0.2" in af  # wave F: 0.2 s
+    from hookline.pipeline.render import audio_fades
+
+    last = max(e for _, e, _ in extras["caption_words"])  # the fade spares the last word
+    assert audio_fades(kept, last).split(",")[1] in af
     mid, tail = _pcm_tail_rms(dst, 0.03)
     assert tail < 0.3 * mid  # the steady sine is faded out at the end (no click)
 
@@ -635,7 +638,8 @@ def test_drop_cut_slivers_removes_short_words_touching_a_cut():
              Word(start=0.7, end=0.75, text="ok"), Word(start=2.0, end=2.06, text="up."),
              Word(start=2.1, end=2.5, text="And")]  # fmt: skip
     out = drop_cut_slivers(words, cuts=[0.55, 2.06])
-    assert [w.text for w in out] == ["kept", "ok", "And"]  # 50/60 ms at a cut: gone
+    # 50/60 ms next to a cut: gone ("ok" is the first word after the 0.55 cut)
+    assert [w.text for w in out] == ["kept", "And"]
 
 
 def test_digital_zero_runs_finds_noise_gate_silence(tmp_path):
@@ -704,3 +708,72 @@ def test_with_tail_ends_0_2_to_0_3_s_after_the_speech_even_before_the_old_end():
     db[240:260] = -15.0  # 2.4-2.6 s
     ((_, end2),) = _with_tail([(0.5, 3.0)], words[:1], Envelope(0.0, 0.01, db), -32.0)
     assert end2 >= 2.6 + 0.2 - 0.011
+
+
+# --- fix wave F review round 1 ------------------------------------------------------------
+
+
+def test_audio_fades_never_start_before_the_last_word_ends():
+    from hookline.pipeline.render import audio_fades
+
+    assert "afade=t=out:st=9.800:d=0.2" in audio_fades(10.0, last_word_end=9.5)
+    assert "afade=t=out:st=9.850:d=0.15" in audio_fades(10.0, last_word_end=9.85)
+    assert "afade=t=out:st=9.920:d=0.08" in audio_fades(10.0, last_word_end=9.97)  # min 0.08 s
+    assert "afade=t=out:st=9.800:d=0.2" in audio_fades(10.0)
+
+
+def test_render_clip_room_tone_bed_mixes_into_aout(
+    fixture_video, fixture_wav, fixture_words, sample_pick, settings, tmp_path, monkeypatch,
+    final_argvs,
+):  # fmt: skip
+    from hookline.pipeline import render as render_mod
+
+    monkeypatch.setattr(render_mod, "digital_zero_runs", lambda path, min_s: [(1.0, 0.3)])
+    s = settings.model_copy(update={"vertical": False, "captions": False})
+    dst = tmp_path / "12-bed.mp4"
+    extras = render_clip(
+        fixture_video, fixture_wav, sample_pick, fixture_words, tmp_path, dst, s, None
+    )
+    (final,) = final_argvs
+    graph = _graph(final)
+    assert extras["room_tone"] is True and "-af" not in final
+    assert "anoisesrc=color=pink" in graph and "amix=inputs=2" in graph and "[aout]" in graph
+    assert final[final.index("[aout]") - 1] == "-map"
+    assert dst.exists() and probe_duration(dst) == pytest.approx(
+        sum(e - st for st, e in extras["keep_ranges"]), abs=0.1
+    )
+
+
+def test_render_clip_splices_keep_cuts_and_captions_consistent(
+    fixture_video, fixture_wav, fixture_words, sample_pick, settings, tmp_path, monkeypatch
+):
+    # a drop through the pick: the snapped splice edges are what the cut times, the remapped
+    # captions and the sidecar all use
+    from hookline.pipeline import render as render_mod
+
+    monkeypatch.setattr(render_mod, "voice_threshold", lambda env, db: -44.0)
+    pick = sample_pick.model_copy(update={"drops": [(40.0, 43.0)]})
+    s = settings.model_copy(update={"vertical": False, "captions": False})
+    extras = render_clip(
+        fixture_video, fixture_wav, pick, fixture_words, tmp_path, tmp_path / "13-s.mp4", s, None
+    )
+    keep = extras["keep_ranges"]
+    assert extras["cut_times"] == cut_times_for([tuple(k) for k in keep])
+    assert any(a < 40.2 and 42.8 < b for (_, a), (b, _) in pairwise(keep))  # the drop is cut
+    total = sum(b - a for a, b in keep)
+    for start, end, _ in extras["caption_words"]:
+        assert 0 <= start < end <= total + 1e-6
+        # no caption word runs across a cut
+        assert not any(start < c - 0.01 and c + 0.01 < end for c in extras["cut_times"])
+
+
+def test_drop_cut_slivers_removes_the_short_word_next_to_a_cut_even_a_little_off_it():
+    # clip 04: the remnant "up." (75 ms) was re-anchored onto sound 80 ms after the cut: it is
+    # still the first word after the cut, a flash; a short word further on stays
+    from hookline.pipeline.render import drop_cut_slivers
+
+    words = [Word(start=0.0, end=0.5, text="kept"), Word(start=0.63, end=0.705, text="up."),
+             Word(start=0.75, end=1.1, text="And"), Word(start=1.15, end=1.2, text="a"),
+             Word(start=1.25, end=1.6, text="lot")]  # fmt: skip
+    out = drop_cut_slivers(words, cuts=[0.55])
+    assert [w.text for w in out] == ["kept", "And", "a", "lot"]

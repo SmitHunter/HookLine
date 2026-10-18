@@ -709,7 +709,7 @@ def test_build_ass_moves_only_the_pages_shown_over_a_head_dip():
         for t, _, y0, _, y1, eye in faces:
             if a - 0.125 <= t <= b + 0.125:
                 top, bottom = y - CAPTION_ABOVE, y + CAPTION_BELOW
-                assert bottom <= min(y0, eye) or top >= y1, (a, b, y, t)
+                assert bottom <= eye or top >= y1, (a, b, y, t)  # the eye line tops the core
 
 
 def test_caption_y_for_counts_the_per_sample_faces():
@@ -719,3 +719,34 @@ def test_caption_y_for_counts_the_per_sample_faces():
     )  # fmt: skip
     # the median box (576-960 px) leaves 1180 free, the per-sample faces (1000-1400) do not
     assert caption_y_for([lay], late=True) != 1180
+
+
+def test_page_on_the_forehead_above_the_eye_line_stays_put():
+    from hookline.captions.ass import face_samples
+
+    words = [Word(start=0.2 + 0.4 * i, end=0.5 + 0.4 * i, text=f"w{i}.") for i in range(6)]
+    # core (20% line) from 1130, eyes at 1260: the 1180 line's text (1141-1241) sits on the
+    # forehead, above the eyes -- accepted when the landmarks exist
+    lay = SceneLayout(
+        start=0, end=3, kind="FACE_TRACK", face_box=(0.5, 0.2), track_x=[(0, 0.5)],
+        face_px=[[k * 0.25 + 0.125, 300, 1130, 780, 1500, 1260] for k in range(12)],
+    )  # fmt: skip
+    text = build_ass(words, "", 3.0, faces=face_samples([lay]))
+    assert {y for _, _, y in _page_y(text)} == {1180}
+    blind = lay.model_copy(
+        update={"face_px": [[*r[:5], None] for r in lay.face_px]}  # no landmarks: 20% core
+    )
+    assert {y for _, _, y in _page_y(build_ass(words, "", 3.0, faces=face_samples([blind])))} != {
+        1180
+    }
+
+
+def test_face_samples_hold_to_the_scene_bounds():
+    from hookline.captions.ass import face_samples
+
+    lay = SceneLayout(
+        start=0, end=6, kind="FACE_TRACK", face_box=(0.5, 0.2), track_x=[(0, 0.5)],
+        face_px=[[t, 300, 1100, 780, 1400, None] for t in (2.125, 2.375)],
+    )  # fmt: skip
+    times = [s[0] for s in face_samples([lay])]
+    assert min(times) <= 0.125 + 1e-9 and max(times) >= 6.0 - 0.125 - 1e-9  # covers the scene
