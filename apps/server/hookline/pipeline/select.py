@@ -389,9 +389,9 @@ _START_FILLERS = ("um", "umm", "uh", "uhh", "erm")
 _COMMA_FILLERS = _OPENER_FILLERS
 _MAX_DROP_LINES = 3
 # A dropped question is kept when the next kept line answers it: it opens on one of these, or
-# repeats >= half of the question's content words (words not in _FUNCTION_WORDS).
+# repeats >= 2 of the question's content words (words not in _FUNCTION_WORDS).
 _ANSWER_OPENERS = ("no", "yes", "yeah", "nope", "sure", "absolutely", "not really")
-_ANSWER_MIN_SHARE = 0.5
+_ANSWER_MIN_SHARED = 2
 _FUNCTION_WORDS = {"i", "you", "he", "she", "it", "we", "they", "me", "him", "her", "us"}
 _FUNCTION_WORDS |= {"them", "my", "your", "his", "its", "our", "their", "this", "that"}
 _FUNCTION_WORDS |= {"a", "an", "the", "and", "or", "but", "so", "of", "to", "in", "on", "at"}
@@ -1159,11 +1159,12 @@ def _strip_start_filler(words: list[Word]) -> int:
 
 def _answers(question: str, toks: list[str]) -> bool:
     """Whether a line with tokens `toks` answers `question`: it opens on an answer word ("No,",
-    "Yes,", "Not really.") or repeats >= half of the question's content words."""
+    "Yes,", "Not really.") or repeats >= 2 of the question's content words (one shared word,
+    as in "Did I go?" / "We go there...", is chance)."""
     if any(toks[: len(a.split())] == a.split() for a in _ANSWER_OPENERS):
         return True
     content = {t for t in _tokens(question) if t not in _FUNCTION_WORDS}
-    return bool(content) and len(content & set(toks)) / len(content) >= _ANSWER_MIN_SHARE
+    return len(content & set(toks)) >= _ANSWER_MIN_SHARED
 
 
 def _is_question(text: str) -> bool:
@@ -1192,7 +1193,9 @@ def _drop_lines(
     """The declared drop_lines that are actually cut: at most 3 lines strictly inside
     L{first}..L{last}, none holding the cold-open teaser, no question whose next kept line
     answers it, and none leaving a spoken piece shorter than MIN_PIECE_S between two drops (the
-    later drop is ignored). With `log`, every ignored line is logged (warning)."""
+    later drop is ignored), nor an opening or closing piece with less than MIN_PIECE_S of
+    speech (from its first word's start to its last word's end) before or after the jump cut
+    (the first or last drop is ignored). With `log`, every ignored line is logged (warning)."""
     sents = src.sentences
 
     def warn(msg: str, *args: object) -> None:
@@ -1248,7 +1251,7 @@ def _drop_lines(
             None,
         )
         if short is None:
-            return lines
+            break
         warn(
             "clip %r: drop_lines %s ignored: it would leave a %.2fs spoken piece (under %.1fs) "
             "between jump cuts",
@@ -1258,6 +1261,36 @@ def _drop_lines(
             MIN_PIECE_S,
         )
         lines = [d for d in lines if d not in groups[short]]
+    while lines:
+        groups = _drop_groups(lines)
+        ranges = _drop_ranges(src, lines)
+        edges = [
+            ("opening", groups[0], sents[first].start, ranges[0][0]),
+            ("closing", groups[-1], ranges[-1][1], sents[last].end),
+        ]
+        edge = next(
+            (e for e in edges if _speech(_clip_words(src, e[2], e[3])) < MIN_PIECE_S - 1e-9),
+            None,
+        )
+        if edge is None:
+            break
+        name, group, a, b = edge
+        warn(
+            "clip %r: drop_lines %s ignored: it would leave the %s piece with %.2fs of speech "
+            "(under %.1fs) next to a jump cut",
+            raw.title,
+            ", ".join(f"L{d}" for d in group),
+            name,
+            _speech(_clip_words(src, a, b)),
+            MIN_PIECE_S,
+        )
+        lines = [d for d in lines if d not in group]
+    return lines
+
+
+def _speech(words: list[Word]) -> float:
+    """Seconds from the first word's start to the last word's end (0 without words)."""
+    return words[-1].end - words[0].start if words else 0.0
 
 
 def _merge_wordless_pieces(
@@ -1339,12 +1372,14 @@ def _assemble(
     src: _Source,
     opening: list[Word],
     move: OpenerMove | None,
+    log: bool = True,
 ) -> ClipPick:
-    """The pick for L{first}..L{last}, starting on `opening` (else on L{first}'s start)."""
+    """The pick for L{first}..L{last}, starting on `opening` (else on L{first}'s start);
+    `log` logs its drop and cold-open decisions."""
     start = opening[0].start if opening else src.sentences[first].start
     start = min(max(start, 0.0), src.duration)
     end = min(max(src.sentences[last].end, 0.0), src.duration)
-    drops, cold_open = _drop_plan(raw, first, last, src, start, log=True)
+    drops, cold_open = _drop_plan(raw, first, last, src, start, log=log)
     words = [w for w in _clip_words(src, start, end) if not any(a <= w.start < b for a, b in drops)]
     return ClipPick(
         start=start,
@@ -1444,7 +1479,8 @@ def _to_pick(raw: _RawClip, src: _Source) -> ClipPick | None:
         start_line, move = _guard_move(raw, first, last, src, min_s, opening)
     if start_line != first:
         offset = 0
-    pick = _assemble(raw, start_line, last, src, _opening(raw, start_line, src, offset), move)
+    opening = _opening(raw, start_line, src, offset)
+    pick = _assemble(raw, start_line, last, src, opening, move, log=False)
     if pick.start > src.sentences[start_line].start and _main_duration(pick) < min_s:
         # Only the mid-line start or the filler strip broke the minimum length: start on the
         # whole line (judged by the opener guard again) rather than lose the pick.
@@ -1457,6 +1493,8 @@ def _to_pick(raw: _RawClip, src: _Source) -> ClipPick | None:
         if move is None:
             start_line, move = _guard_move(raw, start_line, last, src, min_s, None)
         pick = _assemble(raw, start_line, last, src, [], move)
+    else:  # the quiet build stands: log its decisions once
+        _drop_plan(raw, start_line, last, src, pick.start, log=True)
     duration = _main_duration(pick)
     if not min_s <= duration <= max_s:
         logger.warning(

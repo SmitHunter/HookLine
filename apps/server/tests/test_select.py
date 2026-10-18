@@ -1475,7 +1475,7 @@ def test_invalid_drop_lines_are_ignored_with_a_warning(fake_llm, settings, caplo
 
 
 def test_at_most_three_drop_lines(fake_llm, settings, caplog):
-    tr, item = _guard_item({}, _FILLER.format(n=10), drop_lines=[11, 13, 15, 17])
+    tr, item = _guard_item({}, _FILLER.format(n=10), drop_lines=[12, 14, 16, 17])
     (p,) = _one(tr, fake_llm, settings, item, caplog)
     assert len(p.segments()) == 4 and "at most 3" in caplog.text
 
@@ -1644,7 +1644,7 @@ _QUESTION = {13: "Did I do this alone?", 14: "No, I did not do this alone."}
 
 @pytest.mark.parametrize(
     "answer",
-    ["No, I did not do this alone.", "Absolutely, every single day.", "This alone took years."],
+    ["No, I did not do this alone.", "Absolutely, every single day.", "Nope, never."],
 )
 def test_a_question_whose_answer_is_kept_is_never_dropped(fake_llm, settings, caplog, answer):
     tr, item = _guard_item({**_QUESTION, 14: answer}, _FILLER.format(n=10), drop_lines=[13])
@@ -1693,3 +1693,55 @@ def test_drop_ranges_swallow_a_short_wordless_piece(settings, caplog):
     with caplog.at_level(logging.INFO, logger="hookline.pipeline.select"):
         out = _merge_wordless_pieces([(1.0, 2.0), (2.5, 3.0), (5.5, 6.0)], src, "t")
     assert out == [(1.0, 3.0), (5.5, 6.0)] and "swallow" in caplog.text
+
+
+# --- fix wave C review round 2 ----------------------------------------------------------------
+
+
+def test_a_question_answered_by_its_content_words_is_never_dropped(fake_llm, settings, caplog):
+    over = {13: "Did the landlord raise the rent?", 14: "The landlord raised the rent again."}
+    tr, item = _guard_item(over, _FILLER.format(n=10), drop_lines=[13])
+    (p,) = _one(tr, fake_llm, settings, item, caplog)
+    assert p.drops == [] and "answers" in caplog.text  # "landlord" and "rent" repeated
+
+
+def test_one_shared_content_word_is_not_an_answer(fake_llm, settings):
+    over = {13: "Did I go?", 14: "We go there on Sundays with the kids."}
+    tr, item = _guard_item(over, _FILLER.format(n=10), drop_lines=[13])
+    (p,) = _one(tr, fake_llm, settings, item)
+    assert len(p.drops) == 1
+
+
+def test_a_drop_leaving_a_short_spoken_opening_is_ignored(fake_llm, settings, caplog):
+    tr, item = _guard_item({10: "Look."}, "Look.", drop_lines=[11])
+    (p,) = _one(tr, fake_llm, settings, item, caplog)
+    assert p.drops == [] and "L11" in caplog.text and "opening" in caplog.text
+
+
+def test_a_drop_leaving_a_short_spoken_ending_is_ignored(fake_llm, settings, caplog):
+    tr, item = _guard_item({18: "Exactly right."}, _FILLER.format(n=10), drop_lines=[17])
+    item["last_words"] = "Exactly right."
+    (p,) = _one(tr, fake_llm, settings, item, caplog)
+    assert p.drops == [] and "L17" in caplog.text and "closing" in caplog.text
+
+
+def test_a_drop_next_to_a_long_enough_edge_piece_stands(fake_llm, settings):
+    tr, item = _guard_item({}, _FILLER.format(n=10), drop_lines=[12, 16])
+    (p,) = _one(tr, fake_llm, settings, item)
+    assert len(p.drops) == 2  # L10-L11 and L17-L18 each hold 5.2 s of speech
+
+
+def test_whole_line_fallback_logs_each_drop_once(fake_llm, settings, caplog):
+    s = settings.model_copy(update={"min_clip_s": 32})  # min 24.0 s
+    tr = _lines_transcript({10: _MID})
+    item = _line_item(
+        10,
+        17,
+        "the original investors walked out of the room.",
+        _FILLER.format(n=17),
+        drop_lines=[13, 25],
+    )  # L10-L17 is 29.2 s, 25.2 s without L13; 23.45 s from the mid-line start
+    (p,) = _one(tr, fake_llm, s, item, caplog)
+    assert p.start == 40.0 and "whole line" in caplog.text
+    assert caplog.text.count("dropped L13") == 1
+    assert caplog.text.count("L25 ignored") == 1

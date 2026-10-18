@@ -200,7 +200,7 @@ def test_picks_cache_key_mismatch_reselects(fixture_video, fake_llm, settings_tm
     job = s.workspace_dir / job_id_for(str(fixture_video))
     saved = json.loads((job / "picks.json").read_text(encoding="utf-8"))
     assert saved["key"] == {
-        "schema": 4,
+        "schema": 5,
         "clips": 1,
         "select_model": s.select_model,
         "min_clip_s": s.min_clip_s,
@@ -503,10 +503,19 @@ def test_run_job_passes_loud_seconds_to_render(fixture_video, fake_llm, settings
     assert seen == [set(range(20, 25))]
 
 
-def test_picks_schema_is_4_for_drop_lines_and_declared_first_words(settings):
-    from hookline.pipeline.run import PICKS_SCHEMA, _picks_key
+def test_picks_schema_is_5_and_schema_4_picks_are_reselected(settings, tmp_path):
+    from hookline.pipeline.run import PICKS_SCHEMA, _load_picks, _picks_key
 
-    assert PICKS_SCHEMA == 4 and _picks_key(settings, {})["schema"] == 4
+    assert PICKS_SCHEMA == 5 and _picks_key(settings, {})["schema"] == 5
+    key = _picks_key(settings, {})
+    old = {**key, "schema": 4}
+    ppath = tmp_path / "picks.json"
+    ppath.write_text(json.dumps({"key": old, "picks": []}), encoding="utf-8")
+    logs: list[str] = []
+    assert _load_picks(ppath, key, logs.append) is None
+    assert any("schema" in x and "re-selecting" in x for x in logs)
+    ppath.write_text(json.dumps({"key": key, "picks": []}), encoding="utf-8")
+    assert _load_picks(ppath, key, logs.append) == []
 
 
 def test_packaging_pass_runs_once_and_fixes_captions(

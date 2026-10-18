@@ -264,3 +264,10 @@ def test_transcript_without_word_confidence_is_logged_once(fake_llm, settings, c
     with caplog.at_level(logging.INFO, logger="hookline.pipeline.package"):
         package_clips(picks, words, fake_llm, settings)
     assert "no word confidence" not in caplog.text
+
+
+def test_caption_fix_original_matches_ignoring_case_and_punctuation(fake_llm, settings):
+    fixes = [{"index": 8, "original": "Three", "text": "tree"}]  # the word is "three."
+    fake_llm.queue({"clips": [_answer(caption_fixes=fixes)]})
+    (p,) = package_clips([_pick()], WORDS, fake_llm, settings)
+    assert p.caption_fixes == [CaptionFix(start=14.0, end=14.4, original="three.", text="tree.")]
