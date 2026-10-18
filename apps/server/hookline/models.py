@@ -115,12 +115,12 @@ class ClipPick(BaseModel):
     search_title: str = ""
     category: str = ""
     comment_risk: CommentRisk | None = None
-    # Fix wave C: Claude's own first_words (Q6 checks the clip against them), interior source
+    # Claude's own first_words (Q6 checks the clip against them), interior source
     # ranges cut out of the main span (dropped asides), and caption fixes from packaging.
     declared_first_words: str = ""
     drops: list[tuple[float, float]] = []
     caption_fixes: list[CaptionFix] = []
-    # Fix wave C round 1: where the opener guard moved the start (None when it did not).
+    # Where the opener guard moved the start (None when it did not).
     opener_moved: OpenerMove | None = None
 
     @property

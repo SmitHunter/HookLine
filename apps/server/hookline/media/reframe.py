@@ -41,7 +41,7 @@ MERGE_S = 0.1  # a crop pulse this close to a zoom step moves onto it: one frami
 FIT_SLACK = 0.98  # plan_zoom's face-fit cap stays this far inside the guard's limit
 FACE_CORE = 0.8  # share of the face box width kept inside the crop for unguarded close-ups
 KEYFRAME_TOL = 0.5  # px: track keyframes this close to the line through their neighbours go
-# Reframe snaps (fix wave F): the rendered crop never pans faster than MAX_PAN_PX source px/s
+# Reframe snaps: the rendered crop never pans faster than MAX_PAN_PX source px/s
 # at a PAN_REF_W-wide source (scaled with the width). A move that needs more becomes an
 # instant reframe (a framing cut) at the moment the face would leave the margin, moved back
 # to a word gap within SNAP_GAP_S when the new framing already fits there. SNAP_EPS is the
@@ -89,7 +89,7 @@ STEP_SHIFT = 0.04
 _CAP_STEP = 0.005
 
 _CROP_SAMPLES = 15
-# Full-cam reaction beats (wave G-layout): the cam's chin lands at most here, so a caption fits
+# Full-cam reaction beats: the cam's chin lands at most here, so a caption fits
 # below it inside Q4 (caption line 1180 - 39 px visible above it - a 40 px face gap).
 BEAT_CHIN_Y = 1100
 # ... the beat shows a head-centred window of the cam at this aspect (1080x1350: a large

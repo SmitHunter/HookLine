@@ -480,7 +480,7 @@ def fit_to_signals(
     return out
 
 
-# --- wave H: static screens, voiceless stretches, the payoff after the end -------------------
+# --- stream editing: static screens, voiceless stretches, the payoff after the end ---------
 
 STATIC_WORD_PAD_S = 0.05  # a static cut starts / ends this far clear of a word it would split
 STATIC_MIN_GAP_S = 0.25  # a static cut shorter than this is not worth a jump cut

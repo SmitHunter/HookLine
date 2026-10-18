@@ -18,7 +18,7 @@ _BLOCK_FRAMES = 4 * 600  # frames read per block (~10 minutes at 4 fps)
 # source so a long VOD on a slow machine is never cut off: half real time, at least 10 min.
 MOTION_TIMEOUT_MIN_S = 600.0
 MOTION_TIMEOUT_RATE = 0.5
-# Wave H: a "screen" frame (death / loading / menu screen, a fade) of the same decode: near
+# A "screen" frame (death / loading / menu screen, a fade) of the same decode: near
 # uniform -- its 90th and 10th percentile grey levels at most SCREEN_SPREAD apart (a black
 # screen with small text; a fade's flat colour) -- or near white (10th percentile >=
 # SCREEN_WHITE). Measured on a horror stream: death / loading screens and fades spread 0-7,
@@ -90,7 +90,7 @@ def frame_stats(
     given, is called after each block of frames with the source seconds decoded so far.
 
     Screen: per second, a bitmask of its `fps` frames (bit k = frame k) that are screen
-    frames (`screen_frames`), from the same decode. Chroma (wave H round 1): per second, the
+    frames (`screen_frames`), from the same decode. Chroma: per second, the
     mean `frame_chroma` of its screen frames over the cells outside `mask` (a stream's cam and
     labels: normalized boxes), None for a second without screen frames."""
     cmd = [

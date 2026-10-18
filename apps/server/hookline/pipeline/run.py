@@ -321,7 +321,8 @@ def beat_spikes(signals: Signals) -> list[tuple[float, float]]:
 
 def screen_mask_for(profile: LayoutProfile | None) -> list[Rect] | None:
     """The stream profile's cam and its labels (`LayoutProfile.keep_out`) as normalized x0, y0,
-    x1, y1 boxes: masked out of the static-screen chroma (wave H round 1). None without a cam."""
+    x1, y1 boxes: masked out of the static-screen chroma (a cam is coloured, a death screen
+    behind it is not). None without a cam."""
     if profile is None or profile.cam is None:
         return None
     w, h = profile.size

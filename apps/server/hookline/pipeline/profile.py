@@ -1,4 +1,4 @@
-"""VOD-level stream layout profile (wave G-layout), computed once per job and cached.
+"""VOD-level stream layout profile, computed once per job and cached.
 
 A streamer's facecam overlay is a fixed rectangle: the same small face in the same place for
 most of the VOD. The profile finds it once -- sampling PROFILE_SAMPLES frames across the VOD

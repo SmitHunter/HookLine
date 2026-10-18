@@ -141,7 +141,7 @@ LIMITER = "alimiter=limit={lim:.4f}:attack=1:release=50:level=false:latency=true
 PREGAIN_PASSES = 3  # limiting costs loudness, so the pre-gain is re-aimed by the measured miss
 
 
-# Wave G-select: the clip's loudness range is held to MAX_LRA by a leveler (a slow
+# The clip's loudness range is held to MAX_LRA by a leveler (a slow
 # compressor after the gain, which has put the speech at TARGET_I, so its threshold sits
 # relative to the speech level) before the limiter. LEVELERS is a ladder from gentle to firm,
 # climbed only while the range is over MAX_LRA or the speech sits more than SPEECH_SWAY_DB

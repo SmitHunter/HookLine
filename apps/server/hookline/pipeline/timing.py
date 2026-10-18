@@ -590,7 +590,7 @@ def snap_splices(
     return (ranges, words) if adjust else ranges
 
 
-# --- wave H: the cause sound before a segment, held word ends, frame-0 pre-roll ---------------
+# --- the cause sound before a segment, held word ends, frame-0 pre-roll ----------------------
 
 CAUSE_LOOKBACK_S = 0.6  # a sharp onset this close before a segment start is its cause ...
 CAUSE_JUMP_DB = 15.0  # ... a rise of this much over the quietest of the preceding ...
