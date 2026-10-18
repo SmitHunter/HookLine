@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import traceback
 import wave
 from collections.abc import Callable
 from pathlib import Path
@@ -10,8 +11,14 @@ from hookline.config import Settings
 from hookline.fsutil import atomic_write_text, slugify
 from hookline.llm import LLMBackend
 from hookline.media.audio import MOMENTARY_HOP, momentary_db, rms_per_second
-from hookline.media.ffmpeg import FFmpegError, extract_audio, pick_encoder, probe_video_kbps
-from hookline.media.motion import Rect, frame_stats
+from hookline.media.ffmpeg import (
+    FFmpegError,
+    extract_audio,
+    has_audio,
+    pick_encoder,
+    probe_video_kbps,
+)
+from hookline.media.motion import Rect, frame_stats, motion_timeout
 from hookline.models import ClipPick, Transcript, Word
 from hookline.pipeline.boundaries import (
     CAUSE_MAX_S,
@@ -21,7 +28,7 @@ from hookline.pipeline.boundaries import (
     fit_to_signals,
 )
 from hookline.pipeline.chat import chat_keywords, chat_rate, try_fetch_chat
-from hookline.pipeline.ingest import find_source, ingest, job_id_for
+from hookline.pipeline.ingest import IngestError, find_source, ingest, job_id_for
 from hookline.pipeline.layout import SCARE_POST_S, SCARE_PRE_S
 from hookline.pipeline.package import apply_caption_fixes, package_clips
 from hookline.pipeline.profile import LayoutProfile, layout_profile
@@ -188,7 +195,9 @@ def _signals(
     SIGNALS_VERSION, the VOD motion decode (the slow part; motion, screen frames and their
     chroma) only when the cache lacks any of them or measured the chroma with another cam
     `mask` (`screen_mask`: the stream profile's cam and labels, `screen_mask_for`). A failed
-    onset or motion analysis is stored as missing, so the next run retries it."""
+    onset analysis is stored as missing, so the next run retries it; a failed or timed-out
+    motion decode (slow: up to `motion_timeout`) is recorded (`motion_failed`) and retried only
+    for a changed source file or SIGNALS_VERSION."""
     spath = job_dir / "signals.json"
     cpath = job_dir / "chat.json"
     cached: Signals | None = None
@@ -202,7 +211,8 @@ def _signals(
     )
     onsets_stale = cached is None or cached.version < SIGNALS_VERSION or cached.onset_times is None
     want_mask = [list(b) for b in mask] if mask else None
-    motion_stale = (
+    mkey = motion_key(src)
+    motion_stale = (cached is None or cached.motion_failed != mkey) and (
         cached is None
         or cached.motion is None
         or cached.screen is None
@@ -240,13 +250,27 @@ def _signals(
             update |= {"onset_times": None, "transient_times": None}
             update |= {"onsets": None, "transients": None}
     if motion_stale:
+        long_scan = duration >= MOTION_PROGRESS_MIN_S
+        if long_scan:
+            log(f"[4/6] signals: motion scan of {duration / 60:.0f} min started")
+
+        def scanned(done: float) -> None:
+            if long_scan:
+                log(f"[4/6] signals: motion scan {done / 60:.0f} of {duration / 60:.0f} min")
+
         try:
-            motion, screen, chroma = frame_stats(src, mask=mask)
+            motion, screen, chroma = frame_stats(
+                src, mask=mask, timeout=motion_timeout(duration), progress=scanned
+            )
             update |= {"motion": motion, "screen": screen, "screen_chroma": chroma}
-            update["screen_mask"] = want_mask
+            update |= {"screen_mask": want_mask, "motion_failed": None}
         except FFmpegError as e:
-            log(f"warning: motion analysis failed ({e}); continuing without visual signals")
+            log(
+                f"warning: motion analysis failed ({e}); continuing without visual signals "
+                "(not retried until the source changes)"
+            )
             update |= {"motion": None, "screen": None, "screen_chroma": None}
+            update["motion_failed"] = mkey
     if cached is None:
         signals = Signals(duration=duration, loudness=rms_per_second(wav), **update)
     else:
@@ -254,6 +278,17 @@ def _signals(
     atomic_write_text(spath, signals.model_dump_json())
     log("[4/6] signals: done")
     return signals
+
+
+# a motion scan of a source this long (s) logs its progress
+MOTION_PROGRESS_MIN_S = 1800.0
+
+
+def motion_key(src: Path) -> str:
+    """The source file (size, modification time) and SIGNALS_VERSION a motion decode ran on:
+    a failed decode is retried only when this changes."""
+    st = src.stat()
+    return f"v{SIGNALS_VERSION}:{st.st_size}:{st.st_mtime_ns}"
 
 
 def _loud_seconds(signals: Signals) -> set[int]:
@@ -366,6 +401,12 @@ def run_job(
         log("[2/6] audio: skipped (cached)")
     else:
         log("[2/6] audio: started")
+        if not has_audio(src):
+            # clips are chosen from what is said: nothing to transcribe, nothing to pick
+            raise IngestError(
+                f"{src.name} has no audio track — Hookline picks clips from speech, so the "
+                "source needs its audio"
+            )
         tmp = job_dir / "audio.wav.tmp.wav"
         extract_audio(src, tmp)
         os.replace(tmp, wav)
@@ -454,18 +495,18 @@ def run_job(
     clips: list[Path] = []
     for i, pick in enumerate(picks, 1):
         dst = out_dir / f"{i:02d}-{slugify(pick.title)}.mp4"
-        # the cause of an opening reaction pulled in; no death-screen / menu tails; the final
-        # hard length clamp (max_clip_s + the payoff allowance, the end tail not counted)
-        # still, quiet, wordless stretches, static screens and long voiceless stretches inside
-        # the clip are cut like dead air (`gaps`)
-        trimmed, gaps, _ = fit_pick(pick, words, signals, wav, settings)
-        if trimmed != pick:
-            log(
-                f"clip {i:02d}: fitted to signals {pick.start:.2f}-{pick.end:.2f} -> "
-                f"{trimmed.start:.2f}-{trimmed.end:.2f}"
-            )
-            pick = trimmed
         try:
+            # the cause of an opening reaction pulled in; no death-screen / menu tails; the
+            # final hard length clamp (max_clip_s + the payoff allowance, the end tail not
+            # counted); still, quiet, wordless stretches, static screens and long voiceless
+            # stretches inside the clip are cut like dead air (`gaps`)
+            trimmed, gaps, _ = fit_pick(pick, words, signals, wav, settings)
+            if trimmed != pick:
+                log(
+                    f"clip {i:02d}: fitted to signals {pick.start:.2f}-{pick.end:.2f} -> "
+                    f"{trimmed.start:.2f}-{trimmed.end:.2f}"
+                )
+                pick = trimmed
             extras = render_clip(
                 src,
                 wav,
@@ -483,11 +524,14 @@ def run_job(
                 scares=scares,
                 spikes=spikes,
             )
-        except (FFmpegError, ValueError, OSError) as e:
+        except Exception as e:  # noqa: BLE001 - one bad clip never aborts the job
             reason = (str(e).splitlines() or [type(e).__name__])[0]
             if isinstance(e, FFmpegError) and e.stderr:
                 reason += f" ({e.stderr.splitlines()[-1].strip()})"
             log(f"warning: clip {i:02d} failed: {reason}")
+            if not isinstance(e, (FFmpegError, ValueError, OSError)):
+                # an unexpected error is a bug: keep its traceback for the report
+                log(traceback.format_exc().rstrip())
             continue
         post_caption = pick.post_caption or pick.hook_text
         sidecar = {

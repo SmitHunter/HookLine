@@ -262,6 +262,48 @@ def test_all_clips_failing_raises(fixture_video, fake_llm, settings_tmp, monkeyp
         run_job(str(fixture_video), s, fake_llm, FakeTranscriber(duration=150))
 
 
+def test_any_error_in_one_clip_skips_only_that_clip_with_its_traceback(
+    fixture_video, fake_llm, settings_tmp, monkeypatch
+):
+    """A bug in one clip's fit or render (an IndexError on an odd edge case) skips that clip
+    with a warning and the traceback in the log; the other clips still render."""
+    from hookline.pipeline import run as run_mod
+
+    real = run_mod.fit_pick
+    calls = [0]
+
+    def flaky(*a, **k):
+        calls[0] += 1
+        if calls[0] == 1:
+            raise IndexError("list index out of range")
+        return real(*a, **k)
+
+    monkeypatch.setattr(run_mod, "fit_pick", flaky)
+    fake_llm.queue(make_payload_for(150, 2, 21))
+    s = settings_tmp.model_copy(update={"clips": 2, "vertical": False, "captions": False})
+    logs: list[str] = []
+    clips = run_job(str(fixture_video), s, fake_llm, FakeTranscriber(duration=150), logs.append)
+    assert [c.name[:2] for c in clips] == ["02"]
+    assert any(m.startswith("warning: clip 01 failed: list index out of range") for m in logs)
+    assert any("Traceback" in m and "IndexError" in m for m in logs)
+
+
+def test_a_render_bug_in_every_clip_still_raises_no_clips_rendered(
+    fixture_video, fake_llm, settings_tmp, monkeypatch
+):
+    from hookline.media.ffmpeg import FFmpegError
+    from hookline.pipeline import run as run_mod
+
+    def boom(*a, **k):
+        raise IndexError("list index out of range")
+
+    monkeypatch.setattr(run_mod, "render_clip", boom)
+    fake_llm.queue(make_payload_for(150, 1, 21))
+    s = settings_tmp.model_copy(update={"clips": 1})
+    with pytest.raises(FFmpegError, match="no clips rendered"):
+        run_job(str(fixture_video), s, fake_llm, FakeTranscriber(duration=150))
+
+
 @pytest.mark.parametrize(("timing", "protect"), [("segment", False), ("dtw", True)])
 def test_word_protection_follows_transcript_timing(
     fixture_video, fake_llm, settings_tmp, monkeypatch, timing, protect
@@ -675,7 +717,7 @@ def test_signals_cache_keeps_motion_and_recomputes_only_the_onsets(signals_input
     del sig["onset_times"], sig["transient_times"]
     (job / "signals.json").write_text(json.dumps(sig), encoding="utf-8")
 
-    def no_decode(src, mask=None):
+    def no_decode(src, mask=None, **k):
         raise AssertionError("motion re-decoded")
 
     monkeypatch.setattr(run_mod, "frame_stats", no_decode)
@@ -689,23 +731,82 @@ def test_signals_cache_keeps_motion_and_recomputes_only_the_onsets(signals_input
     assert out.chat is not None and out.motion == [7.0] * 150
 
 
-def test_a_failed_motion_analysis_is_retried_next_run(signals_inputs, monkeypatch):
+def test_a_failed_motion_analysis_is_recorded_and_retried_only_for_a_new_source_or_version(
+    signals_inputs, monkeypatch
+):
+    """A decode that fails or times out (a damaged or very long VOD) is recorded in
+    signals.json, so the next run does not spend the timeout again; a changed source file or
+    a new SIGNALS_VERSION retries it."""
     from hookline.media.ffmpeg import FFmpegError
     from hookline.pipeline import run as run_mod
 
     job, src, wav, transcript = signals_inputs
     real = run_mod.frame_stats
+    calls = []
 
-    def broken(src, mask=None):
-        raise FFmpegError("decode failed")
+    def broken(src, **k):
+        calls.append(k)
+        raise FFmpegError("motion analysis timed out after 600 s")
 
     monkeypatch.setattr(run_mod, "frame_stats", broken)
     assert run_mod._signals(job, src, wav, transcript, lambda m: None).motion is None
-    monkeypatch.setattr(run_mod, "frame_stats", real)
     logs: list[str] = []
     out = run_mod._signals(job, src, wav, transcript, logs.append)
-    assert out.motion and len(out.motion) >= 149
-    assert "[4/6] signals: skipped (cached)" not in logs
+    assert len(calls) == 1 and out.motion is None and out.motion_failed
+    assert "[4/6] signals: skipped (cached)" in logs
+    # a new signals version retries the decode
+    monkeypatch.setattr(run_mod, "SIGNALS_VERSION", run_mod.SIGNALS_VERSION + 1)
+    monkeypatch.setattr(run_mod, "frame_stats", real)
+    out = run_mod._signals(job, src, wav, transcript, lambda m: None)
+    assert out.motion and len(out.motion) >= 149 and out.motion_failed is None
+
+
+def test_a_failed_motion_analysis_is_retried_for_a_changed_source(signals_inputs, monkeypatch):
+    import os
+    import shutil
+
+    from hookline.media.ffmpeg import FFmpegError
+    from hookline.pipeline import run as run_mod
+
+    job, fixture, wav, transcript = signals_inputs
+    src = shutil.copy(fixture, job / "source.mp4")
+    calls = []
+
+    def broken(src, **k):
+        calls.append(src)
+        raise FFmpegError("decode failed")
+
+    monkeypatch.setattr(run_mod, "frame_stats", broken)
+    run_mod._signals(job, src, wav, transcript, lambda m: None)
+    run_mod._signals(job, src, wav, transcript, lambda m: None)
+    assert len(calls) == 1
+    st = os.stat(src)
+    os.utime(src, ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))  # a re-downloaded source
+    run_mod._signals(job, src, wav, transcript, lambda m: None)
+    assert len(calls) == 2
+
+
+def test_the_motion_scan_timeout_scales_with_the_source_and_long_scans_log_progress(
+    signals_inputs, monkeypatch
+):
+    from hookline.media.motion import motion_timeout
+    from hookline.pipeline import run as run_mod
+
+    job, src, wav, transcript = signals_inputs
+    long = transcript.model_copy(update={"duration": 4 * 3600.0})
+    seen = {}
+
+    def fake(src, mask=None, timeout=None, progress=None):
+        seen["timeout"] = timeout
+        for done in (600.0, 1200.0, 4 * 3600.0):
+            progress(done)
+        return [7.0] * 150, [0] * 150, [None] * 150
+
+    monkeypatch.setattr(run_mod, "frame_stats", fake)
+    logs: list[str] = []
+    run_mod._signals(job, src, wav, long, logs.append)
+    assert seen["timeout"] == motion_timeout(4 * 3600.0) > 1800
+    assert any("motion scan" in m and "10 of 240 min" in m for m in logs)
 
 
 def test_run_job_builds_the_layout_profile_once_and_passes_it_with_scares(
@@ -771,7 +872,7 @@ def test_signals_recompute_screens_without_chroma_or_for_a_new_cam_mask(
     job, src, wav, transcript = signals_inputs
     calls = []
 
-    def fake(src, mask=None):
+    def fake(src, mask=None, **k):
         calls.append(mask)
         return [7.0] * 150, [0] * 150, [None] * 150
 
@@ -788,3 +889,22 @@ def test_signals_recompute_screens_without_chroma_or_for_a_new_cam_mask(
     (job / "signals.json").write_text(json.dumps(sig), encoding="utf-8")
     run_mod._signals(job, src, wav, transcript, lambda m: None, mask=cam)
     assert len(calls) == 3
+
+
+def test_a_source_without_audio_fails_with_a_clear_error(fake_llm, settings_tmp, tmp_path):
+    """Clips are chosen from what is said: a video with no audio track stops at the audio
+    step with an IngestError naming the problem, not an ffmpeg stream-mapping error."""
+    import subprocess
+
+    from hookline.pipeline.ingest import IngestError
+
+    src = tmp_path / "silent.mp4"
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+         "-i", "testsrc2=size=160x90:rate=25:duration=2", "-c:v", "libx264", str(src)],
+        check=True,
+    )  # fmt: skip
+    t = FakeTranscriber(duration=2)
+    with pytest.raises(IngestError, match="no audio track"):
+        run_job(str(src), settings_tmp, fake_llm, t)
+    assert t.calls == 0 and not list(settings_tmp.workspace_dir.rglob("audio.wav"))

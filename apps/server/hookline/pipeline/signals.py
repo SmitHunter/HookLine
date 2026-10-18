@@ -79,6 +79,9 @@ class Signals(BaseModel):
     # x0, y0, x1, y1 boxes: the stream profile's cam and labels; None = the whole frame)
     screen_chroma: list[float | None] | None = None
     screen_mask: list[list[float]] | None = None
+    # the source and signals version (`run.motion_key`) whose motion decode failed or timed
+    # out: not retried until either changes
+    motion_failed: str | None = None
 
 
 def onset_times(

@@ -3,6 +3,7 @@
 import subprocess
 import tempfile
 import threading
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -12,8 +13,11 @@ from hookline.media.ffmpeg import FFmpegError
 MOTION_FPS = 4
 MOTION_W, MOTION_H = 64, 36
 _BLOCK_FRAMES = 4 * 600  # frames read per block (~10 minutes at 4 fps)
-# A 1 h 720p VOD decodes in ~20 s; a decode still running after this is stuck (a damaged file).
-MOTION_TIMEOUT_S = 1800.0
+# A 1 h 720p VOD decodes in ~20 s (a 1080p60 one in a few minutes on a slow CPU); a decode
+# still running after `motion_timeout` is stuck (a damaged file). The limit scales with the
+# source so a long VOD on a slow machine is never cut off: half real time, at least 10 min.
+MOTION_TIMEOUT_MIN_S = 600.0
+MOTION_TIMEOUT_RATE = 0.5
 # Wave H: a "screen" frame (death / loading / menu screen, a fade) of the same decode: near
 # uniform -- its 90th and 10th percentile grey levels at most SCREEN_SPREAD apart (a black
 # screen with small text; a fade's flat colour) -- or near white (10th percentile >=
@@ -26,8 +30,13 @@ SCREEN_WHITE = 230.0
 Rect = tuple[float, float, float, float]  # normalized x0, y0, x1, y1
 
 
+def motion_timeout(duration: float) -> float:
+    """The motion decode's time limit (s) for a `duration`-second source."""
+    return max(MOTION_TIMEOUT_MIN_S, duration * MOTION_TIMEOUT_RATE)
+
+
 def frame_motion(
-    src: Path, fps: int = MOTION_FPS, timeout: float = MOTION_TIMEOUT_S
+    src: Path, fps: int = MOTION_FPS, timeout: float = MOTION_TIMEOUT_MIN_S
 ) -> list[float]:
     """`frame_stats`' per-second motion."""
     return frame_stats(src, fps, timeout)[0]
@@ -65,8 +74,9 @@ def screen_frames(frames: np.ndarray) -> np.ndarray:
 def frame_stats(
     src: Path,
     fps: int = MOTION_FPS,
-    timeout: float = MOTION_TIMEOUT_S,
+    timeout: float = MOTION_TIMEOUT_MIN_S,
     mask: list[Rect] | None = None,
+    progress: Callable[[float], None] | None = None,
 ) -> tuple[list[float], list[int], list[float | None]]:
     """(motion, screen, chroma) per second of `src`. Motion: per second of `src`, the largest mean absolute difference (0-255 grey levels) between
     consecutive frames of a `fps`-frame/s, 64x36 greyscale decode: about 0 for a still frame,
@@ -76,7 +86,8 @@ def frame_stats(
 
     ffmpeg's stderr goes to a temporary file, never a pipe: a damaged VOD can log megabytes
     of concealment errors, which would fill an unread pipe (~4 KB on Windows) and stall the
-    decode. A decode still running after `timeout` s is killed (FFmpegError).
+    decode. A decode still running after `timeout` s is killed (FFmpegError). `progress`, when
+    given, is called after each block of frames with the source seconds decoded so far.
 
     Screen: per second, a bitmask of its `fps` frames (bit k = frame k) that are screen
     frames (`screen_frames`), from the same decode. Chroma (wave H round 1): per second, the
@@ -93,6 +104,7 @@ def frame_stats(
     screens: list[np.ndarray] = []
     chromas: list[np.ndarray] = []
     prev: np.ndarray | None = None
+    n_read = 0
     with tempfile.TemporaryFile() as errf:
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errf)
@@ -120,6 +132,9 @@ def frame_stats(
                 if len(frames) > 1:
                     diffs.append(np.abs(np.diff(frames, axis=0)).mean(axis=1))
                 prev = frames[-1:]
+                n_read += len(planes)
+                if progress is not None:
+                    progress(n_read / fps)
             code = proc.wait()
         finally:
             watchdog.cancel()

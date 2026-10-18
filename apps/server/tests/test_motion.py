@@ -76,3 +76,19 @@ def test_a_stuck_decode_times_out(monkeypatch, tmp_path):
     finally:
         for p in procs:
             p.kill()
+
+
+def test_the_motion_timeout_scales_with_the_source_duration():
+    from hookline.media.motion import MOTION_TIMEOUT_MIN_S, motion_timeout
+
+    assert motion_timeout(0) == motion_timeout(60.0) == MOTION_TIMEOUT_MIN_S
+    assert motion_timeout(10 * 3600.0) >= 5 * 3600.0  # a 10 h VOD gets hours, not 30 min
+
+
+def test_frame_stats_reports_progress_in_decoded_seconds(flash_video):
+    from hookline.media.motion import frame_stats
+
+    done: list[float] = []
+    frame_stats(flash_video, progress=done.append)
+    assert done and done[-1] == pytest.approx(6.0, abs=0.5)
+    assert done == sorted(done)
