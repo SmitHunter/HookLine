@@ -258,18 +258,20 @@ def render_clip(
     refined = refine_boundaries(pick, near, silences, loud_seconds=loud_seconds)
     fps = probe_fps(src)
     # Frame-grid bounds make the cut timeline exact, so remapped caption times stay in sync.
+    # dead air trusts a refined word end only so far past the transcript's
+    protected = protected_words(raw, near)
     untailed = keep_ranges(
         refined.segments(),
         silences,
         settings.max_pause_s,
         settings.dead_air_pad_s,
-        # dead air trusts a refined word end only so far past the transcript's
-        words=protected_words(raw, near) if protect_words else None,
+        words=protected if protect_words else None,
     )
     tailed = untailed if voice_db is None else _with_tail(untailed, near, env, voice_db)
     keep = snap_ranges(tailed, fps, keep_gaps=refined.drops)
     # words starting in the tail (no audible onset: see `tail_end`) are not captioned
-    spoken = [w for w in near if w.start < untailed[-1][1] - 1e-6] if untailed else near
+    heard = [i for i, w in enumerate(near) if not untailed or w.start < untailed[-1][1] - 1e-6]
+    spoken = [near[i] for i in heard]
 
     inter = cut_segments(
         src, keep, work_dir / f"{name}.mkv", "libx264", quality=INTERMEDIATE_QUALITY, fps=fps
@@ -285,7 +287,10 @@ def render_clip(
 
     seam = seam_time(keep, refined.cold_open)
     # punctuation-only tokens never captioned; first word (and first after the seam) capitalised
-    out_words = caption_words(remap_words(spoken, keep, fps), seam)
+    # a word's survival of a cut is judged on the span dead air protected, not on an
+    # audio-refined end that may run far past it
+    judge = [protected[i].end for i in heard]
+    out_words = caption_words(remap_words(spoken, keep, fps, judge_ends=judge), seam)
     cuts = cut_times_for(keep)
     layouts: list[SceneLayout] = []
     steps: list[tuple[float, float]] = []

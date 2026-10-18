@@ -110,25 +110,42 @@ def snap_ranges(
     return out
 
 
+def _survives(word: Word, judge_end: float | None, k_start: float, k_end: float) -> bool:
+    """Whether at least half of the word's judged span (start to `judge_end`, the end dead
+    air protected, when given and inside the word) lies in [k_start, k_end]."""
+    end = word.end if judge_end is None else min(word.end, max(judge_end, word.start))
+    if end - word.start <= 1e-9:
+        return True
+    kept = min(end, k_end) - max(word.start, k_start)
+    return kept >= MIN_SURVIVING * (end - word.start) - 1e-9
+
+
 def remap_words(
-    words: list[Word], keep: list[tuple[float, float]], fps: float | None = None
+    words: list[Word],
+    keep: list[tuple[float, float]],
+    fps: float | None = None,
+    judge_ends: list[float] | None = None,
 ) -> list[Word]:
     """Move word timings onto the output timeline of the kept ranges. A word a range edge
     clips to less than half of its duration, or to less than one frame (1 / fps; 30 fps when
-    unknown), is left out of that range: it belongs to the speech the cut removed."""
+    unknown), is left out of that range: it belongs to the speech the cut removed.
+
+    `judge_ends` (one per word) are the ends dead-air cutting protected (the transcript end
+    plus PROTECT_S): the half is judged on start..that end, so an audio-refined end inflated
+    past the protected span cannot cost a kept word its caption."""
     frame = 1 / (fps or DEFAULT_FPS)
     out: list[Word] = []
     offset = 0.0
     for k_start, k_end in keep:
-        for word in words:
+        for i, word in enumerate(words):
             start = max(word.start, k_start)
             end = min(word.end, k_end)
             if end <= start:
                 continue
             clipped = word.start < k_start or word.end > k_end
+            judge = judge_ends[i] if judge_ends is not None else None
             if clipped and (
-                end - start < frame - 1e-9
-                or end - start < MIN_SURVIVING * (word.end - word.start) - 1e-9
+                end - start < frame - 1e-9 or not _survives(word, judge, k_start, k_end)
             ):
                 continue  # mostly cut away at the seam (a dropped line's last word): no flash
             if end - start < MIN_WORD_S and clipped:

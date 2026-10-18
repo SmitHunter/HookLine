@@ -54,10 +54,10 @@ Write each clip's packaging so it is true of the source and not contradicted by 
 - Every concrete claim in `hook_text`, `title` and `post_caption` (a name, number, event, \
 quote or outcome) must be true of the source (the final words or the context) and not \
 contradicted by what the cut leaves in or out. Only quote words that are in the final words.
-- When the final words alone do not say who, where or what (whose company, which school, \
-which war or event), `hook_text` or `title` must supply it, so a stranger knows what they are \
-watching. Keep the earlier packaging's specific names and places when they are true of the \
-source.
+- When the final words alone leave a stranger unsure who is speaking or acting, where it \
+happens or what it is about, `hook_text` or `title` must supply that from the context, so the \
+viewer knows what they are watching. Keep the earlier packaging's specific names and places \
+when they are true of the source.
 - `hook_text` must not give away the payoff: the viewer should want to hear the last line. \
 It must not repeat the first two spoken sentences either, quoted or paraphrased: the viewer \
 is hearing them as they read it. Add what the opening does not say.
@@ -126,6 +126,9 @@ _FIX_MAX_SHARE = 0.15  # more fixes than this share of a clip's words: none are 
 _CONTEXT_S = 60.0  # source seconds before the clip shown to the packager as context
 _HOOK_REPEAT_SHARE = 0.7  # a hook sharing this much of its content with the opening repeats it
 _OPENING_SENTENCES = 2
+_OPENING_MAX_WORDS = 25  # ... or this many words, whichever is shorter (unpunctuated speech)
+_GROUND_MIN_LETTERS = 5  # a source word grounding a carried-over tag has at least 5 letters
+_GROUND_MIN_SHARE = 0.5  # ... and covers at least half the tag
 # Broad tags that say nothing about the clip: never carried over, and ranked last.
 _GENERIC_HASHTAGS = {"history", "life", "news", "politics", "podcast", "podcasts", "interview"}
 _GENERIC_HASHTAGS |= {"story", "stories", "storytime", "motivation", "motivational", "funny"}
@@ -296,10 +299,11 @@ def _caption_fixes(raw: list[_RawFix], final: list[Word], label: str) -> list[Ca
 
 
 def _opening_tokens(final: list[Word]) -> list[str]:
-    """Normalised tokens of the first two sentences the viewer hears."""
+    """Normalised tokens of the first two sentences the viewer hears, or of the first 25
+    words when that is shorter (speech without punctuation)."""
     out: list[str] = []
     ends = 0
-    for w in final:
+    for w in final[:_OPENING_MAX_WORDS]:
         out += _tokens(w.text)
         if ends_sentence(w.text):
             ends += 1
@@ -336,10 +340,12 @@ def _choose_hook(pick: ClipPick, raw: _RawPackage, final: list[Word]) -> str:
     for name, text in (("hook_text", raw.hook_text), ("alt_hook_text", raw.alt_hook_text)):
         hook = " ".join(text.split())
         if not hook:
+            log = logger.warning if name == "hook_text" else logger.info
+            log("clip %r: packaged %s is empty", label, name)
             continue
         if len(hook.split()) > _HOOK_MAX_WORDS:
             logger.warning(
-                "clip %r: packaged %s %r is empty or over %d words",
+                "clip %r: packaged %s %r is over %d words",
                 label,
                 name,
                 hook,
@@ -363,36 +369,32 @@ def _choose_hook(pick: ClipPick, raw: _RawPackage, final: list[Word]) -> str:
 
 
 def _grounded(tag: str, source: set[str]) -> bool:
-    """Whether a source word names part of the (lowercase) tag: a word of >= 4 letters inside
-    it, or a 3-letter word it starts or ends with ("uvm", "iraqwar")."""
+    """Whether a source word of >= 5 letters that covers at least half the (lowercase) tag
+    appears inside it ("estate" grounds "realestate"; "real" or "new" ground nothing)."""
     return any(
-        (len(t) >= 4 and t in tag) or (len(t) == 3 and (tag.startswith(t) or tag.endswith(t)))
+        len(t) >= _GROUND_MIN_LETTERS and len(t) >= _GROUND_MIN_SHARE * len(tag) and t in tag
         for t in source
-        if t not in _FUNCTION_WORDS and len(t) >= 3
     )
 
 
 def _merge_hashtags(
     packaged: list[str], selected: list[str], source: set[str], label: str
 ) -> list[str]:
-    """The packager's tags plus the selection's tags that are true of the source (grounded in
-    a source word, not generic, not banned), at most 5: grounded tags first, then the
-    packager's other specific tags, then generic ones; order kept within each group."""
-    ranked: list[tuple[int, int, str]] = []
-    seen: set[str] = set()
-    cands = [(t, False) for t in packaged] + [(t, True) for t in selected]
-    for i, (tag, from_selection) in enumerate(cands):
+    """The packager's tags in its own order, then the selection's tags that are true of the
+    source (grounded in a source word, not generic, not banned, not already there), at most 5
+    (logged when any are carried over)."""
+    out = list(packaged)
+    seen = {t.lower() for t in out}
+    carried = []
+    for tag in selected:
         key = tag.lower()
-        if key in seen or key in _BANNED_HASHTAGS:
+        if key in seen or key in _BANNED_HASHTAGS or key in _GENERIC_HASHTAGS:
             continue
-        generic, grounded = key in _GENERIC_HASHTAGS, _grounded(key, source)
-        if from_selection and (generic or not grounded):
-            continue
-        seen.add(key)
-        ranked.append((2 if generic else 0 if grounded else 1, i, tag))
-    out = [tag for *_, tag in sorted(ranked)][:_MAX_HASHTAGS]
-    kept = [t for t in out if t.lower() not in map(str.lower, packaged)]
-    if kept:
+        if _grounded(key, source):
+            seen.add(key)
+            carried.append(tag)
+    out = (out + carried)[:_MAX_HASHTAGS]
+    if kept := [t for t in carried if t in out]:
         logger.info("clip %r: kept the selection hashtags %s", label, kept)
     return out
 

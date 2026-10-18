@@ -709,3 +709,26 @@ def test_caption_words_capitalise_the_first_word_and_the_first_after_the_seam():
     assert [x.text for x in out] == ['"The', "original", "deal.", "So", "we", "iPhone"]
     assert caption_words([w(0, 1, "iPhone")])[0].text == "iPhone"  # mixed case is a name
     assert caption_words([]) == []
+
+
+def test_caption_words_never_capitalise_a_token_starting_with_a_digit():
+    from hookline.captions.ass import caption_words
+
+    assert caption_words([w(0, 1, "3rd"), w(1, 2, "place.")])[0].text == "3rd"
+
+
+def test_caption_words_drop_any_token_without_letters_or_digits():
+    from hookline.captions.ass import caption_words
+
+    toks = ["«", "»", "¿", "¡", "/", "*", "♪", "♪♪", "…", "--"]
+    words = [w(i, i + 0.5, t) for i, t in enumerate(toks)] + [w(20, 21, "ok")]
+    assert [x.text for x in caption_words(words)] == ["Ok"]
+
+
+def test_a_stutter_across_a_removed_dash_stays_two_caption_words():
+    from hookline.captions.ass import caption_words
+
+    words = [w(0.0, 0.2, "I"), w(0.2, 0.2, "--"), w(0.22, 0.4, "I"), w(0.4, 0.8, "went.")]
+    ass = build_ass(caption_words(words), "", 2)
+    caps = [e for e in _events(ass) if ",Cap," in e]
+    assert len(caps) == 3  # one event per spoken word: I, I, WENT.

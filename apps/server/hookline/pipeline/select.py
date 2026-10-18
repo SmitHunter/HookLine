@@ -52,7 +52,8 @@ ALL_SKIP_MESSAGE = "Claude rated every candidate as skip — the source may not 
 # Shared by selection and the packaging pass (pipeline/package.py). Every example in the
 # prompts is invented: examples lifted from a test video get copied back verbatim.
 PACKAGING_RULES = """\
-Everything in packaging must be literally true to the clip and its source: never put words \nin the speaker's mouth.
+Everything in packaging must be literally true to the clip and its source: never put words \
+in the speaker's mouth.
 
 - `title`: short and specific, under 60 characters.
 - `hook_text`: on-screen text over the first seconds. 3–7 words that name the stake or the \
@@ -139,8 +140,8 @@ morning.") and the clip starts on that word.
 - Set up the hook's referents. When the hook line leans on a who, where or what that the \
 speaker introduced 5–15 seconds earlier, start on the setup sentence that introduces them, or \
 use a cold open: the hook line plays first as the teaser, then the clip runs from the setup. \
-For example (invented): "So I asked her, would you still open the shop on Sundays?" lands \
-only if the viewer has heard "My grandmother ran the corner bakery for forty years." first.
+For example (invented): "That's when the whole crew walked off the job." means nothing \
+until "We had six welders on the bridge contract, all from the same town." has been heard.
 - Cold opens. When a clip genuinely needs its setup but its strongest line comes later, set \
 `cold_open_words` to that later line, copied verbatim from the transcript: a complete thought \
 that finishes its sentence, without lead-ins such as "I think" or "the thing is". It plays \
@@ -212,13 +213,15 @@ car." puts the stake first and scores 22. An abstract policy or jargon claim, su
 for `hook` and is a `maybe` at best, however much it matters: a stranger cannot feel the \
 stake until someone pays it.
 - A surprising fact that only lands with outside knowledge (the viewer must already know who \
-a company or person is and why it matters), such as "The first owners of the city's water \
-utility included a tyre maker.", scores about 14 for `hook` at most and loses `context` points.
+a company or person is and why it matters), such as "That chess opening is named after a \
+bishop who lost every game he played with it.", scores about 14 for `hook` at most and loses \
+`context` points.
 - A contested factual claim stated as fact raises `comment_risk` (people will argue in the \
 comments), and the packaging attributes it: "She says…", not the claim as fact.
 - A quotable thesis or mission line, a sentence a viewer would quote back or stitch, such as \
-"We don't fix bikes to sell bikes; we fix them so kids can get to school.", beats an abstract \
-policy statement on the same theme: weigh it up as a `bold_claim` when it stands on its own.
+"A library is the last building in town where nobody asks you to buy anything.", beats an \
+abstract policy statement on the same theme: weigh it up as a `bold_claim` when it stands on \
+its own.
 
 ## Verdict
 
@@ -310,7 +313,8 @@ def _object(properties: dict) -> dict:
 
 
 _STRING = {"type": "string"}
-# Structured outputs reject maxLength, so the limit is stated (and enforced by _clip_title).
+# Structured outputs reject maxLength, so the limit is stated: 60 is asked for, 61-70 is
+# tolerated as given, and _search_title cuts anything over 70.
 SEARCH_TITLE = {"type": "string", "description": "Keyword-first, at most 60 characters."}
 
 SELECTION_SCHEMA: dict = _object(
@@ -355,7 +359,14 @@ _EXTEND_MAX_LINES = 2
 _EXTEND_MAX_S = 8.0
 _SEARCH_TITLE_MAX = 70  # the prompt asks for 60; over 70 the code cuts
 _SEARCH_TITLE_MIN = 25  # a clause cut leaving less than this is a stub, not a title
-_CLAUSE_BOUNDARIES = (":", " — ", " – ", " - ", ",", "|")
+# Clause boundaries, strongest kind first. ":" and "," only with whitespace after them
+# ("$1,000,000" and "3:30" are not clauses); an em dash counts spaced or not ("TV—From").
+_CLAUSE_BOUNDARIES = (
+    re.compile(r":(?=\s)"),
+    re.compile(r"\s*—\s*|\s[–-]\s"),
+    re.compile(r",(?=\s)"),
+    re.compile(r"\s*\|"),
+)
 _PAYOFF_OVER_S = 5.0  # a clip may run this far over max_clip_s to land its payoff line ...
 _PAYOFF_WITHIN_S = 8.0  # ... when that line ends within this long after the line before it
 _BANNED_HASHTAGS = {
@@ -703,13 +714,15 @@ def _is_marked(sentence: Sentence, heat: frozenset[int] | set[int] | None) -> bo
 
 def _payoff_fits(src: _Source, first: int, last: int, target: int, raw: _RawClip) -> bool:
     """Whether L{first}..L{target} fits max_clip_s (counted without drop_lines), or runs at
-    most 5 s over it with L{target} ending within 8 s of L{last}'s end (a payoff extension,
-    logged)."""
+    most 5 s over it with L{target} ending within 8 s of L{last}'s end while L{first}..L{last}
+    itself fits max_clip_s (a payoff extension, logged; a clip already over the cap is never
+    extended)."""
     span, cap = _span(src, first, target, raw), src.settings.max_clip_s
     if span <= cap:
         return True
     near = src.sentences[target].end - src.sentences[last].end <= _PAYOFF_WITHIN_S + 1e-9
-    if span <= cap + _PAYOFF_OVER_S + 1e-9 and near:
+    fits = _span(src, first, last, raw) <= cap + 1e-9
+    if fits and near and span <= cap + _PAYOFF_OVER_S + 1e-9:
         logger.info(
             "clip %r: the payoff L%d runs the clip to %.1fs, over the %.0fs maximum",
             raw.title,
@@ -1036,16 +1049,16 @@ def _guard_opener(
 
 def _trim_front(raw: _RawClip, first: int, last: int, src: _Source, min_s: float) -> int | None:
     """For a span longer than max_clip_s: the earliest later start L{c} (keeping `last`, the
-    payoff) whose clip lasts <= max_clip_s (else <= 1.25 x max_clip_s) and >= `min_s`, that is
+    payoff) whose clip lasts <= max_clip_s (else <= _hard_max) and >= `min_s`, that is
     not a weak opener or a backchannel, and that does not cut into the cold-open teaser. If
-    there is none, the untrimmed span is kept when it is within 1.25 x max_clip_s (the old
+    there is none, the untrimmed span is kept when it is within _hard_max (the old
     tolerance); otherwise None (logged)."""
     sents = src.sentences
     cap = src.settings.max_clip_s
     span = _span(src, first, last, raw)
     found = _teaser(raw, first, last, src)
     teaser_at = found[0][found[1]].start if found else math.inf
-    for limit in (cap, cap * 1.25):
+    for limit in (cap, _hard_max(cap)):
         for c in range(first + 1, last + 1):
             dur = _span(src, c, last, raw)
             if dur > limit:
@@ -1063,7 +1076,7 @@ def _trim_front(raw: _RawClip, first: int, last: int, src: _Source, min_s: float
                 c,
             )
             return c
-    if span <= cap * 1.25:
+    if span <= _hard_max(cap):
         logger.warning(
             "clip %r: %.1fs is over %.0fs and no clean later start fits; kept untrimmed",
             raw.title,
@@ -1167,11 +1180,12 @@ def _clean_hashtags(tags: list[str], label: str) -> list[str]:
 
 def _clause_cut(text: str, limit: int = _SEARCH_TITLE_MAX) -> str:
     """`text` cut at a clause boundary within `limit` characters, the strongest kind first
-    (":", then a dash, then ",", then "|"; the last of that kind), when that leaves at least
-    _SEARCH_TITLE_MIN characters; "" when there is none."""
-    for sep in _CLAUSE_BOUNDARIES:
-        i = text.rfind(sep, 0, limit + 1)
-        head = text[:i].rstrip(" ,;:-–—|") if i > 0 else ""
+    (": ", then a dash, then ", ", then "|"; the last of that kind), without a dangling
+    function word, when that leaves at least _SEARCH_TITLE_MIN characters; "" when there is
+    none."""
+    for boundary in _CLAUSE_BOUNDARIES:
+        cuts = [m.start() for m in boundary.finditer(text) if 0 < m.start() <= limit]
+        head = _no_dangling(text[: cuts[-1]]) if cuts else ""
         if len(head) >= _SEARCH_TITLE_MIN:
             return head
     return ""
@@ -1209,10 +1223,15 @@ def _clip_title(text: str, limit: int = _SEARCH_TITLE_MAX) -> str:
     if len(text) <= limit:
         return text
     cut = text[: limit + 1].rsplit(" ", 1)[0] if " " in text[:limit] else text[:limit]
-    words = cut.rstrip(" ,;:-–—").split()
-    while len(words) > 1 and words[-1].lower().strip(",;:-–—") in _DANGLING:
+    return _no_dangling(cut)
+
+
+def _no_dangling(text: str) -> str:
+    """`text` without trailing clause punctuation or dangling function words."""
+    words = text.rstrip(" ,;:-–—|").split()
+    while len(words) > 1 and words[-1].lower().strip(",;:-–—|") in _DANGLING:
         words.pop()
-    return " ".join(words).rstrip(" ,;:-–—")
+    return " ".join(words).rstrip(" ,;:-–—|")
 
 
 def _mid_line_offset(raw: _RawClip, line: int, src: _Source) -> int:
@@ -1411,7 +1430,7 @@ def _drop_plan(
     """(source ranges cut for drop_lines, cold-open teaser) of the clip L{first}..L{last}
     starting at `start` (default: L{first}'s start), exactly as `_to_pick` uses them. The
     teaser holds its lines back from the drops unless the clip plus teaser would then exceed
-    1.25 x max_clip_s: the teaser is discarded and those drops stand. `log` logs each
+    _hard_max: the teaser is discarded and those drops stand. `log` logs each
     decision (once, from `_to_pick`)."""
     sents = src.sentences
     t0 = sents[first].start if start is None else start
@@ -1419,7 +1438,7 @@ def _drop_plan(
     if cold:
         lines = _drop_lines(raw, first, last, src, cold, log=False)
         main = sents[last].end - t0 - sum(b - a for a, b in _drop_ranges(src, lines))
-        max_s = src.settings.max_clip_s * 1.25
+        max_s = _hard_max(src.settings.max_clip_s)
         if main + (cold[1] - cold[0]) > max_s:
             _drop_cold_open(raw, log, f"would push the clip over the {max_s:.0f}s maximum length")
             cold = None
@@ -1507,13 +1526,24 @@ def _guard_move(
     return line, OpenerMove(from_line=first, to_line=line, reason=reason)
 
 
+def _hard_max(cap: float) -> float:
+    """The longest a clip may ever be: 1.25 x max_clip_s, or max_clip_s plus the payoff
+    allowance when that is more (short caps)."""
+    return max(cap * 1.25, cap + _PAYOFF_OVER_S)
+
+
 def _length_cap(raw: _RawClip, first: int, last: int, src: _Source) -> float:
-    """max_clip_s, or 5 s more when only the payoff line takes the clip over it: the clip
-    without L{last} (and any backchannel just before it) fits max_clip_s, and L{last} ends
-    within 8 s of that line (logged)."""
+    """max_clip_s, or 5 s more when only the payoff line takes the clip over it: the clip up
+    to the last kept line before L{last} (skipping backchannels and dropped lines) fits
+    max_clip_s, and L{last} ends within 8 s of that line (logged)."""
     cap = src.settings.max_clip_s
+    drops, _ = _drop_plan(raw, first, last, src)
+    sents = src.sentences
     prev = last - 1
-    while prev > first and _is_backchannel(src.tokens[prev]):
+    while prev > first and (
+        _is_backchannel(src.tokens[prev])
+        or any(a <= sents[prev].start and sents[prev].end <= b for a, b in drops)
+    ):
         prev -= 1
     if prev < first or _span(src, first, last, raw) <= cap or _span(src, first, prev, raw) > cap:
         return cap
@@ -1545,7 +1575,7 @@ def _to_pick(raw: _RawClip, src: _Source) -> ClipPick | None:
     first = _reanchor(raw, given_first, 0, given_last, src.tokens, forward=True)
     last = _reanchor(raw, given_last, first, n - 1, src.tokens, forward=False)
     last = _fix_ending(raw, first, last, src)
-    min_s, max_s = src.settings.min_clip_s * 0.75, src.settings.max_clip_s * 1.25
+    min_s, max_s = src.settings.min_clip_s * 0.75, _hard_max(src.settings.max_clip_s)
     if raw.hook_type == "reaction_peak":
         min_s = min(min_s, _REACTION_PEAK_MIN_S)
 

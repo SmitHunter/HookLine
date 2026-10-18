@@ -1860,3 +1860,103 @@ def test_wave_e_prompts_use_no_phrases_from_the_test_video():
             "president's office",
         ):
             assert needle not in low, needle
+
+
+# --- fix wave E review round 1 ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Why First-Time Buyers Now Pay $1,000,000 for a Studio Apartment in the City Centre",
+        "The Bakery Line That Starts at 3:30 Every Saturday Morning Wraps Around the Block Twice",
+    ],
+)
+def test_clause_cut_ignores_number_commas_and_clock_times(text):
+    from hookline.pipeline.select import _clause_cut
+
+    assert _clause_cut(text) == ""  # no whitespace after the "," / ":": not a clause
+
+
+def test_clause_cut_counts_an_unspaced_em_dash():
+    from hookline.pipeline.select import _clause_cut
+
+    text = "How a Night-Shift Baker Built a Bakery Empire—From One Oven to Twelve Stores Overnight"
+    assert _clause_cut(text) == "How a Night-Shift Baker Built a Bakery Empire"
+
+
+def test_clause_cut_strips_a_dangling_function_word():
+    from hookline.pipeline.select import _clause_cut
+
+    text = "Inside the Fight Over Parking Minimums and the Future of: Small Landlords, Big Rents"
+    assert _clause_cut(text) == "Inside the Fight Over Parking Minimums and the Future"
+
+
+def test_fix_ending_never_extends_a_clip_already_over_the_cap(settings):
+    # L10-L17 is 28.95 s, already over 28; L18 (32.45 s) would fit 28 + 5 within 8 s
+    s = settings.model_copy(update={"max_clip_s": 28})
+    assert _fix({17: "so the thing is...", 18: "it worked."}, s) == 17
+
+
+def test_length_cap_skips_a_backchannel_before_the_payoff(settings, caplog):
+    from hookline.pipeline.select import _length_cap, _RawClip
+
+    caplog.set_level(logging.INFO, logger="hookline.pipeline.select")
+    s = settings.model_copy(update={"max_clip_s": 46})
+    src = _fix_src({21: "Yeah."}, s)  # L10-L20 is 41.2 s; L22 ends 8 s after L20
+    item = _line_item(10, 22, _FILLER.format(n=10), _FILLER.format(n=22))
+    assert _length_cap(_RawClip.model_validate(item), 10, 22, src) == 51
+    assert "payoff L22" in caplog.text
+
+
+def test_length_cap_measures_from_the_last_kept_line_not_a_dropped_one(settings):
+    from hookline.pipeline.select import _length_cap, _RawClip
+
+    # L21 is dropped (-4 s): the clip is 45.95 s. The payoff L22 ends 4.75 s after L21
+    # (dropped) but 8.75 s after L20, the last kept line: no allowance
+    s = settings.model_copy(update={"max_clip_s": 45.5})
+    texts = {22: "and that is how we finally got paid."}
+    src = _fix_src(texts, s)
+    item = _line_item(10, 22, _FILLER.format(n=10), texts[22], drop_lines=[21])
+    assert _length_cap(_RawClip.model_validate(item), 10, 22, src) == 45.5
+
+
+def test_hard_length_bound_is_the_larger_of_125_percent_and_cap_plus_5(fake_llm, settings):
+    # max 17.5: 1.25 x = 21.875 s, cap + 5 = 22.5 s; L10-L15 is 21.95 s and only the payoff
+    # line L15 runs over the cap
+    s = settings.model_copy(update={"max_clip_s": 17.5, "min_clip_s": 10})
+    tr = _lines_transcript({15: "and that is how we finally got paid."})
+    item = _line_item(10, 15, _FILLER.format(n=10), "and that is how we finally got paid.")
+    (p,) = _one(tr, fake_llm, s, item)
+    assert (p.start, p.end) == (40.0, _end_of(tr, 15))
+
+
+# Wave-E prompt examples must not mirror the test video's line structures either: these
+# function-word skeletons came from its lines ("the original investors in ... included ...",
+# "we're not making media just to make media ... we're making media so that ...") or map one
+# to one onto its clips (whose company / which school / which war).
+_TEST_VIDEO_SKELETONS = (
+    r"\bincluded an? \w+",
+    r"\binvestors in\b",
+    r"\bnot \w+ \w+ just to\b",
+    r"\bdon't \w+ \w+ to \w+ \w+;",
+    r"; we \w+ (?:\w+ )?so\b",
+    r"whose company",
+    r"which school",
+    r"which war",
+)
+
+
+def test_prompt_examples_avoid_the_test_videos_sentence_skeletons():
+    from hookline.pipeline.package import PACKAGING_SYSTEM_PROMPT
+
+    for prompt in (SYSTEM_PROMPT, PACKAGING_SYSTEM_PROMPT):
+        for pattern in _TEST_VIDEO_SKELETONS:
+            assert not re.search(pattern, prompt, re.IGNORECASE), pattern
+
+
+def test_packaging_rules_have_no_stray_line_break():
+    from hookline.pipeline.select import PACKAGING_RULES
+
+    first = PACKAGING_RULES.splitlines()[0]
+    assert first.endswith("mouth."), first

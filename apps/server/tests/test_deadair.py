@@ -160,3 +160,15 @@ def test_remap_does_not_stretch_uncut_short_words():
 def test_snap_ranges_never_merges_an_explicit_drop():
     keep = [(1.0, 2.0), (2.12, 3.0), (3.04, 4.0)]
     assert snap_ranges(keep, 25, keep_gaps=[(2.0, 2.12)]) == [(1.0, 2.0), (2.12, 4.0)]
+
+
+def test_remap_judges_survival_on_the_protected_span_not_an_inflated_refined_end():
+    # transcript word 10.00-10.10; audio refinement stretched its end to 11.2; dead air only
+    # protected 10.00-10.40 (transcript end + 0.3 s) and cut at 10.52: the word is fully kept
+    word = w(10.0, 11.2, "kept.")
+    keep = [(9.0, 10.52), (12.0, 13.0)]
+    assert remap_words([word], keep) == []  # judged on the inflated span: 43% survives
+    (out,) = remap_words([word], keep, judge_ends=[10.4])
+    assert (out.start, out.end) == pytest.approx((1.0, 1.52))
+    # a dropped line's word is still dropped when its protected span is mostly cut
+    assert remap_words([w(10.3, 11.2, "up.")], keep, judge_ends=[10.9]) == []

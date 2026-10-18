@@ -317,7 +317,7 @@ def test_packaging_prompt_rules_wave_e():
     for needle in (
         "true of the source",
         "not contradicted by the cut",
-        "who, where or what",
+        "unsure who is speaking or acting",
         "CONTEXT ONLY",
         '"She says…"',
         "first two spoken sentences",
@@ -361,20 +361,15 @@ def test_hook_text_against_the_teaser_and_first_clip_sentence(fake_llm, settings
     assert out.hook_text == "Maybe four days in"
 
 
-def test_hashtags_keep_selection_tags_grounded_in_the_source_specific_first(fake_llm, settings):
+def test_hashtags_keep_the_packager_order_then_grounded_selection_tags(fake_llm, settings):
     p = _pick(hashtags=["dishwasher", "bosskeys", "history", "chefstories"])
     tags = ["restaurantstories", "motivation", "kitchenlife"]
     fake_llm.queue({"clips": [_answer(hashtags=tags)]})
     (out,) = package_clips([p], WORDS, fake_llm, settings)
-    # grounded (a source word in the tag) first; "dishwasher" is said only in the context;
-    # selection's generic #history and ungrounded #chefstories are not carried over
-    assert out.hashtags == [
-        "kitchenlife",
-        "dishwasher",
-        "bosskeys",
-        "restaurantstories",
-        "motivation",
-    ]
+    # the packager's tags in its own order, then the selection's grounded ones ("dishwasher"
+    # is said only in the context); "bosskeys" has no >= 5-letter source word, #history is
+    # generic, #chefstories is not in the source
+    assert out.hashtags == ["restaurantstories", "motivation", "kitchenlife", "dishwasher"]
 
 
 def test_packaged_search_title_clause_cut_then_selection_fallback(fake_llm, settings):
@@ -386,3 +381,40 @@ def test_packaged_search_title_clause_cut_then_selection_fallback(fake_llm, sett
     fake_llm.queue({"clips": [_answer(search_title=long)]})
     (p,) = package_clips([_pick()], WORDS, fake_llm, settings)
     assert p.search_title == "Dishwasher Gets Restaurant Keys on Day Three"  # selection's
+
+
+# --- fix wave E review round 1 ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("tag", "said", "grounded"),
+    [
+        ("newyorkcity", "We moved to a new place in the city.", False),
+        ("realestate", "It was real money back then.", False),
+        ("truecrimepodcast", "That story is true, I swear.", False),
+        ("realestate", "The estate sold in a week.", True),
+        ("dishwasher", "I was a dishwasher.", True),
+        ("bakerylife", "The bakery opened at five.", True),
+    ],
+)
+def test_selection_tag_needs_a_long_source_word_covering_half_of_it(tag, said, grounded):
+    from hookline.pipeline.package import _grounded
+    from hookline.pipeline.select import _tokens
+
+    assert _grounded(tag, set(_tokens(said))) is grounded
+
+
+def test_hook_overlap_uses_at_most_the_first_25_words_of_unpunctuated_speech():
+    from hookline.pipeline.package import _opening_tokens
+
+    words = _seq(" ".join(f"w{i}" for i in range(60)), 0.0)  # no sentence end at all
+    assert _opening_tokens(words) == [f"w{i}" for i in range(25)]
+    short = _seq("One. Two three. Four.", 0.0)
+    assert _opening_tokens(short) == ["one", "two", "three"]
+
+
+def test_empty_packaged_hook_is_logged(fake_llm, settings, caplog):
+    fake_llm.queue({"clips": [_answer(hook_text="", alt_hook_text="")]})
+    with caplog.at_level(logging.WARNING, logger="hookline.pipeline.package"):
+        (p,) = package_clips([_pick()], WORDS, fake_llm, settings)
+    assert p.hook_text == "Dishwasher to head chef" and "hook_text is empty" in caplog.text

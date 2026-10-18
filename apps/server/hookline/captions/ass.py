@@ -118,15 +118,23 @@ def _normalise(words: list[Word]) -> list[Word]:
     return out
 
 
-# Punctuation a transcriber emits as a word of its own ("--", "—", "…"): never a caption word.
-_PUNCT_ONLY = set(".,;:!?-–—…'\"“”‘’()[]")
+# Symbols without letters or digits that are still spoken ("rock & roll"): kept as words.
+_SPOKEN_SYMBOLS = {"&", "%", "$", "+", "=", "@", "#"}
 _SEAM_SLACK_S = 0.01
 
 
+def _unspoken(text: str) -> bool:
+    """A token with no letter or digit ("--", "—", "…", "«", "¿", "/", "♪"): punctuation a
+    transcriber emitted as a word of its own, never a caption word."""
+    t = text.strip()
+    return t not in _SPOKEN_SYMBOLS and not any(c.isalnum() for c in t)
+
+
 def _capitalised(text: str) -> str:
-    """`text` with its first letter upper-cased, unless the word is mixed case ("iPhone")."""
-    i = next((k for k, c in enumerate(text) if c.isalpha()), None)
-    if i is None or any(c.isupper() for c in text[i + 1 :]):
+    """`text` with its first letter upper-cased, unless the word is mixed case ("iPhone") or
+    starts with a digit ("3rd")."""
+    i = next((k for k, c in enumerate(text) if c.isalnum()), None)
+    if i is None or not text[i].isalpha() or any(c.isupper() for c in text[i + 1 :]):
         return text
     return text[:i] + text[i].upper() + text[i + 1 :]
 
@@ -134,8 +142,23 @@ def _capitalised(text: str) -> str:
 def caption_words(words: list[Word], seam: float | None = None) -> list[Word]:
     """The words as captioned: punctuation-only tokens dropped (the other words keep their
     times), and the clip's first word and the first word at or after the cold-open `seam`
-    capitalised (a clip may start mid-sentence)."""
-    out = [w for w in words if not set(w.text.strip()) <= _PUNCT_ONLY]
+    capitalised (a clip may start mid-sentence).
+
+    A stutter split by a dropped token ("I -- I") stays two words: when the pair is close
+    enough for `_normalise` to merge it as one cut fragment, the second word starts just
+    past that gap (it moves by at most MERGE_GAP_S)."""
+    out: list[Word] = []
+    removed = False
+    for w in words:
+        if _unspoken(w.text):
+            removed = bool(out)
+            continue
+        if removed and _clean(w.text) == _clean(out[-1].text):
+            start = round(out[-1].end + MERGE_GAP_S + 0.001, 3)
+            if w.start - out[-1].end <= MERGE_GAP_S and start < w.end:
+                w = w.model_copy(update={"start": start})
+        out.append(w)
+        removed = False
     firsts = {0} if out else set()
     if seam is not None:
         after = next((k for k, w in enumerate(out) if w.start >= seam - _SEAM_SLACK_S), None)
